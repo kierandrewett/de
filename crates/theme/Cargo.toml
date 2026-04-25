@@ -1,0 +1,14 @@
+[package]
+name = "theme"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace section — the root orchestrator adds this crate to the
+# workspace at integration time, at which point this section is removed.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
