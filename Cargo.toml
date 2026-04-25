@@ -8,6 +8,8 @@ members = [
     "crates/ipc",
     "crates/shell-devtools",
     "crates/compositor",
+    "crates/portal",
+    "crates/portal-ui",
 ]
 
 [workspace.package]
