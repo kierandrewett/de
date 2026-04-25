@@ -315,6 +315,12 @@ impl Shell {
     }
 
     /// Allocate the next unique window ID.
+    /// Push a fully-constructed [`MappedWindow`] onto the shell. Caller is
+    /// responsible for `alloc_window_id()` first.
+    pub fn add_window(&mut self, window: MappedWindow) {
+        self.windows.push(window);
+    }
+
     pub fn alloc_window_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;

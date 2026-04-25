@@ -4,7 +4,7 @@ use smithay::{
     delegate_xdg_shell,
     desktop::{PopupKind, Window},
     reexports::wayland_server::protocol::wl_seat,
-    utils::Serial,
+    utils::{Rectangle, Serial},
     wayland::{
         seat::WaylandFocus,
         shell::xdg::{
@@ -13,7 +13,14 @@ use smithay::{
     },
 };
 
+use crate::shell::{DecorationMode, MappedWindow, WindowSurface};
 use crate::state::State;
+
+/// Stable shell-window identifier attached to a smithay [`Window`] via its
+/// `user_data` map. Allows us to round-trip from a wayland surface to the
+/// shell's `MappedWindow.id`.
+#[derive(Debug, Clone, Copy)]
+struct ShellWindowId(u64);
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -21,9 +28,32 @@ impl XdgShellHandler for State {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Allocate a shell-side id and stash it on the smithay Window so we
+        // can find it again on destroy. Title and app_id arrive later via
+        // xdg_toplevel.set_title / .set_app_id (not wired here yet).
+        let id = self.common.shell.alloc_window_id();
         let window = Window::new_wayland_window(surface);
-        // Place new windows at the origin; subagent 09 (shell) handles tiling/placement.
+        window.user_data().insert_if_missing(|| ShellWindowId(id));
+
+        // Default geometry — real placement happens once the client commits.
+        let geometry: Rectangle<i32, smithay::utils::Logical> =
+            Rectangle::from_size((640, 480).into());
+        let mapped = MappedWindow::new(
+            id,
+            WindowSurface { token: id },
+            geometry,
+            DecorationMode::ServerSide,
+            String::new(),
+            String::new(),
+        );
+        self.common.shell.add_window(mapped);
+
         self.common.space.map_element(window, (0, 0), false);
+
+        // Notify shell processes (panel, dock, launcher).
+        if let Some(info) = self.common.shell.window_info(id) {
+            self.common.ipc.broadcast(&ipc::ShellEvent::WindowOpened { window: info });
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -70,6 +100,12 @@ impl XdgShellHandler for State {
             .cloned();
 
         if let Some(w) = window {
+            // Pull the shell id back out, drop the corresponding MappedWindow,
+            // and tell the shell processes about the close.
+            if let Some(ShellWindowId(id)) = w.user_data().get::<ShellWindowId>().copied() {
+                self.common.shell.remove_window(id);
+                self.common.ipc.broadcast(&ipc::ShellEvent::WindowClosed { window_id: id });
+            }
             self.common.space.unmap_elem(&w);
         }
     }

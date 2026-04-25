@@ -10,6 +10,7 @@ use clap::Parser;
 
 mod focus;
 mod input;
+mod ipc;
 mod render;
 mod shell;
 mod state;

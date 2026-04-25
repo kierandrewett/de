@@ -1,7 +1,7 @@
 //! Winit dev backend — runs the compositor as a nested window inside an existing display.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smithay::{
     backend::{
@@ -11,6 +11,7 @@ use smithay::{
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
+    desktop::space::render_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -129,6 +130,12 @@ pub fn run() -> anyhow::Result<()> {
             break;
         }
 
+        // Advance window animations.
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(state.common.last_frame).as_secs_f64();
+        state.common.last_frame = now;
+        state.common.shell.tick_animations(dt);
+
         render_frame(&mut state);
 
         if event_loop
@@ -148,38 +155,46 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render one frame into the winit window (clear to a dark grey).
+/// Render one frame into the winit window. Draws every mapped wayland
+/// surface in the compositor `Space` via smithay's damage-tracked
+/// `render_output` helper.
 fn render_frame(state: &mut State) {
-    use smithay::backend::renderer::{Frame, Renderer};
-
     let Backend::Winit(ref mut winit) = state.backend else { return };
 
-    let size = winit
-        .output
-        .current_mode()
-        .map(|m| m.size)
-        .unwrap_or_else(|| (1920i32, 1080i32).into());
+    let age = winit.backend.buffer_age().unwrap_or(0);
 
-    let rendered = match winit.backend.bind() {
-        Ok((renderer, mut fb)) => {
-            match renderer.render(&mut fb, size, Transform::Normal) {
-                Ok(mut frame) => {
-                    let _ = frame.clear(
-                        [0.1, 0.1, 0.1, 1.0].into(),
-                        &[Rectangle::from_size(size)],
-                    );
-                    let _ = frame.finish();
-                    true
-                }
-                Err(e) => { tracing::warn!("winit render: {e:?}"); false }
+    // Render under a scoped borrow so we can call `submit` afterwards.
+    let damage_owned = {
+        let (renderer, mut fb) = match winit.backend.bind() {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("winit bind: {e}");
+                return;
+            }
+        };
+
+        let result = render_output::<_, smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<GlesRenderer>, _, _>(
+            &winit.output,
+            renderer,
+            &mut fb,
+            1.0,
+            age,
+            [&state.common.space],
+            &[],
+            &mut winit.damage_tracker,
+            [0.06, 0.06, 0.07, 1.0],
+        );
+
+        match result {
+            Ok(res) => res.damage.cloned(),
+            Err(e) => {
+                tracing::warn!("render_output: {e:?}");
+                None
             }
         }
-        Err(e) => { tracing::warn!("winit bind: {e}"); false }
     };
 
-    if rendered {
-        if let Err(e) = winit.backend.submit(None) {
-            tracing::warn!("winit submit: {e}");
-        }
+    if let Err(e) = winit.backend.submit(damage_owned.as_deref()) {
+        tracing::warn!("winit submit: {e}");
     }
 }

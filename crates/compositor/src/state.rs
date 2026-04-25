@@ -156,6 +156,15 @@ pub struct CommonState {
     pub shell: crate::shell::Shell,
     /// Active pointer grab (move or resize), if any.
     pub grab: crate::shell::grab::GrabState,
+
+    // ── IPC ───────────────────────────────────────────────────────────────
+    /// Server for the unix-socket IPC used by panel/dock/launcher.
+    pub ipc: crate::ipc::IpcServer,
+
+    // ── Frame timing ──────────────────────────────────────────────────────
+    /// Timestamp of the previous render frame (used to compute `dt` for
+    /// animation tick).
+    pub last_frame: Instant,
 }
 
 impl CommonState {
@@ -167,6 +176,7 @@ impl CommonState {
         socket_name: String,
     ) -> Self {
         let clock = Clock::<Monotonic>::new();
+        let loop_handle_for_ipc = loop_handle.clone();
 
         let compositor_state = CompositorState::new::<State>(dh);
         let shm_state = ShmState::new::<State>(dh, vec![]);
@@ -284,6 +294,9 @@ impl CommonState {
             popup_manager: PopupManager::default(),
             shell: crate::shell::Shell::new(),
             grab: crate::shell::grab::GrabState::default(),
+            ipc: crate::ipc::IpcServer::start(loop_handle_for_ipc)
+                .expect("failed to bind compositor IPC socket"),
+            last_frame: Instant::now(),
         }
     }
 }
