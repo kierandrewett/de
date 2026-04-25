@@ -1,0 +1,17 @@
+[package]
+name = "rounding"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Kieran Drewett"]
+description = "Continuous-curvature squircle corner rounding matching macOS/iOS aesthetics"
+
+[dependencies]
+tiny-skia = { version = "0.11", optional = true }
+
+[features]
+default = []
+tiny-skia = ["dep:tiny-skia"]
+
+[dev-dependencies]
+tiny-skia = { version = "0.11" }
