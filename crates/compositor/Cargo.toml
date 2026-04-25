@@ -19,12 +19,15 @@ cursor = { path = "../cursor" }
 
 # Utility
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+wayland-protocols-misc = { version = "0.3", features = ["server"] }
+indexmap = "2"
+input = "0.10"
 
 [[bin]]
 name = "compositor"

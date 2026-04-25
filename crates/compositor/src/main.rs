@@ -8,10 +8,14 @@
 
 use clap::Parser;
 
-mod state;
-mod wayland;
+mod focus;
+mod input;
 mod render;
 mod shell;
+mod state;
+mod udev;
+mod wayland;
+mod winit;
 
 #[derive(Parser, Debug)]
 #[command(name = "compositor")]
@@ -35,14 +39,24 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    if cli.winit {
-        tracing::info!("Starting compositor (winit dev mode)");
-        // TODO: subagent 07 / 08 wire backend init
+
+    // Auto-detect backend when no flag is given: prefer winit if a display is
+    // available (WAYLAND_DISPLAY or DISPLAY), otherwise fall back to udev.
+    let use_winit = if cli.winit {
+        true
     } else if cli.tty_udev {
-        tracing::info!("Starting compositor (tty-udev production mode)");
-        // TODO: subagent 07 / 08 wire backend init
+        false
     } else {
-        anyhow::bail!("Specify --winit or --tty-udev");
+        std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("DISPLAY").is_ok()
+    };
+
+    if use_winit {
+        tracing::info!("Starting compositor (winit dev mode)");
+        crate::winit::run()?;
+    } else {
+        tracing::info!("Starting compositor (tty-udev production mode)");
+        crate::udev::run()?;
     }
+
     Ok(())
 }
