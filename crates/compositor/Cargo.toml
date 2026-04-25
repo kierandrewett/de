@@ -11,13 +11,14 @@ wayland-protocols = { version = "0.32", features = ["server", "staging", "unstab
 wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 
 # Phase 1 crates
-rounding = { path = "../rounding" }
+rounding = { path = "../rounding", features = ["tiny-skia"] }
 animation = { path = "../animation" }
 theme = { path = "../theme" }
 ipc = { path = "../ipc" }
 cursor = { path = "../cursor" }
 
 # Utility
+tiny-skia = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 serde = { workspace = true }
