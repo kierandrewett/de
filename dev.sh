@@ -13,18 +13,27 @@ mkdir -p "$LOG_DIR"
 # Make sure release-style env doesn't sneak in.
 unset XDG_CURRENT_DESKTOP
 
-# Start the compositor in a nested winit window and discover the socket name
-# it advertises in its log.
+# Build everything once before launching anything — keeps log noise out of
+# the per-process logs.
 cargo build -p compositor -p shell-panel -p shell-dock -p shell-launcher \
             -p notification -p portal --message-format=short
 
-cargo run -q -p compositor -- --winit \
+# Run binaries directly (not via `cargo run`) so we get the actual process
+# pid and avoid extra stdio buffering. `stdbuf -oL` forces line-buffered
+# stdout so the wayland-socket discovery loop below sees the log line as
+# soon as the compositor prints it.
+stdbuf -oL ./target/debug/compositor --winit \
     > "$LOG_DIR/compositor.log" 2>&1 &
 COMPOSITOR_PID=$!
 echo "compositor pid=$COMPOSITOR_PID — log: $LOG_DIR/compositor.log"
 
 # Wait for the compositor to bind its wayland socket.
-for _ in $(seq 1 60); do
+for _ in $(seq 1 80); do
+    if ! kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
+        echo "ERROR: compositor exited early. Last log lines:" >&2
+        tail -20 "$LOG_DIR/compositor.log" >&2
+        exit 1
+    fi
     if SOCK=$(grep -oE 'Wayland socket: wayland-[0-9]+' "$LOG_DIR/compositor.log" 2>/dev/null | tail -1 | awk '{print $3}'); then
         if [[ -n "${SOCK:-}" ]]; then break; fi
     fi
@@ -45,7 +54,7 @@ echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
 # (XDG_RUNTIME_DIR/myDE.sock) on its own.
 declare -A pids
 for proc in shell-panel shell-dock notification portal; do
-    cargo run -q -p "$proc" > "$LOG_DIR/$proc.log" 2>&1 &
+    stdbuf -oL ./target/debug/"$proc" > "$LOG_DIR/$proc.log" 2>&1 &
     pids[$proc]=$!
     echo "$proc pid=${pids[$proc]} — log: $LOG_DIR/$proc.log"
 done

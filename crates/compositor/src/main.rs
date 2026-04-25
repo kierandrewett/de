@@ -35,9 +35,11 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Default to `info` so the wayland socket name is visible without
+    // RUST_LOG being set. Override with RUST_LOG=… as usual.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 
