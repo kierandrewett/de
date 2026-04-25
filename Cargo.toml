@@ -8,6 +8,7 @@ members = [
     "crates/ipc",
     "crates/shell-devtools",
     "crates/compositor",
+    "crates/status-notifier",
 ]
 
 [workspace.package]
