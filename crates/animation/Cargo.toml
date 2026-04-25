@@ -1,0 +1,11 @@
+[package]
+name = "animation"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-dependency animation engine for a Wayland compositor"
+
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
