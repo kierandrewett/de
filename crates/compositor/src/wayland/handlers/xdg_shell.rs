@@ -50,7 +50,22 @@ impl XdgShellHandler for State {
         );
         self.common.shell.add_window(mapped);
 
-        self.common.space.map_element(window.clone(), (0, 0), true);
+        // Center the window on the first output's work area. Replace with a
+        // real placement policy (cascaded / tiled / per-app) when the shell
+        // module wires up a placement strategy.
+        let location = if let Some(out) = self.common.space.outputs().next().cloned() {
+            let out_geo = self
+                .common
+                .space
+                .output_geometry(&out)
+                .unwrap_or_else(|| Rectangle::from_size((1280, 800).into()));
+            let cx = out_geo.loc.x + (out_geo.size.w - geometry.size.w).max(0) / 2;
+            let cy = out_geo.loc.y + (out_geo.size.h - geometry.size.h).max(0) / 2;
+            (cx, cy)
+        } else {
+            (0, 0)
+        };
+        self.common.space.map_element(window.clone(), location, true);
 
         // Auto-focus the new window so wtype / typed input has somewhere to
         // land. Real placement / activation policy belongs in the shell

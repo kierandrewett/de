@@ -7,7 +7,9 @@ use smithay::{
     backend::{
         renderer::{
             damage::OutputDamageTracker,
+            element::{solid::SolidColorRenderElement, Id, Kind},
             gles::GlesRenderer,
+            utils::CommitCounter,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
@@ -21,7 +23,7 @@ use smithay::{
         wayland_server::Display,
         winit::platform::pump_events::PumpStatus,
     },
-    utils::Transform,
+    utils::{Rectangle, Scale, Transform},
     wayland::socket::ListeningSocketSource,
 };
 
@@ -47,6 +49,10 @@ pub fn run() -> anyhow::Result<()> {
     // call `dispatch_new_events` in the main loop without a state borrow conflict.
     let (winit_backend, mut winit_events) = winit::init::<GlesRenderer>()
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // Hide winit's native pointer — we render our own cursor at the
+    // compositor-tracked pointer location.
+    winit_backend.window().set_cursor_visible(false);
 
     let output = {
         let win_size = winit_backend.window_size();
@@ -164,12 +170,33 @@ pub fn run() -> anyhow::Result<()> {
 
 /// Render one frame into the winit window. Draws every mapped wayland
 /// surface in the compositor `Space` via smithay's damage-tracked
-/// `render_output` helper.
+/// `render_output` helper, plus a small overlay cursor at the pointer
+/// location.
 fn render_frame(state: &mut State) {
     let Backend::Winit(ref mut winit) = state.backend else { return };
 
     let age = winit.backend.buffer_age().unwrap_or(0);
     let element_count = state.common.space.elements().count();
+    let scale = Scale::from(winit.output.current_scale().fractional_scale());
+
+    // Build the cursor overlay: a small white square at the pointer
+    // location. Stand-in until the cursor crate's CursorThemeManager is
+    // wired in to load real SVG cursors.
+    let cursor_elements: Vec<SolidColorRenderElement> = if let Some(pointer) =
+        state.common.seat.get_pointer()
+    {
+        let loc = pointer.current_location().to_physical(scale).to_i32_round();
+        let size: smithay::utils::Size<i32, smithay::utils::Physical> = (12, 12).into();
+        vec![SolidColorRenderElement::new(
+            Id::new(),
+            Rectangle::new(loc, size),
+            CommitCounter::default(),
+            [0.95, 0.95, 0.95, 1.0],
+            Kind::Cursor,
+        )]
+    } else {
+        Vec::new()
+    };
 
     // Render under a scoped borrow so we can call `submit` afterwards.
     let damage_owned = {
@@ -181,14 +208,14 @@ fn render_frame(state: &mut State) {
             }
         };
 
-        let result = render_output::<_, smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<GlesRenderer>, _, _>(
+        let result = render_output::<_, SolidColorRenderElement, _, _>(
             &winit.output,
             renderer,
             &mut fb,
             1.0,
             age,
             [&state.common.space],
-            &[],
+            &cursor_elements,
             &mut winit.damage_tracker,
             [0.06, 0.06, 0.07, 1.0],
         );
