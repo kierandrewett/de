@@ -161,6 +161,16 @@ pub struct CommonState {
     /// Server for the unix-socket IPC used by panel/dock/launcher.
     pub ipc: crate::ipc::IpcServer,
 
+    // ── Cursor ────────────────────────────────────────────────────────────
+    /// Loaded SVG cursor theme; provides rasterised cursor pixels.
+    pub cursor_manager: cursor::CursorThemeManager,
+    /// Cached `MemoryRenderBuffer` for the default arrow cursor — built
+    /// once on first render to avoid per-frame allocation.
+    pub cursor_buffer: Option<smithay::backend::renderer::element::memory::MemoryRenderBuffer>,
+    /// Hotspot offset (logical pixels) of the cached cursor — subtracted
+    /// from the pointer location at render time.
+    pub cursor_hotspot: (i32, i32),
+
     // ── Frame timing ──────────────────────────────────────────────────────
     /// Timestamp of the previous render frame (used to compute `dt` for
     /// animation tick).
@@ -296,6 +306,17 @@ impl CommonState {
             grab: crate::shell::grab::GrabState::default(),
             ipc: crate::ipc::IpcServer::start(loop_handle_for_ipc)
                 .expect("failed to bind compositor IPC socket"),
+            cursor_manager: cursor::CursorThemeManager::load(
+                &std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string()),
+                "default",
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!("could not load cursor theme: {e}; cursor will fall back to a square");
+                cursor::CursorThemeManager::load("default", "default")
+                    .expect("failed to construct fallback cursor theme manager")
+            }),
+            cursor_buffer: None,
+            cursor_hotspot: (0, 0),
             last_frame: Instant::now(),
         }
     }

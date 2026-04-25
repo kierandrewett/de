@@ -5,11 +5,16 @@ use std::time::{Duration, Instant};
 
 use smithay::{
     backend::{
+        allocator::Fourcc,
         renderer::{
             damage::OutputDamageTracker,
-            element::{solid::SolidColorRenderElement, Id, Kind},
+            element::{
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                solid::SolidColorRenderElement,
+                Kind,
+            },
             gles::GlesRenderer,
-            utils::CommitCounter,
+            ImportAll, ImportMem,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
@@ -23,7 +28,8 @@ use smithay::{
         wayland_server::Display,
         winit::platform::pump_events::PumpStatus,
     },
-    utils::{Rectangle, Scale, Transform},
+    render_elements,
+    utils::{Scale, Transform},
     wayland::socket::ListeningSocketSource,
 };
 
@@ -168,10 +174,20 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Wraps the two cursor render-element kinds (real texture vs solid-color
+// fallback) into one type that satisfies render_output's `C: RenderElement<R>`
+// generic.
+render_elements! {
+    pub CursorElement<R> where R: ImportAll + ImportMem;
+    Texture=MemoryRenderBufferRenderElement<R>,
+    Solid=SolidColorRenderElement,
+}
+
 /// Render one frame into the winit window. Draws every mapped wayland
 /// surface in the compositor `Space` via smithay's damage-tracked
-/// `render_output` helper, plus a small overlay cursor at the pointer
-/// location.
+/// `render_output` helper, plus a cursor overlay at the pointer
+/// location (real SVG cursor texture if loadable, else a small solid
+/// square as a fallback).
 fn render_frame(state: &mut State) {
     let Backend::Winit(ref mut winit) = state.backend else { return };
 
@@ -179,21 +195,71 @@ fn render_frame(state: &mut State) {
     let element_count = state.common.space.elements().count();
     let scale = Scale::from(winit.output.current_scale().fractional_scale());
 
-    // Build the cursor overlay: a small white square at the pointer
-    // location. Stand-in until the cursor crate's CursorThemeManager is
-    // wired in to load real SVG cursors.
-    let cursor_elements: Vec<SolidColorRenderElement> = if let Some(pointer) =
+    // Lazy-load the default cursor texture on first render so the cost
+    // doesn't appear in startup time.
+    if state.common.cursor_buffer.is_none() {
+        let physical_size = 24u32;
+        if let Some(c) = state
+            .common
+            .cursor_manager
+            .get_cursor("default", physical_size)
+        {
+            // Cursor crate emits row-major premultiplied RGBA; smithay reads
+            // memory buffers as Argb8888 (which on little-endian = BGRA in
+            // memory). Swap R↔B so the cursor doesn't render with an
+            // inverted hue.
+            let mut bgra = c.pixels.clone();
+            for px in bgra.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            state.common.cursor_buffer = Some(MemoryRenderBuffer::from_slice(
+                &bgra,
+                Fourcc::Argb8888,
+                (c.width as i32, c.height as i32),
+                1,
+                Transform::Normal,
+                None,
+            ));
+            state.common.cursor_hotspot = (c.hotspot_x, c.hotspot_y);
+        }
+    }
+
+    // Build cursor overlay element.
+    let cursor_elements: Vec<CursorElement<GlesRenderer>> = if let Some(pointer) =
         state.common.seat.get_pointer()
     {
-        let loc = pointer.current_location().to_physical(scale).to_i32_round();
-        let size: smithay::utils::Size<i32, smithay::utils::Physical> = (12, 12).into();
-        vec![SolidColorRenderElement::new(
-            Id::new(),
-            Rectangle::new(loc, size),
-            CommitCounter::default(),
-            [0.95, 0.95, 0.95, 1.0],
-            Kind::Cursor,
-        )]
+        let cursor_logical = pointer.current_location()
+            - smithay::utils::Point::from((
+                state.common.cursor_hotspot.0 as f64,
+                state.common.cursor_hotspot.1 as f64,
+            ));
+        let cursor_physical = cursor_logical.to_physical(scale);
+
+        if let Some(buf) = state.common.cursor_buffer.as_ref() {
+            match MemoryRenderBufferRenderElement::from_buffer(
+                {
+                    let (renderer, _) = match winit.backend.bind() {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    renderer
+                },
+                cursor_physical,
+                buf,
+                None,
+                None,
+                None,
+                Kind::Cursor,
+            ) {
+                Ok(el) => vec![CursorElement::Texture(el)],
+                Err(e) => {
+                    tracing::trace!("cursor texture element failed: {e}; falling back to solid");
+                    fallback_cursor(cursor_physical.to_i32_round())
+                }
+            }
+        } else {
+            fallback_cursor(cursor_physical.to_i32_round())
+        }
     } else {
         Vec::new()
     };
@@ -208,7 +274,7 @@ fn render_frame(state: &mut State) {
             }
         };
 
-        let result = render_output::<_, SolidColorRenderElement, _, _>(
+        let result = render_output::<_, CursorElement<GlesRenderer>, _, _>(
             &winit.output,
             renderer,
             &mut fb,
@@ -247,4 +313,19 @@ fn render_frame(state: &mut State) {
             Some(winit.output.clone())
         });
     });
+}
+
+/// Last-resort 12×12 white square at the cursor location, used when no
+/// real cursor texture is available.
+fn fallback_cursor(loc: smithay::utils::Point<i32, smithay::utils::Physical>) -> Vec<CursorElement<GlesRenderer>> {
+    use smithay::backend::renderer::{element::Id, utils::CommitCounter};
+    use smithay::utils::{Rectangle, Size};
+    let size: Size<i32, smithay::utils::Physical> = (12, 12).into();
+    vec![CursorElement::Solid(SolidColorRenderElement::new(
+        Id::new(),
+        Rectangle::new(loc, size),
+        CommitCounter::default(),
+        [0.95, 0.95, 0.95, 1.0],
+        Kind::Cursor,
+    ))]
 }
