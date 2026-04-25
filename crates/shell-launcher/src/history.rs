@@ -74,8 +74,13 @@ mod tests {
     use super::*;
     use std::env;
 
-    fn with_temp_home(f: impl FnOnce()) {
-        let dir = std::env::temp_dir().join(format!("launcher_test_{}", std::process::id()));
+    use std::sync::Mutex;
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_temp_home(name: &str, f: impl FnOnce()) {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir()
+            .join(format!("launcher_test_{}_{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         env::set_var("HOME", &dir);
         f();
@@ -84,7 +89,7 @@ mod tests {
 
     #[test]
     fn record_increments_count() {
-        with_temp_home(|| {
+        with_temp_home("call1", || {
             let mut h = LaunchHistory::default();
             h.record("Firefox");
             h.record("Firefox");
@@ -94,7 +99,7 @@ mod tests {
 
     #[test]
     fn save_and_reload() {
-        with_temp_home(|| {
+        with_temp_home("call2", || {
             let mut h = LaunchHistory::default();
             h.record("Thunderbird");
             let loaded = LaunchHistory::load();
@@ -104,7 +109,7 @@ mod tests {
 
     #[test]
     fn missing_file_gives_empty_history() {
-        with_temp_home(|| {
+        with_temp_home("call3", || {
             let h = LaunchHistory::load();
             assert!(h.counts.is_empty());
         });
