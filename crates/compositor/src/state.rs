@@ -152,6 +152,10 @@ pub struct CommonState {
     // === render fields (subagent 08) ===
 
     // === shell fields (subagent 09) ===
+    /// Window management state: layout, focus, animations.
+    pub shell: crate::shell::Shell,
+    /// Active pointer grab (move or resize), if any.
+    pub grab: crate::shell::grab::GrabState,
 }
 
 impl CommonState {
@@ -278,6 +282,8 @@ impl CommonState {
             xwayland_keyboard_grab_state,
             space: Space::default(),
             popup_manager: PopupManager::default(),
+            shell: crate::shell::Shell::new(),
+            grab: crate::shell::grab::GrabState::default(),
         }
     }
 }
