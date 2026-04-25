@@ -1,0 +1,25 @@
+[package]
+name = "shell-dock"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Kieran Drewett"]
+description = "Wayland dock for myDE — iced layer-shell application"
+
+[[bin]]
+name = "shell-dock"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.13", features = ["advanced", "image", "svg", "tokio"] }
+iced_layershell = "0.7"
+ipc = { path = "../ipc" }
+animation = { path = "../animation" }
+theme = { path = "../theme" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+futures = "0.3"
