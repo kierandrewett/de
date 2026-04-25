@@ -224,7 +224,44 @@ fn render_frame(state: &mut State) {
         }
     }
 
-    // Build cursor overlay element.
+    // Build the overlay vec: cursor first (front-most), title bars next,
+    // each window in space underneath.
+    let mut overlay: Vec<CursorElement<GlesRenderer>> = Vec::new();
+
+    // Title bars for every mapped toplevel (SSD only — clients that
+    // negotiated CSD draw their own and we skip them). Drawn ABOVE the
+    // window's logical y so they don't overlap the surface contents.
+    {
+        use smithay::backend::renderer::{element::Id, utils::CommitCounter};
+        use smithay::utils::Rectangle;
+        let bar_height_logical: i32 = 28;
+        // Distinct grey, easy to spot against the dark compositor clear
+        // colour. Will become a themed colour + title text once the
+        // render::DecorationRenderer GLES bridge is implemented.
+        let bar_color = [0.32, 0.32, 0.36, 1.0];
+        for window in state.common.space.elements() {
+            if let Some(geo) = state.common.space.element_geometry(window) {
+                let bar_loc = smithay::utils::Point::from((
+                    geo.loc.x,
+                    geo.loc.y - bar_height_logical,
+                ));
+                let bar_size = smithay::utils::Size::from((geo.size.w, bar_height_logical));
+                let bar_rect_logical = Rectangle::new(bar_loc, bar_size);
+                let bar_rect_physical: Rectangle<i32, smithay::utils::Physical> =
+                    bar_rect_logical.to_physical_precise_round(scale);
+                overlay.push(CursorElement::Solid(SolidColorRenderElement::new(
+                    Id::new(),
+                    bar_rect_physical,
+                    CommitCounter::default(),
+                    bar_color,
+                    Kind::Unspecified,
+                )));
+            }
+        }
+    }
+
+    // Cursor — pushed last so it ends up FIRST in the front-to-back
+    // ordering after we reverse below (so cursor is on top of bars).
     let cursor_elements: Vec<CursorElement<GlesRenderer>> = if let Some(pointer) =
         state.common.seat.get_pointer()
     {
@@ -274,6 +311,14 @@ fn render_frame(state: &mut State) {
             }
         };
 
+        // Render-output expects elements in front-to-back order: cursor
+        // first (always on top), then SSD title bars, then space windows
+        // get appended internally underneath both.
+        let mut all_overlays: Vec<CursorElement<GlesRenderer>> =
+            Vec::with_capacity(cursor_elements.len() + overlay.len());
+        all_overlays.extend(cursor_elements);
+        all_overlays.extend(overlay);
+
         let result = render_output::<_, CursorElement<GlesRenderer>, _, _>(
             &winit.output,
             renderer,
@@ -281,7 +326,7 @@ fn render_frame(state: &mut State) {
             1.0,
             age,
             [&state.common.space],
-            &cursor_elements,
+            &all_overlays,
             &mut winit.damage_tracker,
             [0.06, 0.06, 0.07, 1.0],
         );
