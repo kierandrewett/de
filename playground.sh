@@ -184,14 +184,25 @@ case "$CMD" in
 
     screenshot)
         out="${1:-$SHOTS/$(date +%H%M%S).png}"
-        if ! command -v grim >/dev/null; then
-            echo "grim not installed; can't screenshot from a wayland host" >&2
+        # Pick the first available screenshot tool that works against the
+        # host session. grim needs wlr-screencopy (sway/wlroots/Hyprland —
+        # NOT GNOME mutter or our own compositor). gnome-screenshot uses
+        # the xdg-desktop-portal screenshot interface (works on GNOME).
+        # ImageMagick `import` is an X11/XWayland fallback.
+        host_display="${HOST_WAYLAND_DISPLAY:-wayland-0}"
+        if command -v grim >/dev/null \
+           && WAYLAND_DISPLAY="$host_display" grim "$out" 2>/dev/null; then
+            echo "$out (grim)"
+        elif command -v gnome-screenshot >/dev/null \
+             && gnome-screenshot -f "$out" 2>/dev/null; then
+            echo "$out (gnome-screenshot)"
+        elif command -v import >/dev/null \
+             && import -window root "$out" 2>/dev/null; then
+            echo "$out (import)"
+        else
+            echo "ERROR: no working screenshot tool" >&2
             exit 1
         fi
-        # grim on the HOST wayland session captures the entire host display
-        # including the nested compositor's winit window.
-        grim "$out"
-        echo "$out"
         ;;
 
     watch)
@@ -215,9 +226,9 @@ case "$CMD" in
                     echo "$tail_text"
                 fi
             done
-            if command -v grim >/dev/null; then
-                shot="$SHOTS/tick-$(printf %03d $i).png"
-                grim "$shot" 2>/dev/null && echo "screenshot: $shot"
+            shot="$SHOTS/tick-$(printf %03d $i).png"
+            if "$0" screenshot "$shot" >/dev/null 2>&1; then
+                echo "screenshot: $shot"
             fi
             sleep "$interval"
         done

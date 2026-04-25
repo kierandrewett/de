@@ -10,7 +10,12 @@ authors = ["Kieran Drewett"]
 zbus = { version = "5", features = [] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
+
+[[bin]]
+name = "notification"
+path = "src/main.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -74,6 +74,10 @@ pub fn run() -> anyhow::Result<()> {
         out
     };
 
+    // Make the Output visible as a wl_output global — without this clients
+    // see "no monitors available" and never create surfaces.
+    let _output_global = output.create_global::<State>(&dh);
+
     let damage_tracker = OutputDamageTracker::from_output(&output);
 
     // Socket — auto-select an available name, then accept clients via calloop.

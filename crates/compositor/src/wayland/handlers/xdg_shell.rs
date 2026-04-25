@@ -32,6 +32,7 @@ impl XdgShellHandler for State {
         // can find it again on destroy. Title and app_id arrive later via
         // xdg_toplevel.set_title / .set_app_id (not wired here yet).
         let id = self.common.shell.alloc_window_id();
+        tracing::info!(id, "xdg_shell: new_toplevel");
         let window = Window::new_wayland_window(surface);
         window.user_data().insert_if_missing(|| ShellWindowId(id));
 
