@@ -25,8 +25,9 @@ You are running NON-INTERACTIVELY in a git worktree. Your CWD is the root of the
 - Read ARCHITECTURE.md before writing any code. It is at the root of this worktree.
 - Read WINDOW_SPEC.md if your work involves rendering, theming, or window chrome.
 - Read PROTOCOLS.md if your work touches Wayland protocol handlers.
-- Create your crate under `crates/<crate-name>/` exactly per the prompt above.
-- Do NOT modify the root Cargo.toml — the orchestrator adds workspace members at integration time. Your crate's Cargo.toml stands alone for now (you may use `package.edition = "2021"`).
+- Place your code at the path the prompt above specifies (a new crate, or modules inside an existing crate).
+- Do NOT add a `[workspace]` table to any Cargo.toml. Do NOT modify the root Cargo.toml. The orchestrator manages the workspace.
+- If the crate already exists (Phase 2 compositor), you are adding a SUBDIRECTORY. Touch only your assigned `src/<area>/` subdirectory, plus any minimal additions to `src/state.rs` / `src/lib.rs` for module declaration — keep edits to shared files small to minimize merge conflicts.
 - Work cycle, repeat until done:
   1. SCAFFOLD: Cargo.toml + module stubs. `cargo check`. Commit.
   2. IMPLEMENT one module at a time. Every ~100 lines: `cargo check`, `cargo clippy -- -D warnings`, `cargo test`, then commit.

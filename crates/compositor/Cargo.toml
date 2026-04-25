@@ -1,0 +1,31 @@
+[package]
+name = "compositor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smithay = { git = "https://github.com/Smithay/smithay.git", features = ["backend_drm", "backend_egl", "backend_gbm", "backend_libinput", "backend_session_libseat", "backend_udev", "backend_winit", "renderer_gl", "renderer_glow", "renderer_pixman", "use_system_lib", "wayland_frontend", "xwayland"] }
+calloop = "0.13"
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
+
+# Phase 1 crates
+rounding = { path = "../rounding" }
+animation = { path = "../animation" }
+theme = { path = "../theme" }
+ipc = { path = "../ipc" }
+cursor = { path = "../cursor" }
+
+# Utility
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "compositor"
+path = "src/main.rs"
