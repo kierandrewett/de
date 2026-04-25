@@ -39,7 +39,7 @@
 //!
 //! ## Features
 //!
-//! - `tiny-skia` — enables [`SquirclePath::to_tiny_skia_path`] for CPU rasterisation.
+//! - `tiny-skia` — enables `SquirclePath::to_tiny_skia_path` for CPU rasterisation.
 
 #![deny(missing_docs)]
 
