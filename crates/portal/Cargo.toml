@@ -1,0 +1,24 @@
+[package]
+name = "portal"
+version = "0.1.0"
+edition = "2021"
+description = "xdg-desktop-portal backend for myDE"
+license = "MIT"
+authors = ["Kieran Drewett"]
+
+[dependencies]
+zbus = { workspace = true }
+zvariant = "5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+ipc = { path = "../ipc" }
+futures-util = "0.3"
+
+[[bin]]
+name = "portal"
+path = "src/main.rs"

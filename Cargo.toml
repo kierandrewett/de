@@ -10,6 +10,8 @@ members = [
     "crates/compositor",
     "crates/notification",
     "crates/status-notifier",
+    "crates/portal",
+    "crates/portal-ui",
 ]
 
 [workspace.package]
