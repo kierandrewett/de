@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/rounding"]
+members = [
+    "crates/rounding",
+    "crates/animation",
+    "crates/cursor",
+    "crates/theme",
+    "crates/ipc",
+    "crates/shell-devtools",
+]
 
 [workspace.package]
 edition = "2021"
