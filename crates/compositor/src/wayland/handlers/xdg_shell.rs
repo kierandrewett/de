@@ -4,7 +4,7 @@ use smithay::{
     delegate_xdg_shell,
     desktop::{PopupKind, Window},
     reexports::wayland_server::protocol::wl_seat,
-    utils::{Rectangle, Serial},
+    utils::{Rectangle, Serial, SERIAL_COUNTER},
     wayland::{
         seat::WaylandFocus,
         shell::xdg::{
@@ -13,6 +13,7 @@ use smithay::{
     },
 };
 
+use crate::focus::KeyboardFocusTarget;
 use crate::shell::{DecorationMode, MappedWindow, WindowSurface};
 use crate::state::State;
 
@@ -49,12 +50,24 @@ impl XdgShellHandler for State {
         );
         self.common.shell.add_window(mapped);
 
-        self.common.space.map_element(window, (0, 0), false);
+        self.common.space.map_element(window.clone(), (0, 0), true);
+
+        // Auto-focus the new window so wtype / typed input has somewhere to
+        // land. Real placement / activation policy belongs in the shell
+        // module; this keeps the playground usable.
+        if let Some(kb) = self.common.seat.get_keyboard() {
+            let target = KeyboardFocusTarget::Window(Box::new(window));
+            let serial = SERIAL_COUNTER.next_serial();
+            kb.set_focus(self, Some(target), serial);
+        }
+        self.common.shell.focus_window(id);
 
         // Notify shell processes (panel, dock, launcher).
         if let Some(info) = self.common.shell.window_info(id) {
             self.common.ipc.broadcast(&ipc::ShellEvent::WindowOpened { window: info });
         }
+        let focus_info = self.common.shell.window_info(id);
+        self.common.ipc.broadcast(&ipc::ShellEvent::FocusedWindowChanged { window: focus_info });
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

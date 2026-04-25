@@ -274,6 +274,62 @@ case "$CMD" in
         socat - "UNIX-CONNECT:$sock"
         ;;
 
+    type)
+        # Inject keyboard text into the focused surface of the nested
+        # compositor via wtype (zwp_virtual_keyboard_manager_v1).
+        if ! command -v wtype >/dev/null; then
+            echo "wtype not installed (sudo dnf install wtype)" >&2; exit 1
+        fi
+        local_sock=$(socket_name)
+        if [[ -z "${local_sock:-}" ]]; then
+            echo "compositor not up — run ./playground.sh up" >&2; exit 1
+        fi
+        if [[ $# -lt 1 ]]; then
+            echo "usage: playground.sh type 'text to send'"; exit 1
+        fi
+        WAYLAND_DISPLAY="$local_sock" wtype "$@"
+        ;;
+
+    key)
+        # Send a single keysym (Return, Escape, Left, BackSpace, etc.) via
+        # wtype's -P (press+release) shortcut.
+        if ! command -v wtype >/dev/null; then
+            echo "wtype not installed (sudo dnf install wtype)" >&2; exit 1
+        fi
+        local_sock=$(socket_name)
+        if [[ -z "${local_sock:-}" ]]; then
+            echo "compositor not up — run ./playground.sh up" >&2; exit 1
+        fi
+        if [[ $# -lt 1 ]]; then
+            echo "usage: playground.sh key Return | Escape | Left | …"; exit 1
+        fi
+        WAYLAND_DISPLAY="$local_sock" wtype -P "$1"
+        ;;
+
+    click)
+        # ydotool talks to /dev/uinput so events go to whichever surface
+        # has system-wide focus on the HOST. To target the nested
+        # compositor: focus its window first (alt-tab to it manually or
+        # use this command after the compositor window is foreground).
+        if ! command -v ydotool >/dev/null; then
+            echo "ydotool not installed" >&2; exit 1
+        fi
+        if ! pgrep -x ydotoold >/dev/null; then
+            echo "ydotoold daemon not running. Start it with:" >&2
+            echo "  sudo systemctl start ydotool   # or:" >&2
+            echo "  sudo ydotoold &" >&2
+            exit 1
+        fi
+        case "${1:-}" in
+            "")        ydotool click 0xC0 ;;          # left click at current
+            left)      ydotool click 0xC0 ;;
+            right)     ydotool click 0xC1 ;;
+            middle)    ydotool click 0xC2 ;;
+            move)      shift; ydotool mousemove --absolute "$1" "$2" ;;
+            *)         echo "usage: playground.sh click [left|right|middle|move x y]"; exit 1 ;;
+        esac
+        ;;
+
     *)
         sed -n '2,30p' "$0"
         ;;
