@@ -169,6 +169,7 @@ fn render_frame(state: &mut State) {
     let Backend::Winit(ref mut winit) = state.backend else { return };
 
     let age = winit.backend.buffer_age().unwrap_or(0);
+    let element_count = state.common.space.elements().count();
 
     // Render under a scoped borrow so we can call `submit` afterwards.
     let damage_owned = {
@@ -193,9 +194,15 @@ fn render_frame(state: &mut State) {
         );
 
         match result {
-            Ok(res) => res.damage.cloned(),
+            Ok(res) => {
+                let dmg_n = res.damage.as_ref().map(|d| d.len()).unwrap_or(0);
+                if element_count > 0 {
+                    tracing::trace!(elements = element_count, damage = dmg_n, "render_output ok");
+                }
+                res.damage.cloned()
+            }
             Err(e) => {
-                tracing::warn!("render_output: {e:?}");
+                tracing::warn!("render_output failed: {e:?}");
                 None
             }
         }
@@ -204,4 +211,13 @@ fn render_frame(state: &mut State) {
     if let Err(e) = winit.backend.submit(damage_owned.as_deref()) {
         tracing::warn!("winit submit: {e}");
     }
+
+    // Drive surface frame callbacks (without these, clients won't paint
+    // their next frame). Anvil does this in its main loop.
+    let now = state.common.clock.now();
+    state.common.space.elements().for_each(|w| {
+        w.send_frame(&winit.output, now, Some(std::time::Duration::from_secs(1)), |_, _| {
+            Some(winit.output.clone())
+        });
+    });
 }
