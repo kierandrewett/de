@@ -9,6 +9,7 @@ members = [
     "crates/shell-devtools",
     "crates/compositor",
     "crates/notification",
+    "crates/status-notifier",
 ]
 
 [workspace.package]
