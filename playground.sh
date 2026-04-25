@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# playground.sh — debug harness for the nested compositor.
+#
+# Subcommands:
+#   up                Build and start: compositor + panel + dock + notification + portal.
+#   down              Kill all playground processes + remove sockets.
+#   status            Show pids, wayland socket, log sizes.
+#   restart           down + up.
+#   logs [name]       Tail a process log (default: compositor).
+#                     Names: compositor | shell-panel | shell-dock |
+#                     notification | portal | client.
+#   screenshot [out]  grim screenshot of the host display (default: out.png
+#                     under playground/).
+#   watch [interval]  Take screenshots + tail logs every <interval> sec
+#                     until Ctrl-C. Default 3 s.
+#   client <cmd...>   Launch a wayland client against the compositor
+#                     (e.g. `playground.sh client kitty -e htop`).
+#   ipc <json>        Send a raw ShellRequest line to the compositor IPC
+#                     socket via socat. Example:
+#                       playground.sh ipc '{"type":"GetAllWindows"}'
+#   events            Tail ShellEvents broadcast by the compositor.
+#
+# All state goes under playground/ (gitignored).
+set -uo pipefail
+
+cd "$(dirname "$0")"
+DIR="playground"
+PIDS="$DIR/pids"
+LOGS="$DIR/logs"
+SHOTS="$DIR/screenshots"
+mkdir -p "$DIR" "$PIDS" "$LOGS" "$SHOTS"
+
+CMD="${1:-status}"
+shift || true
+
+PROCS=(compositor shell-panel shell-dock notification portal)
+
+socket_name() {
+    grep -oE 'Wayland socket: wayland-[0-9]+' "$LOGS/compositor.log" 2>/dev/null \
+        | tail -1 | awk '{print $3}'
+}
+
+wayland_display() {
+    local s; s=$(socket_name)
+    [[ -n "$s" ]] && echo "$s"
+}
+
+is_alive() { kill -0 "$1" 2>/dev/null; }
+
+clean_pidfiles() {
+    for f in "$PIDS"/*.pid; do
+        [[ -e "$f" ]] || continue
+        local pid; pid=$(cat "$f")
+        if ! is_alive "$pid"; then rm -f "$f"; fi
+    done
+}
+
+case "$CMD" in
+    up)
+        # Make sure nothing stale is running.
+        "$0" down >/dev/null 2>&1 || true
+
+        echo "[playground] building binaries..."
+        cargo build --message-format=short \
+            -p compositor -p shell-panel -p shell-dock \
+            -p notification -p portal 2>&1 | tail -3
+
+        echo "[playground] launching compositor..."
+        stdbuf -oL ./target/debug/compositor --winit \
+            > "$LOGS/compositor.log" 2>&1 &
+        echo $! > "$PIDS/compositor.pid"
+
+        echo -n "[playground] waiting for wayland socket"
+        for _ in $(seq 1 80); do
+            if ! is_alive "$(cat "$PIDS/compositor.pid")"; then
+                echo " — DEAD"
+                tail -20 "$LOGS/compositor.log"
+                exit 1
+            fi
+            local_sock=$(socket_name)
+            if [[ -n "${local_sock:-}" ]]; then
+                echo " → $local_sock"
+                break
+            fi
+            sleep 0.25
+            echo -n "."
+        done
+
+        local_sock=$(socket_name)
+        if [[ -z "${local_sock:-}" ]]; then
+            echo "[playground] ERROR: socket never appeared. Last log:"
+            tail -20 "$LOGS/compositor.log"
+            exit 1
+        fi
+
+        export WAYLAND_DISPLAY="$local_sock"
+        echo "[playground] WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+
+        for proc in shell-panel shell-dock notification portal; do
+            stdbuf -oL "./target/debug/$proc" \
+                > "$LOGS/$proc.log" 2>&1 &
+            echo $! > "$PIDS/$proc.pid"
+            echo "[playground] $proc pid=$(cat $PIDS/$proc.pid)"
+        done
+
+        echo
+        echo "[playground] All up. Try:"
+        echo "  ./playground.sh client kitty"
+        echo "  ./playground.sh logs compositor"
+        echo "  ./playground.sh watch 2"
+        echo "  ./playground.sh screenshot"
+        echo "  ./playground.sh down"
+        ;;
+
+    down)
+        # Clients first
+        if [[ -f "$PIDS/client.pid" ]]; then
+            pid=$(cat "$PIDS/client.pid")
+            kill "$pid" 2>/dev/null || true
+            rm -f "$PIDS/client.pid"
+        fi
+        for proc in "${PROCS[@]}"; do
+            f="$PIDS/$proc.pid"
+            if [[ -f "$f" ]]; then
+                pid=$(cat "$f")
+                kill "$pid" 2>/dev/null || true
+                rm -f "$f"
+            fi
+        done
+        # Belt-and-braces — kill any stragglers from prior crashes.
+        pkill -f "target/debug/compositor"   2>/dev/null || true
+        pkill -f "target/debug/shell-panel"  2>/dev/null || true
+        pkill -f "target/debug/shell-dock"   2>/dev/null || true
+        pkill -f "target/debug/notification" 2>/dev/null || true
+        pkill -f "target/debug/portal"       2>/dev/null || true
+        rm -f "${XDG_RUNTIME_DIR:-/tmp}/myDE.sock"
+        echo "[playground] stopped."
+        ;;
+
+    status)
+        clean_pidfiles
+        printf "%-15s %-10s %-12s %s\n" "PROCESS" "PID" "ALIVE" "LOG SIZE"
+        for proc in "${PROCS[@]}" client; do
+            f="$PIDS/$proc.pid"
+            if [[ -f "$f" ]]; then
+                pid=$(cat "$f")
+                alive=$(is_alive "$pid" && echo yes || echo no)
+            else
+                pid="-"; alive="-"
+            fi
+            log="$LOGS/$proc.log"
+            sz=$([[ -f "$log" ]] && wc -c < "$log" || echo 0)
+            printf "%-15s %-10s %-12s %s bytes\n" "$proc" "$pid" "$alive" "$sz"
+        done
+        echo
+        local_sock=$(socket_name)
+        if [[ -n "${local_sock:-}" ]]; then
+            echo "Wayland socket: $local_sock"
+            echo "  -> WAYLAND_DISPLAY=$local_sock <wayland-client>"
+        else
+            echo "Wayland socket: not yet announced"
+        fi
+        if [[ -S "${XDG_RUNTIME_DIR:-/tmp}/myDE.sock" ]]; then
+            echo "IPC socket:     ${XDG_RUNTIME_DIR:-/tmp}/myDE.sock"
+        else
+            echo "IPC socket:     missing"
+        fi
+        ;;
+
+    restart)
+        "$0" down
+        sleep 0.5
+        "$0" up
+        ;;
+
+    logs)
+        name="${1:-compositor}"
+        log="$LOGS/$name.log"
+        if [[ ! -f "$log" ]]; then
+            echo "no log at $log"; exit 1
+        fi
+        exec tail -f "$log"
+        ;;
+
+    screenshot)
+        out="${1:-$SHOTS/$(date +%H%M%S).png}"
+        if ! command -v grim >/dev/null; then
+            echo "grim not installed; can't screenshot from a wayland host" >&2
+            exit 1
+        fi
+        # grim on the HOST wayland session captures the entire host display
+        # including the nested compositor's winit window.
+        grim "$out"
+        echo "$out"
+        ;;
+
+    watch)
+        interval="${1:-3}"
+        echo "watching every ${interval}s — Ctrl-C to stop"
+        echo "screenshots will be saved to $SHOTS/"
+        i=0
+        while true; do
+            i=$((i + 1))
+            stamp=$(date +%H:%M:%S)
+            echo
+            echo "===== tick $i  ($stamp) ====="
+            "$0" status
+            for log in "$LOGS"/*.log; do
+                [[ -e "$log" ]] || continue
+                name=$(basename "$log" .log)
+                tail_text=$(tail -3 "$log" 2>/dev/null)
+                if [[ -n "$tail_text" ]]; then
+                    echo
+                    echo "-- $name (last 3) --"
+                    echo "$tail_text"
+                fi
+            done
+            if command -v grim >/dev/null; then
+                shot="$SHOTS/tick-$(printf %03d $i).png"
+                grim "$shot" 2>/dev/null && echo "screenshot: $shot"
+            fi
+            sleep "$interval"
+        done
+        ;;
+
+    client)
+        local_sock=$(socket_name)
+        if [[ -z "${local_sock:-}" ]]; then
+            echo "compositor isn't up — run ./playground.sh up first" >&2
+            exit 1
+        fi
+        if [[ $# -lt 1 ]]; then
+            echo "usage: playground.sh client <command> [args...]"; exit 1
+        fi
+        echo "[playground] launching client under WAYLAND_DISPLAY=$local_sock"
+        WAYLAND_DISPLAY="$local_sock" "$@" \
+            > "$LOGS/client.log" 2>&1 &
+        echo $! > "$PIDS/client.pid"
+        echo "[playground] client pid=$(cat $PIDS/client.pid) — log: $LOGS/client.log"
+        ;;
+
+    ipc)
+        if [[ $# -lt 1 ]]; then
+            echo "usage: playground.sh ipc '<json-shellrequest>'"; exit 1
+        fi
+        sock="${XDG_RUNTIME_DIR:-/tmp}/myDE.sock"
+        if [[ ! -S "$sock" ]]; then
+            echo "compositor IPC socket not found at $sock" >&2; exit 1
+        fi
+        if ! command -v socat >/dev/null; then
+            echo "socat not installed — can't talk to the IPC socket" >&2
+            exit 1
+        fi
+        printf '%s\n' "$1" | socat - "UNIX-CONNECT:$sock"
+        ;;
+
+    events)
+        sock="${XDG_RUNTIME_DIR:-/tmp}/myDE.sock"
+        if ! command -v socat >/dev/null; then
+            echo "socat not installed — can't tail IPC events" >&2; exit 1
+        fi
+        echo "tailing ShellEvents from $sock — Ctrl-C to stop"
+        socat - "UNIX-CONNECT:$sock"
+        ;;
+
+    *)
+        sed -n '2,30p' "$0"
+        ;;
+esac

@@ -61,9 +61,12 @@ pub fn run() -> anyhow::Result<()> {
             },
         );
         let mode = Mode { size: win_size, refresh: 60_000 };
+        // winit's GL framebuffer is Y-down vs smithay's render-output
+        // expectation — Flipped180 corrects the upside-down surfaces.
+        // Matches anvil's winit example.
         out.change_current_state(
             Some(mode),
-            Some(Transform::Normal),
+            Some(Transform::Flipped180),
             None,
             Some((0, 0).into()),
         );
