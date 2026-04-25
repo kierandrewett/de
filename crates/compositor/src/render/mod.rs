@@ -1,22 +1,31 @@
-//! Per-window rendering pipeline.
+//! Per-window chrome rendering pipeline (squircle clip, macOS-style border,
+//! shadow, title bar). All CPU-side computation lives here; the GPU
+//! integration via Smithay's `GlesFrame` is **not yet wired**.
 //!
-//! This module implements the full per-window compositing pipeline:
-//! shadow → outer border → window fill → title bar (SSD) → client content → inner highlight.
+//! ## Status
 //!
-//! # Architecture
+//! Today the compositor draws plain wayland surfaces via
+//! [`smithay::desktop::space::render_output`] (see `crates/compositor/src/winit.rs`).
+//! That gives us functional windows but bypasses everything in this module.
 //!
-//! The pipeline is split into independent sub-renderers, each with its own cache.
-//! All CPU-side computation (shadow generation, path tessellation, pixel data) is
-//! handled here. GPU integration hooks in via the [`FrameRef`] trait; the Smithay
-//! `GlesFrame` implementation lives in the backend wiring (subagent 07).
+//! The renderers below (Shadow, Border, Clip, Decoration, Effect) are
+//! intentional dead code until the FrameRef ↔ GlesFrame bridge is implemented.
+//! They produce CPU pixel data + path geometry that the bridge will upload as
+//! textures and stitch into the per-window draw call.
 //!
-//! # Render order (back to front, per WINDOW_SPEC.md)
+//! ## Render order (back to front, per WINDOW_SPEC.md)
 //! 1. Shadow (pre-computed blurred squircle behind the window)
 //! 2. Outer border stroke (0.5 px along squircle path)
 //! 3. Window fill (SSD only — background behind title bar + content)
 //! 4. Title bar (SSD only — iced-rendered texture)
 //! 5. Client content (clipped to squircle via SDF shader)
 //! 6. Inner highlight (1 px inset, vertical alpha gradient)
+//!
+//! ## Wiring TODO
+//! Implement `FrameRef for smithay::backend::renderer::gles::GlesFrame`,
+//! then in `winit.rs`/`udev.rs::render_frame` call
+//! `WindowRenderer::render_window` for each window after `render_output`.
+#![allow(dead_code)]
 
 pub mod border;
 pub mod clip;
@@ -24,16 +33,11 @@ pub mod decoration;
 pub mod effects;
 pub mod shadow;
 
-#[allow(unused_imports)]
 pub use border::BorderRenderer;
-#[allow(unused_imports)]
 pub use clip::{ClipRenderer, ClipStrategy};
-#[allow(unused_imports)]
-pub use decoration::{ButtonHit, DecorationRenderer};
-#[allow(unused_imports)]
+pub use decoration::DecorationRenderer;
 pub use effects::EffectRenderer;
-#[allow(unused_imports)]
-pub use shadow::{ShadowCache, ShadowPixels, ShadowRenderer};
+pub use shadow::ShadowRenderer;
 
 use rounding::{SquircleConfig, SquirclePath};
 use std::collections::HashMap;

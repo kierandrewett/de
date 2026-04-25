@@ -43,8 +43,8 @@ pub struct Theme {
     pub spacing: Spacing,
     /// Window decoration tokens.
     pub windows: WindowTheme,
-    /// Window animation presets.
-    // TODO: import from animation crate once available
+    /// Window animation presets — semantic tokens, mapped to `animation`
+    /// crate primitives at use time (see `theme::animation` module docs).
     pub animations: WindowAnimationPresets,
 }
 

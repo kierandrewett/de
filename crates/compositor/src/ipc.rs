@@ -127,6 +127,7 @@ impl IpcServer {
     }
 
     /// Number of currently connected clients (for tests / diagnostics).
+    #[allow(dead_code)]
     pub fn client_count(&self) -> usize {
         self.clients.lock().unwrap().len()
     }

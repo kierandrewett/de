@@ -21,7 +21,7 @@ use smithay::{
         wayland_server::Display,
         winit::platform::pump_events::PumpStatus,
     },
-    utils::{Rectangle, Transform},
+    utils::Transform,
     wayland::socket::ListeningSocketSource,
 };
 

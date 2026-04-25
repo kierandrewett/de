@@ -1,7 +1,9 @@
 //! Window animation preset tokens.
 //!
-//! These types are defined locally until the `animation` crate is available.
-// TODO: import from animation crate once available
+//! Theme tokens stay independent of the `animation` crate: this file describes
+//! *intent* (semantic easing names that round-trip through user-visible TOML
+//! config), while `animation::EasingCurve` describes *implementation*. Window
+//! managers map `theme::Easing` → an `animation::EasingCurve` at use time.
 
 use serde::{Deserialize, Serialize};
 
