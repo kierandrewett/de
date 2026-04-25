@@ -17,7 +17,7 @@
 //! ```
 
 mod metadata;
-mod render;
+pub mod render;
 mod shape;
 mod theme;
 mod xcursor_fb;

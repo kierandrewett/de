@@ -228,34 +228,72 @@ fn render_frame(state: &mut State) {
     // each window in space underneath.
     let mut overlay: Vec<CursorElement<GlesRenderer>> = Vec::new();
 
-    // Title bars for every mapped toplevel (SSD only — clients that
-    // negotiated CSD draw their own and we skip them). Drawn ABOVE the
-    // window's logical y so they don't overlap the surface contents.
+    // Title bars for every mapped SSD toplevel. CSD clients (those that
+    // asked for ClientSide decoration) are skipped — they draw their own
+    // chrome. The bar is rendered offscreen by iced (chrome_iced module)
+    // and composited as a single MemoryRenderBufferRenderElement per window.
     {
-        use smithay::backend::renderer::{element::Id, utils::CommitCounter};
-        use smithay::utils::Rectangle;
-        let bar_height_logical: i32 = 28;
-        // Distinct grey, easy to spot against the dark compositor clear
-        // colour. Will become a themed colour + title text once the
-        // render::DecorationRenderer GLES bridge is implemented.
-        let bar_color = [0.32, 0.32, 0.36, 1.0];
-        for window in state.common.space.elements() {
-            if let Some(geo) = state.common.space.element_geometry(window) {
-                let bar_loc = smithay::utils::Point::from((
-                    geo.loc.x,
-                    geo.loc.y - bar_height_logical,
-                ));
-                let bar_size = smithay::utils::Size::from((geo.size.w, bar_height_logical));
-                let bar_rect_logical = Rectangle::new(bar_loc, bar_size);
-                let bar_rect_physical: Rectangle<i32, smithay::utils::Physical> =
-                    bar_rect_logical.to_physical_precise_round(scale);
-                overlay.push(CursorElement::Solid(SolidColorRenderElement::new(
-                    Id::new(),
-                    bar_rect_physical,
-                    CommitCounter::default(),
-                    bar_color,
-                    Kind::Unspecified,
-                )));
+        // Snapshot the windows we care about up front so we can drop the
+        // borrow on `state.common.space` before mutably borrowing
+        // `state.common.chrome_iced` and `winit.backend`.
+        let focused_id = state.common.shell.focused_window_id();
+        let ssd_titles: Vec<(smithay::utils::Rectangle<i32, smithay::utils::Logical>, String, bool)> =
+            state
+                .common
+                .space
+                .elements()
+                .filter(|w| crate::shell::is_ssd(w))
+                .filter_map(|w| {
+                    let geo = state.common.space.element_geometry(w)?;
+                    let title = if let smithay::desktop::WindowSurface::Wayland(toplevel) =
+                        w.underlying_surface()
+                    {
+                        smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+                            states
+                                .data_map
+                                .get::<std::sync::Mutex<smithay::wayland::shell::xdg::XdgToplevelSurfaceRoleAttributes>>()
+                                .and_then(|m| m.lock().ok().and_then(|g| g.title.clone()))
+                        })
+                        .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let win_id = w
+                        .user_data()
+                        .get::<crate::wayland::handlers::xdg_shell::ShellWindowId>()
+                        .map(|id| id.0);
+                    let focused = win_id == focused_id;
+                    Some((geo, title, focused))
+                })
+                .collect();
+
+        for (geo, title, focused) in ssd_titles {
+            let chrome = crate::shell::title_bar_chrome(geo);
+            let bar_phys: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
+                chrome.bar.to_physical_precise_round(scale);
+            let phys_loc = chrome.bar.loc.to_f64().to_physical(scale);
+            let buffer_opt = state.common.chrome_iced.render_title_bar(
+                bar_phys.size.w.max(1) as u32,
+                bar_phys.size.h.max(1) as u32,
+                scale.x,
+                &title,
+                focused,
+            );
+            let Some(buffer) = buffer_opt else { continue };
+            let (renderer, _) = match winit.backend.bind() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                phys_loc,
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                overlay.push(CursorElement::Texture(el));
             }
         }
     }
@@ -331,6 +369,14 @@ fn render_frame(state: &mut State) {
             [0.06, 0.06, 0.07, 1.0],
         );
 
+        // Honour any pending screenshot request before submit (the back
+        // buffer is what we just drew). Path comes from the IPC handler.
+        if let Some(out_path) = state.common.pending_screenshot.take() {
+            if let Err(e) = capture_framebuffer(renderer, &fb, &winit.output, &out_path) {
+                tracing::warn!("screenshot capture failed: {e}");
+            }
+        }
+
         match result {
             Ok(res) => {
                 let dmg_n = res.damage.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -358,6 +404,58 @@ fn render_frame(state: &mut State) {
             Some(winit.output.clone())
         });
     });
+}
+
+/// Read the just-rendered framebuffer back to CPU memory and write it as
+/// a PNG. Used by the in-compositor screenshot path so callers don't have
+/// to take a host-side screenshot of the nested winit window.
+fn capture_framebuffer(
+    renderer: &mut GlesRenderer,
+    fb: &smithay::backend::renderer::gles::GlesTarget<'_>,
+    output: &smithay::output::Output,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use smithay::backend::renderer::ExportMem;
+    use smithay::utils::{Point, Rectangle, Size};
+
+    let mode = output.current_mode().ok_or_else(|| anyhow::anyhow!("output has no mode"))?;
+    let size: Size<i32, smithay::utils::Buffer> = (mode.size.w, mode.size.h).into();
+    let region: Rectangle<i32, smithay::utils::Buffer> = Rectangle::new(Point::from((0, 0)), size);
+
+    let mapping = renderer
+        .copy_framebuffer(fb, region, Fourcc::Argb8888)
+        .map_err(|e| anyhow::anyhow!("copy_framebuffer: {e:?}"))?;
+    let bytes = renderer
+        .map_texture(&mapping)
+        .map_err(|e| anyhow::anyhow!("map_texture: {e:?}"))?;
+
+    // smithay returns BGRA premultiplied; tiny_skia wants RGBA premultiplied.
+    let mut rgba = bytes.to_vec();
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+
+    use smithay::backend::renderer::TextureMapping;
+    let w = mode.size.w as usize;
+    let h = mode.size.h as usize;
+    let stride = w * 4;
+    if mapping.flipped() {
+        let row: Vec<u8> = vec![0; stride];
+        let mut tmp = row;
+        for y in 0..h / 2 {
+            let other = h - 1 - y;
+            tmp.copy_from_slice(&rgba[y * stride..y * stride + stride]);
+            rgba.copy_within(other * stride..other * stride + stride, y * stride);
+            rgba[other * stride..other * stride + stride].copy_from_slice(&tmp);
+        }
+    }
+
+    let mut pixmap = tiny_skia::Pixmap::new(w as u32, h as u32)
+        .ok_or_else(|| anyhow::anyhow!("Pixmap::new {w}x{h}"))?;
+    pixmap.data_mut().copy_from_slice(&rgba);
+    pixmap.save_png(path)?;
+    tracing::info!("screenshot saved to {}", path.display());
+    Ok(())
 }
 
 /// Last-resort 12×12 white square at the cursor location, used when no

@@ -10,3 +10,6 @@ target/
 .env.local
 session-logs/
 playground/
+subagents/
+*.md
+!README.md

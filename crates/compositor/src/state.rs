@@ -171,6 +171,15 @@ pub struct CommonState {
     /// from the pointer location at render time.
     pub cursor_hotspot: (i32, i32),
 
+    // ── SSD chrome ────────────────────────────────────────────────────────
+    /// Iced offscreen renderer for the full title-bar chrome (buttons +
+    /// title text). Cached per `(size, scale, focus, title)`.
+    pub chrome_iced: crate::chrome_iced::IcedChrome,
+
+    /// When set, the next render frame copies the framebuffer back to
+    /// CPU and writes a PNG to this path. Cleared after a single frame.
+    pub pending_screenshot: Option<std::path::PathBuf>,
+
     // ── Frame timing ──────────────────────────────────────────────────────
     /// Timestamp of the previous render frame (used to compute `dt` for
     /// animation tick).
@@ -317,6 +326,8 @@ impl CommonState {
             }),
             cursor_buffer: None,
             cursor_hotspot: (0, 0),
+            chrome_iced: crate::chrome_iced::IcedChrome::default(),
+            pending_screenshot: None,
             last_frame: Instant::now(),
         }
     }

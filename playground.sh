@@ -274,6 +274,35 @@ case "$CMD" in
         socat - "UNIX-CONNECT:$sock"
         ;;
 
+    inner-screenshot)
+        # Ask the compositor itself to read back its framebuffer to PNG.
+        # Avoids host-side screenshot tools entirely. Output is copied
+        # into playground/screenshots/ for the conversation.
+        sock="${XDG_RUNTIME_DIR:-/tmp}/myDE.sock"
+        produced="${XDG_RUNTIME_DIR:-/tmp}/myDE-screenshot.png"
+        if [[ ! -S "$sock" ]]; then
+            echo "compositor IPC socket not found at $sock" >&2; exit 1
+        fi
+        if ! command -v socat >/dev/null; then
+            echo "socat not installed — can't talk to IPC" >&2; exit 1
+        fi
+        rm -f "$produced"
+        printf '%s\n' '{"type":"TakeScreenshot","region":null}' \
+            | socat - "UNIX-CONNECT:$sock" >/dev/null &
+        # Wait up to 3 s for the file to appear (one render frame).
+        for _ in 1 2 3 4 5 6; do
+            [[ -f "$produced" ]] && break
+            sleep 0.5
+        done
+        if [[ ! -f "$produced" ]]; then
+            echo "ERROR: compositor produced no screenshot at $produced" >&2
+            exit 1
+        fi
+        out="${1:-$SHOTS/inner-$(date +%H%M%S).png}"
+        cp "$produced" "$out"
+        echo "$out"
+        ;;
+
     type)
         # Inject keyboard text into the focused surface of the nested
         # compositor via wtype (zwp_virtual_keyboard_manager_v1).

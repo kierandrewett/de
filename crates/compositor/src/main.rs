@@ -8,6 +8,7 @@
 
 use clap::Parser;
 
+mod chrome_iced;
 mod focus;
 mod input;
 mod ipc;

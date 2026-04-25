@@ -17,6 +17,13 @@ theme = { path = "../theme" }
 ipc = { path = "../ipc" }
 cursor = { path = "../cursor" }
 
+# Iced offscreen renderer for SSD title-bar chrome
+iced_core = "0.13"
+iced_widget = { version = "0.13", features = ["svg"] }
+iced_runtime = "0.13"
+iced_tiny_skia = { version = "0.13", features = ["svg"] }
+iced_graphics = "0.13"
+
 # Utility
 tiny-skia = { workspace = true }
 tracing = { workspace = true }

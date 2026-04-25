@@ -21,7 +21,7 @@ use crate::state::State;
 /// `user_data` map. Allows us to round-trip from a wayland surface to the
 /// shell's `MappedWindow.id`.
 #[derive(Debug, Clone, Copy)]
-struct ShellWindowId(u64);
+pub struct ShellWindowId(pub u64);
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {

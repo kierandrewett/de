@@ -14,10 +14,70 @@ pub mod minimize;
 pub mod output_switch;
 pub mod snapping;
 
+use smithay::desktop::Window;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use animation::animated::{AnimatedFloat, AnimatedRect, AnimatedValue};
 use ipc::{Rect, SnapLayout, WindowInfo, WindowState};
+
+// ---------------------------------------------------------------------------
+// SSD title-bar chrome geometry
+// ---------------------------------------------------------------------------
+
+/// Logical-pixel height of an SSD title bar.
+pub const TITLE_BAR_HEIGHT: i32 = 28;
+/// Diameter of each control button (circle background; the icon inside is 17px with 2px padding).
+pub const BUTTON_SIZE: i32 = 21;
+/// Spacing between adjacent control buttons (edge-to-edge gap).
+pub const BUTTON_GAP: i32 = 6;
+/// Left/right inset of the leftmost/rightmost button from the bar edge.
+pub const BUTTON_MARGIN: i32 = 10;
+
+/// Logical rectangles for one SSD window's chrome.
+#[derive(Debug, Clone, Copy)]
+pub struct TitleBarChrome {
+    /// The full title bar background.
+    pub bar: Rectangle<i32, Logical>,
+    /// Close (red) button.
+    pub close: Rectangle<i32, Logical>,
+    /// Minimize (yellow) button.
+    pub minimize: Rectangle<i32, Logical>,
+    /// Maximize (green) button.
+    pub maximize: Rectangle<i32, Logical>,
+}
+
+/// Compute the chrome geometry for a window whose content rect is `geo`.
+/// macOS convention: traffic-light controls are at the LEFT of the bar.
+pub fn title_bar_chrome(geo: Rectangle<i32, Logical>) -> TitleBarChrome {
+    let bar_loc = Point::from((geo.loc.x, geo.loc.y - TITLE_BAR_HEIGHT));
+    let bar = Rectangle::new(bar_loc, Size::from((geo.size.w, TITLE_BAR_HEIGHT)));
+    let center_y = bar_loc.y + (TITLE_BAR_HEIGHT - BUTTON_SIZE) / 2;
+
+    let mut x = bar_loc.x + BUTTON_MARGIN;
+    let close = Rectangle::new(Point::from((x, center_y)), Size::from((BUTTON_SIZE, BUTTON_SIZE)));
+    x += BUTTON_SIZE + BUTTON_GAP;
+    let minimize = Rectangle::new(Point::from((x, center_y)), Size::from((BUTTON_SIZE, BUTTON_SIZE)));
+    x += BUTTON_SIZE + BUTTON_GAP;
+    let maximize = Rectangle::new(Point::from((x, center_y)), Size::from((BUTTON_SIZE, BUTTON_SIZE)));
+
+    TitleBarChrome { bar, close, minimize, maximize }
+}
+
+/// Whether a smithay `Window` was negotiated as server-side decorations.
+/// Returns `true` for any non-Wayland surface (X11 windows still need a
+/// server-drawn title bar) and for Wayland toplevels whose pending
+/// `decoration_mode` is anything other than `ClientSide`.
+pub fn is_ssd(window: &Window) -> bool {
+    use smithay::desktop::WindowSurface as SmithayWindowSurface;
+    use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+    match window.underlying_surface() {
+        SmithayWindowSurface::Wayland(toplevel) => {
+            let mode = toplevel.with_pending_state(|s| s.decoration_mode);
+            !matches!(mode, Some(Mode::ClientSide))
+        }
+        _ => true,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Core types

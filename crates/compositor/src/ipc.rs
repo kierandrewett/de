@@ -221,10 +221,20 @@ fn handle_request(state: &mut State, req: ShellRequest) {
         ShellRequest::Lock => {
             tracing::info!("ipc: Lock requested (session-lock not yet wired into shell)");
         }
+        ShellRequest::TakeScreenshot { region: _ } => {
+            // Region cropping is a follow-up; for now we always grab the
+            // full output. The compositor reads back the framebuffer on
+            // the next render and writes a PNG to a deterministic path.
+            let path = std::env::var("XDG_RUNTIME_DIR")
+                .map(|d| std::path::PathBuf::from(d).join("myDE-screenshot.png"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/myDE-screenshot.png"));
+            tracing::info!("ipc: TakeScreenshot -> {}", path.display());
+            state.common.pending_screenshot = Some(path);
+        }
         // The remaining variants either need backend support that doesn't
-        // exist yet (output config, screencast, screenshots) or system
-        // integration outside the compositor (Shutdown/Reboot/Suspend via
-        // logind). Log and ignore for now — clients tolerate missing replies.
+        // exist yet (output config, screencast) or system integration
+        // outside the compositor (Shutdown/Reboot/Suspend via logind).
+        // Log and ignore for now — clients tolerate missing replies.
         other => tracing::debug!("ipc: unhandled request {other:?}"),
     }
 }
