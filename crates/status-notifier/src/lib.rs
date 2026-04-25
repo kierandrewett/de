@@ -18,7 +18,7 @@ mod types;
 mod watcher;
 
 pub use error::{Error, Result};
-pub use icon::{best_pixmap, lookup_icon};
+pub use icon::{argb_network_to_rgba, best_pixmap, lookup_icon};
 pub use service::StatusNotifierWatcher;
 pub use types::{
     DbusMenu, ItemStatus, MenuItem, StatusNotifierItem, ToggleType, TrayEvent, TrayIcon,
