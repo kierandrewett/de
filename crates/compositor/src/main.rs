@@ -10,6 +10,7 @@ use clap::Parser;
 
 mod state;
 mod wayland;
+#[allow(dead_code, unused_imports)]
 mod render;
 mod shell;
 

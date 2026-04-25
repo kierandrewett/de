@@ -7,6 +7,7 @@
 ///
 /// This is a placeholder — subagent 07 will fill in real fields
 /// (Display, CompositorState, XdgShellState, SeatState, etc.).
+#[allow(dead_code)]
 pub struct State {
     // === wayland fields (subagent 07) ===
     // === render fields (subagent 08) ===
