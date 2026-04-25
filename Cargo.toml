@@ -12,6 +12,7 @@ members = [
     "crates/status-notifier",
     "crates/portal",
     "crates/portal-ui",
+    "crates/shell-launcher",
 ]
 
 [workspace.package]
