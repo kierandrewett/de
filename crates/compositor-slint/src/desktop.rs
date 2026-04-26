@@ -202,7 +202,9 @@ pub fn resolve_icon(icon_name: &str) -> Option<PathBuf> {
         "scalable/apps",
         "32x32/apps",
         "24x24/apps",
+        "16x16/apps",
         "scalable/mimetypes",
+        "16x16/mimetypes",
     ];
     let exts = ["png", "svg", "xpm"];
 
