@@ -1,40 +1,49 @@
 #!/usr/bin/env bash
-# run.sh — build and run the GPU compositor-slint with a test client.
+# run.sh — smoke test for compositor-slint.
 #
-# Usage: bash crates/compositor-slint/run.sh
+# Behaviour:
+#   1. Launches compositor-slint binary (pre-built; this script does NOT build).
+#   2. Waits up to 3 s for the Wayland socket to appear in the log.
+#   3. Launches kitty against the socket.
+#   4. Waits 15 s for visual inspection / stability check.
+#   5. Cleans up (kills compositor + kitty).
+#   6. Returns 0 if no "panicked at" was found in the log, non-zero otherwise.
 #
-# This script builds compositor-slint (GPU pipeline via FemtoVGWGPURenderer),
-# launches it, waits for the Wayland socket, then launches kitty inside it.
-# Screenshot is taken to /tmp/slint-gpu-spike.png for visual verification (D5).
+# Build before running:
+#   CARGO_TARGET_DIR=/var/tmp/de-prompts-target cargo build -p compositor-slint
 #
-# Requirements: kitty, grim (optional for screenshots)
-# Note: uses CARGO_TARGET_DIR=/var/tmp/de-prompts-target if disk space is tight.
+# Usage:
+#   bash crates/compositor-slint/run.sh
+#
+# Requirements: kitty, optional: grim (for screenshot)
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-LOG="/tmp/slint-gpu.log"
-SCREENSHOT="/tmp/slint-gpu-spike.png"
+LOG="/tmp/slint-compositor.log"
+SCREENSHOT="/tmp/slint-prod.png"
 
-# Use /var/tmp for build artifacts if /home is tight on space
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/var/tmp/de-prompts-target}"
+BINARY="$CARGO_TARGET_DIR/debug/compositor-slint"
+
+if [ ! -f "$BINARY" ]; then
+    echo "ERROR: binary not found at $BINARY"
+    echo "Run: CARGO_TARGET_DIR=/var/tmp/de-prompts-target cargo build -p compositor-slint"
+    exit 1
+fi
 
 cd "$REPO_ROOT"
 
-echo "=== Building compositor-slint (GPU) ==="
-cargo build -p compositor-slint 2>&1
-
-BINARY="$CARGO_TARGET_DIR/debug/compositor-slint"
-
-echo "=== Starting GPU compositor (logs → $LOG) ==="
-"$BINARY" > "$LOG" 2>&1 &
+echo "=== Starting compositor-slint (logs → $LOG) ==="
+RUST_LOG="compositor_slint=debug,wgpu=warn" "$BINARY" > "$LOG" 2>&1 &
 COMPOSITOR_PID=$!
 echo "Compositor PID: $COMPOSITOR_PID"
 
-# Wait for the Wayland socket to appear
-echo "=== Waiting for Wayland socket ==="
+# ── Wait up to 3 s for the Wayland socket ────────────────────────────────────
+echo "=== Waiting up to 3 s for Wayland socket ==="
 WAYLAND_SOCKET=""
-for i in $(seq 1 30); do
+for i in $(seq 1 6); do
     sleep 0.5
     WAYLAND_SOCKET=$(grep "WAYLAND_DISPLAY=" "$LOG" 2>/dev/null | tail -1 | sed 's/WAYLAND_DISPLAY=//' || true)
     if [ -n "$WAYLAND_SOCKET" ]; then
@@ -44,32 +53,47 @@ for i in $(seq 1 30); do
 done
 
 if [ -z "$WAYLAND_SOCKET" ]; then
-    echo "ERROR: Wayland socket not found. Logs:"
-    cat "$LOG"
-    kill $COMPOSITOR_PID 2>/dev/null || true
+    echo "ERROR: Wayland socket not found after 3 s. Log tail:"
+    tail -30 "$LOG"
+    kill "$COMPOSITOR_PID" 2>/dev/null || true
     exit 1
 fi
 
+# ── Launch kitty ──────────────────────────────────────────────────────────────
 echo "=== Launching kitty (WAYLAND_DISPLAY=$WAYLAND_SOCKET) ==="
 WAYLAND_DISPLAY="$WAYLAND_SOCKET" kitty &
 KITTY_PID=$!
 
-echo "=== Waiting 5 seconds for kitty to render ==="
-sleep 5
+# ── 15 s visual inspection window ────────────────────────────────────────────
+echo "=== Waiting 15 s for visual inspection ==="
+sleep 15
 
-echo "=== Taking screenshot to $SCREENSHOT ==="
+# ── Optional screenshot ───────────────────────────────────────────────────────
 if command -v grim &>/dev/null; then
-    grim "$SCREENSHOT" && echo "Screenshot saved: $SCREENSHOT"
-    echo "Compare with: /tmp/spike-2.png (software renderer reference)"
+    echo "=== Taking screenshot to $SCREENSHOT ==="
+    grim "$SCREENSHOT" && echo "Screenshot saved: $SCREENSHOT" || true
 else
-    echo "grim not available — skipping screenshot (D5 incomplete)"
+    echo "(grim not available — skipping screenshot)"
 fi
 
-echo "=== Compositor logs ==="
-cat "$LOG"
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+echo "=== Cleaning up ==="
+kill "$KITTY_PID" 2>/dev/null || true
+kill "$COMPOSITOR_PID" 2>/dev/null || true
+# Give them a moment to exit
+sleep 1
+kill -0 "$COMPOSITOR_PID" 2>/dev/null && kill -9 "$COMPOSITOR_PID" 2>/dev/null || true
 
-echo ""
-echo "=== Done ==="
-echo "Compositor PID $COMPOSITOR_PID still running."
-echo "Kill with: kill $COMPOSITOR_PID"
-echo "Screenshot: $SCREENSHOT"
+# ── Check for panics ─────────────────────────────────────────────────────────
+echo "=== Log tail (last 30 lines) ==="
+tail -30 "$LOG"
+
+if grep -q "panicked at" "$LOG" 2>/dev/null; then
+    echo ""
+    echo "RESULT: FAIL — panic detected in log"
+    exit 1
+else
+    echo ""
+    echo "RESULT: PASS — no panic detected"
+    exit 0
+fi

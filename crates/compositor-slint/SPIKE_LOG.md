@@ -143,3 +143,36 @@ SHM path unchanged from spike: `with_buffer_contents` memcpy + `slint::Image::fr
 **Result: ⚠️ PENDING** (requires running compositor with display, screenshot)
 
 The compositor builds and is structurally complete. A screenshot was not taken because this is a headless build environment. The screenshot task (`/tmp/slint-gpu-spike.png`) should be run in a graphical session with: `CARGO_TARGET_DIR=/var/tmp/de-prompts-target cargo run -p compositor-slint`.
+
+---
+
+## Renderer Migration
+
+### (a) TextureView lifetime panic — root cause and fix
+
+**Root cause**: Two separate `wgpu::Device` instances were created in `renderer.rs` — one for `FemtoVGWGPURenderer` (the Slint platform device, no surface) and a second for the winit swapchain (surface-compatible device). `FemtoVGWGPURenderer::render_to_texture()` internally calls `texture.create_view(...)` and stores the resulting `TextureView`. wgpu asserts at storage lookup that any resource (texture, view, encoder) must belong to the device that created it. Because the render texture was created with the swapchain device but FemtoVG expected its own device, the storage slot for the view had a different epoch, triggering:
+
+```
+TextureView[Id(0,1)] is no longer alive (left: 1 right: 2)
+```
+
+**Fix**: Use a **single shared wgpu device** for both FemtoVG and the swapchain. `GpuWindowAdapter` now stores clones of the `wgpu::Instance`, `wgpu::Adapter`, `wgpu::Device`, and `wgpu::Queue` passed to `FemtoVGWGPURenderer::new()`. `renderer.rs`'s `resumed()` no longer creates a second device — it uses `gpu_window.wgpu_instance` to create the surface and `gpu_window.wgpu_adapter/device` to configure and drive it. The render texture (`make_render_texture`) is also created with `gpu_window.wgpu_device`, so every wgpu object shares one Device. Frame counter log at INFO every 60 frames confirms the render loop is stable.
+
+### (b) Production Compositor properties — wired vs deferred
+
+**Wired:**
+- `clock-text` — updated each second via `chrono::Local::now().format("%H:%M:%S")`
+- `windows` — one `WindowItem` per mapped SHM toplevel (title from `XdgToplevelSurfaceData`, SHM pixel buffer as texture, fixed geometry 100,100)
+- `dock-items` — hardcoded 3 placeholder apps: firefox, kitty, nautilus (pinned, not running)
+- `launch-app` callback — spawns the named app via `setsid`
+- `close-window`, `minimize-window`, `maximize-window`, `activate-window` callbacks — log stubs
+- `toggle-datetime-popout`, `toggle-control-centre` callbacks — log stubs
+
+**Deferred (not yet wired):**
+- `wallpaper` — no wallpaper source; `Wallpaper.slint` falls back to its `#1e1e2e` background colour
+- `focused-app` — not set; Panel shows an empty app name (requires tracking which app has keyboard focus)
+- `layers` — empty; no external layer-shell clients produce textures yet
+- `dock-items.running` / `.focused` — always false; would need to compare running app-ids against `active_surface`
+- Real app icons for dock items — `DockItem.icon` is `slint::Image::default()` (blank); needs icon loader
+- Multi-window management — `SpikeState` tracks only `active_surface` (one toplevel); a `Vec<ToplevelSurface>` + window-manager space is needed for full multi-window support
+- Pointer forwarding to wayland clients — removed `forward_pointer_click` since `CompositorUI.on_client_clicked` no longer exists; production path needs hit-testing WindowItems then forwarding pointer events to the correct surface
