@@ -191,19 +191,20 @@ pub fn resolve_icon(icon_name: &str) -> Option<PathBuf> {
     }
 
     let home = home_dir();
-    // Prefer scalable SVG, then large raster, then smaller.
+    // Prefer large raster (PNG) first so the image crate can decode it directly.
+    // SVG is listed last as a fallback; `load_icon` handles SVG→PNG fallback.
     let sizes = [
-        "scalable/apps",
         "256x256/apps",
         "128x128/apps",
         "96x96/apps",
         "64x64/apps",
         "48x48/apps",
+        "scalable/apps",
         "32x32/apps",
         "24x24/apps",
         "scalable/mimetypes",
     ];
-    let exts = ["svg", "png", "xpm"];
+    let exts = ["png", "svg", "xpm"];
 
     let theme_roots: &[PathBuf] = &[
         home.join(".local/share/icons/hicolor"),
@@ -243,18 +244,50 @@ pub fn generic_app_icon() -> Option<PathBuf> {
 
 /// Load an icon from disk and return a Slint `Image`.  Falls back to a
 /// default (empty) image if the path is missing or loading fails.
+///
+/// For SVG icons: first tries `slint::Image::load_from_path` (works if the
+/// Slint build includes the resvg backend); if that fails, looks for a sibling
+/// PNG at the same icon-theme path.  For raster icons the `image` crate is
+/// used directly.
 pub fn load_icon(icon_path: &Path) -> slint::Image {
-    // Try loading with image crate — handles PNG, JPEG, SVG via resvg is not
-    // included, but Slint can load SVG paths directly.
-    if icon_path.extension().and_then(|e| e.to_str()) == Some("svg") {
-        // Slint can load SVGs itself.
+    let ext = icon_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if ext == "svg" {
+        // Attempt Slint's own SVG loader (requires resvg support in the build).
         match slint::Image::load_from_path(icon_path) {
             Ok(img) => return img,
-            Err(e) => warn!("failed to load SVG icon {:?}: {}", icon_path, e),
+            Err(_) => {
+                // Slint SVG failed — look for a PNG sibling at a raster size.
+                if let Some(icon_name) = icon_path.file_stem().and_then(|s| s.to_str()) {
+                    // Try common raster sizes as fallback.
+                    for size in &["48x48/apps", "64x64/apps", "256x256/apps", "32x32/apps"] {
+                        for root in &[
+                            PathBuf::from("/usr/share/icons/hicolor"),
+                            PathBuf::from("/usr/share/icons/Adwaita"),
+                        ] {
+                            let png = root.join(size).join(format!("{icon_name}.png"));
+                            if png.exists() {
+                                if let Some(img) = load_raster(&png) {
+                                    return img;
+                                }
+                            }
+                        }
+                    }
+                }
+                debug!("SVG icon {:?} could not be loaded by Slint and no PNG fallback found", icon_path);
+            }
+        }
+    } else {
+        if let Some(img) = load_raster(icon_path) {
+            return img;
         }
     }
 
-    // For raster formats (PNG, XPM, etc.) use the image crate.
+    slint::Image::default()
+}
+
+/// Load a raster image (PNG/JPEG/etc.) using the `image` crate.
+fn load_raster(icon_path: &Path) -> Option<slint::Image> {
     match image::open(icon_path) {
         Ok(img) => {
             let rgba = img.to_rgba8();
@@ -264,11 +297,11 @@ pub fn load_icon(icon_path: &Path) -> slint::Image {
                 w,
                 h,
             );
-            slint::Image::from_rgba8(buf)
+            Some(slint::Image::from_rgba8(buf))
         }
         Err(e) => {
             warn!("failed to load icon {:?}: {}", icon_path, e);
-            slint::Image::default()
+            None
         }
     }
 }
