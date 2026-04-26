@@ -1221,35 +1221,45 @@ fn render_frame(state: &mut State) {
         }
         let _ = title_bar_by_geo;
 
-        // Hide the space windows from `render_output` whenever the SDF
-        // clip program compiled. We were previously falling back to the
-        // rectangular pipeline whenever *any* window failed to build a
-        // clipped element (e.g. a brand-new window before its first
-        // buffer commit) — but that re-renders ALL windows rectangularly
-        // at full opacity *behind* the clipped+animated ones, so the
-        // open/close fade was being painted over by the rectangular
-        // version on the first frames. Instead just let the
-        // not-yet-clipped windows be invisible until their buffer
-        // arrives; they'd be at opacity ≈ 0 from the spring anyway.
-        let space_ref = &state.common.space;
-        let space_slice: Vec<&smithay::desktop::Space<smithay::desktop::Window>> =
-            if clip_program.is_some() {
-                Vec::new()
-            } else {
-                vec![space_ref]
-            };
-
-        let result = render_output::<_, CursorElement, _, _>(
-            &winit.output,
-            renderer,
-            &mut fb,
-            1.0,
-            age,
-            space_slice.iter().copied(),
-            &all_overlays,
-            &mut winit.damage_tracker,
-            [0.06, 0.06, 0.07, 1.0],
-        );
+        // When the SDF clip program is available we own the entire element
+        // list — cursor, layer-shell chrome, window chrome, etc. are all in
+        // `all_overlays`. Calling `space::render_output` in that mode would
+        // make smithay re-render every layer surface from the layer_map as a
+        // plain rectangle *behind* our squircle-clipped versions, defeating
+        // the clip entirely (the rectangular surface shows through the
+        // transparent corners). We bypass it and call the damage-tracker
+        // directly so we have full control.
+        //
+        // When the program hasn't compiled yet (first frame or compile error)
+        // fall back to the classic `space::render_output` path which handles
+        // everything including layer surfaces and space windows.
+        let result = if clip_program.is_some() {
+            // Full custom path — all elements are already in `all_overlays`.
+            // Call the damage tracker directly so smithay does NOT re-render
+            // layer surfaces from the layer_map (which would draw rectangular
+            // unclipped surfaces behind our squircle-clipped ones, making the
+            // corners appear unclipped).
+            winit.damage_tracker.render_output(
+                renderer,
+                &mut fb,
+                age,
+                &all_overlays,
+                [0.06_f32, 0.06, 0.07, 1.0],
+            )
+        } else {
+            // Fallback: let smithay assemble layer-shell + space elements.
+            render_output::<_, CursorElement, _, _>(
+                &winit.output,
+                renderer,
+                &mut fb,
+                1.0,
+                age,
+                std::iter::once(&state.common.space),
+                &all_overlays,
+                &mut winit.damage_tracker,
+                [0.06_f32, 0.06, 0.07, 1.0],
+            )
+        };
 
         // Honour any pending screenshot request before submit (the back
         // buffer is what we just drew). Path comes from the IPC handler.
