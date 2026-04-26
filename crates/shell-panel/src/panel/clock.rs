@@ -3,12 +3,23 @@ use iced::{Color, Element};
 
 use crate::app::{Message, State};
 
-/// Clock face showing HH:MM; clicking opens the date/time popout.
+/// Primary text colour matching WINDOW_SPEC dark active: rgba(255,255,255,0.8).
+const TEXT_PRIMARY: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.8 };
+
+/// Clock face showing HH:MM:SS · t=N (debug variant). The seconds
+/// + monotonic tick counter make it obvious from a single screenshot
+/// whether the panel's `time::every` subscription is firing and iced
+/// is repainting. Once the freeze investigation is over, drop the
+/// `:%S` and the `· t=` suffix and revert the tick interval to 30 s.
 pub fn view(state: &State) -> Element<'_, Message> {
-    text(state.now.format("%H:%M").to_string())
-        .size(14)
-        .color(Color::WHITE)
-        .into()
+    let label = format!(
+        "{}  · t={}",
+        state.now.format("%H:%M:%S"),
+        state.tick_count,
+    );
+    tracing::info!(t = state.tick_count, "clock::view called");
+    // Size 13, iced::Font::DEFAULT, TEXT_PRIMARY colour per WINDOW_SPEC.
+    text(label).size(13).color(TEXT_PRIMARY).into()
 }
 
 #[cfg(test)]
