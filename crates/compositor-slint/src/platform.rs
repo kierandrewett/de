@@ -7,6 +7,11 @@
 //!
 //! The calloop event loop still drives everything — Slint's run_event_loop() returns an error
 //! intentionally so calloop stays in control (same as the software spike).
+//!
+//! PANIC FIX: GpuWindowAdapter now exposes the wgpu device/queue/adapter/instance
+//! used by FemtoVG.  renderer.rs uses THESE resources (not a separate second device)
+//! for both the offscreen render texture and the swapchain, so every wgpu object
+//! lives on the same device and the TextureView lifetime assertion never fires.
 
 use std::{
     cell::Cell,
@@ -33,6 +38,14 @@ pub struct GpuWindowAdapter {
     slint_window: slint::Window,
     /// The FemtoVG renderer — GPU rasteriser.
     pub renderer: FemtoVGWGPURenderer,
+    /// Cloned wgpu resources — the SAME instance/device/queue passed to FemtoVG.
+    /// Exposed so renderer.rs can build the swapchain on the identical device,
+    /// preventing the TextureView lifetime panic (wgpu requires all resources that
+    /// reference each other to belong to the same Device).
+    pub wgpu_instance: wgpu::Instance,
+    pub wgpu_adapter: wgpu::Adapter,
+    pub wgpu_device: wgpu::Device,
+    pub wgpu_queue: wgpu::Queue,
     /// Current size in physical pixels.
     size: Cell<PhysicalSize>,
     /// Whether a redraw has been requested.
@@ -42,17 +55,24 @@ pub struct GpuWindowAdapter {
 impl GpuWindowAdapter {
     pub fn new(
         instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
         width: u32,
         height: u32,
     ) -> Rc<Self> {
-        let renderer = FemtoVGWGPURenderer::new(instance, device, queue)
+        // Clone device + queue before moving them into FemtoVG so we can
+        // store copies here for the swapchain (wgpu::Device/Queue are Clone).
+        let renderer = FemtoVGWGPURenderer::new(instance.clone(), device.clone(), queue.clone())
             .expect("Failed to create FemtoVGWGPURenderer");
 
         Rc::new_cyclic(|weak: &Weak<Self>| Self {
             slint_window: slint::Window::new(weak.clone()),
             renderer,
+            wgpu_instance: instance,
+            wgpu_adapter: adapter,
+            wgpu_device: device,
+            wgpu_queue: queue,
             size: Cell::new(PhysicalSize::new(width, height)),
             needs_redraw: Cell::new(true),
         })
@@ -71,6 +91,7 @@ impl GpuWindowAdapter {
     }
 
     /// Render the Slint scene to the given wgpu texture (GPU path).
+    /// The texture MUST have been created with this adapter's wgpu_device.
     pub fn render_to_texture(&self, texture: &wgpu::Texture) -> Result<(), slint::PlatformError> {
         self.renderer.render_to_texture(texture)?;
         self.needs_redraw.set(false);
@@ -129,6 +150,7 @@ pub struct CalloopPlatform {
     _loop_signal: LoopSignal,
     start_time: Instant,
     instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     initial_width: u32,
@@ -141,6 +163,7 @@ impl CalloopPlatform {
     pub fn new(
         loop_signal: LoopSignal,
         instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
         initial_width: u32,
@@ -150,6 +173,7 @@ impl CalloopPlatform {
             _loop_signal: loop_signal,
             start_time: Instant::now(),
             instance,
+            adapter,
             device,
             queue,
             initial_width,
@@ -165,6 +189,7 @@ impl Platform for CalloopPlatform {
 
         let adapter = GpuWindowAdapter::new(
             self.instance.clone(),
+            self.adapter.clone(),
             self.device.clone(),
             self.queue.clone(),
             self.initial_width,
