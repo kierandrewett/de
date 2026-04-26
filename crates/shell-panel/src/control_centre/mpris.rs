@@ -42,7 +42,8 @@ pub fn view(state: &State) -> Element<'_, Message> {
     .width(Length::Fill)
     .style(|_: &Theme| iced::widget::container::Style {
         background: Some(CARD_BG.into()),
-        border: iced::Border { radius: 8.0.into(), ..Default::default() },
+        // Inner card radius = 10 per WINDOW_SPEC consistency rule.
+        border: iced::Border { radius: 10.0.into(), ..Default::default() },
         ..Default::default()
     });
 

@@ -27,7 +27,8 @@ fn power_btn(label: &'static str, msg: Message, bg: Color) -> Element<'static, M
     .on_press(msg)
     .style(move |_: &Theme, _| iced::widget::button::Style {
         background: Some(bg.into()),
-        border: iced::Border { radius: 8.0.into(), ..Default::default() },
+        // Inner card radius = 10 per WINDOW_SPEC consistency rule.
+        border: iced::Border { radius: 10.0.into(), ..Default::default() },
         text_color: Color::WHITE,
         ..Default::default()
     })
