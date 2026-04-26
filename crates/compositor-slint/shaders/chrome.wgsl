@@ -32,7 +32,7 @@ struct ChromeUniforms {
     // Inner highlight top colour alpha (bottom is always 0)
     highlight_a: f32,
     // 1 = active, 0 = inactive (controls highlight intensity)
-    active:     f32,
+    is_active:  f32,
     // Shadow colour alpha for this layer
     shadow_a:   f32,
     // Shadow Y offset in physical pixels
@@ -192,6 +192,16 @@ fn fs_shadow(in: VertexOut) -> @location(0) vec4<f32> {
     // see chrome_shader.rs where the uniform is constructed).
 
     let blur_sigma = u.highlight_a; // repurposed field for shadow pass
+
+    // Early discard: fragments more than 3×blur_sigma away from the shadow bounding
+    // box will have negligible alpha (exp(-9/2) ≈ 0.01).
+    let shadow_slack = blur_sigma * 3.0 + 20.0;
+    if frag_px.x < (u.win_x - shadow_slack + u.shadow_ox) ||
+       frag_px.x > (u.win_x + u.win_w + shadow_slack + u.shadow_ox) ||
+       frag_px.y < (u.win_y - shadow_slack + u.shadow_oy) ||
+       frag_px.y > (u.win_y + u.win_h + shadow_slack + u.shadow_oy) {
+        discard;
+    }
 
     let corner_r = 14.0; // always the outer window corner radius
     let half_size = vec2<f32>(u.win_w * 0.5, u.win_h * 0.5);

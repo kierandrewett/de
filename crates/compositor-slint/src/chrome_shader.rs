@@ -90,7 +90,7 @@ struct ChromeUniforms {
     stroke_a: f32,   // 48
 
     highlight_a: f32,
-    active: f32,
+    is_active: f32,
     shadow_a: f32,
     shadow_oy: f32,  // 64
 
@@ -401,7 +401,7 @@ impl ChromeShader {
                     stroke_b: 0.0,
                     stroke_a: 0.0,
                     highlight_a: layer.blur_sigma, // repurposed as blur_sigma in fs_shadow
-                    active: if win.active { 1.0 } else { 0.0 },
+                    is_active: if win.active { 1.0 } else { 0.0 },
                     shadow_a: layer.alpha,
                     shadow_oy: layer.offset_y,
                     shadow_ox: layer.offset_x,
@@ -434,7 +434,7 @@ impl ChromeShader {
                 stroke_b: 0.0,
                 stroke_a,
                 highlight_a,
-                active: if win.active { 1.0 } else { 0.0 },
+                is_active: if win.active { 1.0 } else { 0.0 },
                 shadow_a: 0.0,
                 shadow_oy: 0.0,
                 shadow_ox: 0.0,
