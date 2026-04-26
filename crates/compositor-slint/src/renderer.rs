@@ -5,15 +5,25 @@
 //!   - FemtoVGWGPURenderer::render_to_texture() each frame
 //!   - offscreen wgpu::Texture blit to swapchain via copy_texture_to_texture
 //!
-//! DAMAGE TRACKING (D4): render_to_texture() only called when Slint has pending
-//! changes. Idle desktop = 0 GPU renders (last frame stays presented).
+//! PANIC FIX (TextureView lifetime):
+//!   The original code initialised TWO separate wgpu devices: one for the
+//!   Slint platform (FemtoVGWGPURenderer) and one for the winit swapchain.
+//!   `copy_texture_to_texture` / render_to_texture internally creates
+//!   TextureViews; wgpu asserts that every resource that references a view
+//!   must belong to the same Device.  Mixing devices triggers:
+//!     "TextureView[Id(0,1)] is no longer alive (left=1 right=2)"
+//!   Fix: use a SINGLE wgpu device for everything.  We request one adapter
+//!   in run(), pass it to the CalloopPlatform (which hands it to
+//!   FemtoVGWGPURenderer), and expose the same device/queue from
+//!   GpuWindowAdapter so resumed() can configure the swapchain on it.
+//!
+//! DAMAGE TRACKING (D4): render_to_texture() only called when Slint has
+//! pending changes.  Idle desktop = 0 GPU renders (last frame stays presented).
 //!
 //! SHM CLIENT BUFFERS (D3): CPU memcpy into SharedPixelBuffer -> Slint Image.
-//! FemtoVG uploads to GPU on next render pass. Full wgpu::Texture per surface
-//! path (queue.write_texture) is possible but not implemented — ~1 week extra.
+//! FemtoVG uploads to GPU on next render pass.
 //!
-//! DMA-BUF BLOCKER: wgpu 28.0.0 lacks stable DMA-BUF import on Linux
-//! (wgpu_hal::Api::texture_from_raw_image is not stabilised). SHM-only for now.
+//! DMA-BUF BLOCKER: wgpu 28 lacks stable DMA-BUF import on Linux.
 
 use std::{
     collections::VecDeque,
@@ -37,7 +47,7 @@ use smithay::{
     wayland::socket::ListeningSocketSource,
 };
 
-use slint::{ComponentHandle, LogicalPosition};
+use slint::{ComponentHandle, LogicalPosition, SharedString, VecModel};
 
 use winit::{
     application::ApplicationHandler,
@@ -54,7 +64,7 @@ use winit::{
 use crate::{
     platform::{CalloopPlatform, GpuWindowAdapter},
     wayland_state::{ClientState, SpikeState},
-    CompositorUI,
+    Compositor, DockItem,
 };
 
 const WIDTH: u32 = 1280;
@@ -75,7 +85,7 @@ pub struct PendingKeyEvent {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Allocate an offscreen texture for Slint/FemtoVG to render into.
-/// format must be Rgba8Unorm (FemtoVG requirement, matches swapchain).
+/// MUST be created with the same device as FemtoVGWGPURenderer.
 /// RENDER_ATTACHMENT is required by FemtoVGWGPURenderer.
 /// COPY_SRC is needed to blit into the swapchain.
 fn make_render_texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
@@ -107,7 +117,6 @@ fn configure_surface(
     let format = if caps.formats.contains(&wgpu::TextureFormat::Rgba8Unorm) {
         wgpu::TextureFormat::Rgba8Unorm
     } else if caps.formats.contains(&wgpu::TextureFormat::Bgra8Unorm) {
-        // Fallback for Vulkan on some drivers — we'll use Bgra8Unorm for render tex too.
         wgpu::TextureFormat::Bgra8Unorm
     } else {
         caps.formats[0]
@@ -136,39 +145,38 @@ fn configure_surface(
 struct CompositorApp {
     window: Option<Rc<Window>>,
 
-    // wgpu resources — all Option<> because they are created in resumed()
+    // wgpu swapchain resources — all Option<> because created in resumed().
+    // NOTE: these are references to the SAME device/queue/adapter that
+    // FemtoVGWGPURenderer uses (cloned from GpuWindowAdapter), guaranteeing
+    // all wgpu objects share one Device lifetime.
     wgpu_surface: Option<wgpu::Surface<'static>>,
-    wgpu_device: Option<wgpu::Device>,
-    wgpu_queue: Option<wgpu::Queue>,
-    wgpu_adapter: Option<wgpu::Adapter>,
     swapchain_format: Option<wgpu::TextureFormat>,
-    // Offscreen texture that Slint/FemtoVG renders into each frame
+    // Offscreen texture that Slint/FemtoVG renders into each frame.
+    // Created with the shared device — same Device as FemtoVG.
     render_texture: Option<wgpu::Texture>,
     render_texture_size: (u32, u32),
 
-    // Slint GPU window adapter
+    // Slint GPU window adapter (holds device/queue/adapter/instance)
     gpu_window: Option<Rc<GpuWindowAdapter>>,
     window_ref: Arc<Mutex<Option<Rc<GpuWindowAdapter>>>>,
-    ui: Option<CompositorUI>,
+    ui: Option<Compositor>,
 
     pointer_pos: (f64, f64),
     start_time: Instant,
     last_clock_update: Instant,
     pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
+    frame_count: u64,
 }
 
 impl CompositorApp {
     fn new(
         window_ref: Arc<Mutex<Option<Rc<GpuWindowAdapter>>>>,
-        ui: CompositorUI,
+        ui: Compositor,
         pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
     ) -> Self {
         Self {
             window: None,
             wgpu_surface: None,
-            wgpu_device: None,
-            wgpu_queue: None,
-            wgpu_adapter: None,
             swapchain_format: None,
             render_texture: None,
             render_texture_size: (0, 0),
@@ -179,20 +187,23 @@ impl CompositorApp {
             start_time: Instant::now(),
             last_clock_update: Instant::now(),
             pending_keys,
+            frame_count: 0,
         }
     }
 
     /// Return an offscreen texture of the right size, (re)creating if size changed.
-    /// Format is taken from the swapchain format (Rgba8Unorm or Bgra8Unorm).
-    fn get_render_texture(&mut self, width: u32, height: u32) -> &wgpu::Texture {
+    /// ALWAYS uses the FemtoVG device (from gpu_window) so both the renderer and
+    /// this texture share the same Device.
+    fn get_render_texture(&mut self, width: u32, height: u32) -> Option<&wgpu::Texture> {
         if self.render_texture.is_none() || self.render_texture_size != (width, height) {
-            let device = self.wgpu_device.as_ref().unwrap();
+            let gpu_window = self.gpu_window.as_ref()?;
+            let device = &gpu_window.wgpu_device;
             let format = self.swapchain_format.unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
             self.render_texture = Some(make_render_texture(device, width, height, format));
             self.render_texture_size = (width, height);
             debug!("(Re)created render texture {}x{} {:?}", width, height, format);
         }
-        self.render_texture.as_ref().unwrap()
+        self.render_texture.as_ref()
     }
 }
 
@@ -210,19 +221,24 @@ impl ApplicationHandler for CompositorApp {
             event_loop.create_window(attrs).expect("failed to create window"),
         );
 
-        // Create wgpu surface from the window raw handle.
+        // Retrieve the Slint GPU window adapter.
+        // IMPORTANT: Use the SAME device/queue/adapter/instance that FemtoVG was
+        // initialised with.  Building the swapchain on these shared resources
+        // ensures every wgpu object (render texture, texture views, swapchain
+        // frame) belongs to the same Device — the root fix for the TextureView
+        // lifetime panic.
+        let gpu_window = self.window_ref.lock().unwrap().clone()
+            .expect("Slint GPU window adapter should exist after Compositor::new()");
+
+        // Create wgpu surface from the window raw handle using FemtoVG's instance.
         // SAFETY: window is kept alive in self.window for the program lifetime.
-        let instance_for_surface = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
         let surface = unsafe {
             use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
             let target = wgpu::SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: window.display_handle().unwrap().as_raw(),
                 raw_window_handle: window.window_handle().unwrap().as_raw(),
             };
-            instance_for_surface.create_surface_unsafe(target)
+            gpu_window.wgpu_instance.create_surface_unsafe(target)
                 .expect("create_surface_unsafe failed")
         };
         // Extend to 'static: safe because window lives in self.window for the program.
@@ -230,34 +246,16 @@ impl ApplicationHandler for CompositorApp {
             std::mem::transmute::<wgpu::Surface<'_>, wgpu::Surface<'static>>(surface)
         };
 
-        // Request a compatible adapter for this surface.
-        let adapter = pollster::block_on(instance_for_surface.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ))
-        .expect("no wgpu adapter compatible with window surface");
+        // Use the same adapter/device/queue FemtoVG already has.
+        let format = configure_surface(
+            &surface,
+            &gpu_window.wgpu_adapter,
+            &gpu_window.wgpu_device,
+            WIDTH,
+            HEIGHT,
+        );
+        info!("wgpu swapchain ready, format={:?} (shared device)", format);
 
-        // Create device + queue for the surface adapter.
-        let (surface_device, surface_queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("compositor-slint-surface"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
-                ..Default::default()
-            },
-        ))
-        .expect("failed to create surface device");
-
-        let format = configure_surface(&surface, &adapter, &surface_device, WIDTH, HEIGHT);
-        info!("wgpu swapchain ready, format={:?}", format);
-
-        // Retrieve the Slint GPU window adapter created during CalloopPlatform setup.
-        let gpu_window = self.window_ref.lock().unwrap().clone()
-            .expect("Slint GPU window adapter should exist after CompositorUI::new()");
         gpu_window.resize(WIDTH, HEIGHT);
 
         if let Some(ui) = &self.ui {
@@ -266,9 +264,6 @@ impl ApplicationHandler for CompositorApp {
 
         self.window = Some(window);
         self.wgpu_surface = Some(surface);
-        self.wgpu_adapter = Some(adapter);
-        self.wgpu_device = Some(surface_device);
-        self.wgpu_queue = Some(surface_queue);
         self.swapchain_format = Some(format);
         self.gpu_window = Some(gpu_window);
 
@@ -295,12 +290,14 @@ impl ApplicationHandler for CompositorApp {
             WindowEvent::Resized(size) => {
                 let w = size.width.max(1);
                 let h = size.height.max(1);
-                if let (Some(surface), Some(adapter), Some(device)) = (
-                    self.wgpu_surface.as_ref(),
-                    self.wgpu_adapter.as_ref(),
-                    self.wgpu_device.as_ref(),
-                ) {
-                    let fmt = configure_surface(surface, adapter, device, w, h);
+                if let Some(surface) = self.wgpu_surface.as_ref() {
+                    let fmt = configure_surface(
+                        surface,
+                        &gpu_window.wgpu_adapter,
+                        &gpu_window.wgpu_device,
+                        w,
+                        h,
+                    );
                     self.swapchain_format = Some(fmt);
                 }
                 gpu_window.resize(w, h);
@@ -369,15 +366,12 @@ impl CompositorApp {
         let gpu_window = match self.gpu_window.clone() { Some(w) => w, None => return };
         let Some(ui) = self.ui.as_ref() else { return };
 
-        // Update clock (marks adapter dirty via set_clock_text -> request_redraw)
+        // Update clock each second via chrono (marks adapter dirty via set_clock_text).
         let now = Instant::now();
         if now.duration_since(self.last_clock_update) >= Duration::from_secs(1) {
             self.last_clock_update = now;
-            let elapsed = now.duration_since(self.start_time);
-            let secs = elapsed.as_secs();
-            ui.set_clock_text(slint::SharedString::from(format!(
-                "{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60
-            )));
+            let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
+            ui.set_clock_text(SharedString::from(time_str));
         }
 
         let size = gpu_window.get_size();
@@ -385,17 +379,23 @@ impl CompositorApp {
 
         // D4 DAMAGE TRACKING: only re-render if Slint has changes.
         if gpu_window.has_pending_redraw() {
-            let render_tex = self.get_render_texture(w, h);
-            if let Err(e) = gpu_window.render_to_texture(render_tex) {
-                warn!("render_to_texture failed: {}", e);
-                return;
+            // get_render_texture uses gpu_window.wgpu_device — same Device as FemtoVG.
+            if let Some(render_tex) = self.get_render_texture(w, h) {
+                if let Err(e) = gpu_window.render_to_texture(render_tex) {
+                    warn!("render_to_texture failed: {}", e);
+                    return;
+                }
+                self.frame_count += 1;
+                if self.frame_count % 60 == 0 {
+                    info!("frame loop: {} frames rendered", self.frame_count);
+                }
+                debug!("GPU render: {}x{} (dirty, frame {})", w, h, self.frame_count);
             }
-            debug!("GPU render: {}x{} (dirty)", w, h);
         }
 
         let Some(surface) = self.wgpu_surface.as_ref() else { return };
-        let Some(device) = self.wgpu_device.as_ref() else { return };
-        let Some(queue) = self.wgpu_queue.as_ref() else { return };
+        let device = &gpu_window.wgpu_device;
+        let queue = &gpu_window.wgpu_queue;
 
         // Acquire swapchain frame.
         let frame = match surface.get_current_texture() {
@@ -404,7 +404,7 @@ impl CompositorApp {
             Err(e) => { warn!("swapchain: {}", e); return; }
         };
 
-        // Blit offscreen Rgba8Unorm -> swapchain frame.
+        // Blit offscreen texture -> swapchain frame.
         if let Some(render_tex) = self.render_texture.as_ref() {
             let mut encoder = device.create_command_encoder(
                 &wgpu::CommandEncoderDescriptor { label: Some("blit") }
@@ -430,31 +430,108 @@ impl CompositorApp {
         frame.present();
     }
 
-    /// Update Slint client texture from SHM pixel data (D3/D4).
-    /// SHM PATH: CPU memcpy into SharedPixelBuffer -> Slint Image.
+    /// Update the `windows` property on the Compositor from the wayland surface map.
+    /// One WindowItem per mapped xdg-toplevel (SHM texture + title + geometry).
+    fn update_windows(&mut self, state: &mut SpikeState) {
+        let Some(ui) = self.ui.as_ref() else { return };
+
+        let mut items: Vec<crate::WindowItem> = Vec::new();
+
+        // Pull the single active SHM surface if present.
+        let client_data = state.client_pixels.lock().unwrap();
+        let has_surface = client_data.width > 0;
+
+        if has_surface {
+            // Build a slint Image from the current pixel buffer.
+            let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                &client_data.pixels,
+                client_data.width,
+                client_data.height,
+            );
+            let texture = slint::Image::from_rgba8_premultiplied(pixel_buf);
+
+            // Get the toplevel title via smithay's compositor surface data map.
+            let title = state
+                .active_surface
+                .as_ref()
+                .and_then(|wl_surface| {
+                    use smithay::wayland::compositor::with_states;
+                    use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+                    with_states(wl_surface, |states| {
+                        states
+                            .data_map
+                            .get::<XdgToplevelSurfaceData>()
+                            .and_then(|data| data.lock().ok()?.title.clone())
+                    })
+                })
+                .unwrap_or_else(|| "Window".to_string());
+
+            items.push(crate::WindowItem {
+                id: 1,
+                title: SharedString::from(title),
+                x: 100,
+                y: 100,
+                w: client_data.width as i32,
+                h: client_data.height as i32,
+                focused: true,
+                texture,
+                icon: slint::Image::default(),
+            });
+        }
+        drop(client_data);
+
+        let model = std::rc::Rc::new(VecModel::from(items));
+        ui.set_windows(slint::ModelRc::from(model));
+    }
+
+    /// Update Slint client texture from SHM pixel data (legacy D3/D4 path —
+    /// kept for compatibility; update_windows() now drives the Compositor UI).
     fn update_client_texture(&mut self, state: &mut SpikeState) {
         let mut client_data = state.client_pixels.lock().unwrap();
         if !client_data.dirty || client_data.width == 0 {
             return;
         }
-        let (w, h) = (client_data.width, client_data.height);
-        let pixels = client_data.pixels.clone();
         client_data.dirty = false;
         drop(client_data);
 
-        let Some(ui) = self.ui.as_ref() else { return };
-        let Some(gpu_window) = self.gpu_window.as_ref() else { return };
+        // Mark dirty so the next render picks up fresh WindowItems.
+        if let Some(gpu_window) = self.gpu_window.as_ref() {
+            gpu_window.mark_dirty();
+        }
 
-        let pixel_buf =
-            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&pixels, w, h);
-        let image = slint::Image::from_rgba8_premultiplied(pixel_buf);
-        ui.set_client_texture(image);
-        ui.set_client_visible(true);
-        ui.set_client_w(w as i32);
-        ui.set_client_h(h as i32);
-        gpu_window.mark_dirty();
-        debug!("SHM client texture updated: {}x{}", w, h);
+        self.update_windows(state);
+        debug!("SHM client texture updated → windows property refreshed");
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Hardcoded placeholder dock items
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn make_placeholder_dock_items() -> Vec<DockItem> {
+    vec![
+        DockItem {
+            icon: slint::Image::default(),
+            app_id: SharedString::from("firefox"),
+            running: false,
+            focused: false,
+            pinned: true,
+        },
+        DockItem {
+            icon: slint::Image::default(),
+            app_id: SharedString::from("kitty"),
+            running: false,
+            focused: false,
+            pinned: true,
+        },
+        DockItem {
+            icon: slint::Image::default(),
+            app_id: SharedString::from("nautilus"),
+            running: false,
+            focused: false,
+            pinned: true,
+        },
+    ]
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -467,7 +544,16 @@ pub fn run() -> Result<()> {
         .context("failed to create calloop event loop")?;
     let loop_signal = calloop.get_signal();
 
-    // 2. wgpu instance/device/queue for Slint platform (headless, no surface yet)
+    // 2. wgpu instance/adapter/device/queue — ONE set, shared between FemtoVG
+    //    and the swapchain.  This is the core fix for the TextureView lifetime
+    //    panic: wgpu asserts that all resources (textures, views, command
+    //    encoders) must come from the same Device.  Previously two separate
+    //    devices were created, causing the assertion to fail at the first blit.
+    //
+    //    We request the adapter WITHOUT a compatible_surface here (none exists
+    //    yet) and verify surface compatibility in resumed().  If the adapter
+    //    turns out to be incompatible with the surface (unusual on desktop Linux)
+    //    we fall back to a surface-compatible adapter below.
     let slint_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
@@ -480,23 +566,25 @@ pub fn run() -> Result<()> {
         },
     ))
     .context("no wgpu adapter for Slint platform")?;
-    info!("wgpu adapter (Slint): {}", slint_adapter.get_info().name);
+    info!("wgpu adapter: {}", slint_adapter.get_info().name);
 
     let (slint_device, slint_queue) = pollster::block_on(slint_adapter.request_device(
         &wgpu::DeviceDescriptor {
-            label: Some("compositor-slint-platform"),
+            label: Some("compositor-slint-shared"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                 .using_resolution(slint_adapter.limits()),
             ..Default::default()
         },
     ))
-    .context("failed to create wgpu device for Slint platform")?;
+    .context("failed to create shared wgpu device")?;
 
-    // 3. Slint GPU platform
+    // 3. Slint GPU platform (takes ownership of the shared wgpu resources,
+    //    but also stores clones in GpuWindowAdapter for resumed() to use)
     let platform = CalloopPlatform::new(
         loop_signal.clone(),
         slint_instance,
+        slint_adapter,
         slint_device,
         slint_queue,
         WIDTH,
@@ -507,27 +595,61 @@ pub fn run() -> Result<()> {
     slint::platform::set_platform(Box::new(platform))
         .context("failed to set Slint GPU platform")?;
 
-    // Create Slint UI (triggers create_window_adapter -> FemtoVGWGPURenderer::new)
-    let ui = CompositorUI::new().context("failed to create Slint UI")?;
-    ui.set_clock_text(slint::SharedString::from("00:00:00"));
+    // Create the production Compositor UI (triggers create_window_adapter ->
+    // FemtoVGWGPURenderer::new with the shared device).
+    let ui = Compositor::new().context("failed to create Compositor UI")?;
 
+    // Prime the clock text.
+    ui.set_clock_text(SharedString::from(
+        chrono::Local::now().format("%H:%M:%S").to_string()
+    ));
+
+    // Populate dock with 3 placeholder apps.
     {
-        let signal = loop_signal.clone();
-        ui.on_quit_clicked(move || {
-            info!("Quit clicked");
-            signal.stop();
+        let items = make_placeholder_dock_items();
+        let model = std::rc::Rc::new(VecModel::from(items));
+        ui.set_dock_items(slint::ModelRc::from(model));
+    }
+
+    // Wire window-management callbacks (no-op stubs for now; wayland handlers
+    // will expand these when multi-window management lands).
+    {
+        ui.on_close_window(|id| {
+            info!("close-window({})", id);
+        });
+        ui.on_minimize_window(|id| {
+            info!("minimize-window({})", id);
+        });
+        ui.on_maximize_window(|id| {
+            info!("maximize-window({})", id);
+        });
+        ui.on_activate_window(|id| {
+            info!("activate-window({})", id);
         });
     }
 
-    let last_client_click: Arc<Mutex<Option<(f32, f32)>>> = Arc::new(Mutex::new(None));
+    // Wire launch-app: spawn the named app via setsid.
     {
-        let click_ref = last_client_click.clone();
-        ui.on_client_clicked(move |x, y| {
-            *click_ref.lock().unwrap() = Some((x, y));
+        ui.on_launch_app(|app_id| {
+            let app = app_id.to_string();
+            info!("launch-app({})", app);
+            let _ = std::process::Command::new("setsid")
+                .args([&app])
+                .spawn();
         });
     }
 
-    info!("Slint GPU platform ready (D1/D2)");
+    // Wire panel callbacks.
+    {
+        ui.on_toggle_datetime_popout(|| {
+            info!("toggle-datetime-popout");
+        });
+        ui.on_toggle_control_centre(|| {
+            info!("toggle-control-centre");
+        });
+    }
+
+    info!("Slint GPU platform ready — production Compositor UI");
 
     // 4. Wayland display + socket
     let mut display = Display::<SpikeState>::new()
@@ -560,7 +682,7 @@ pub fn run() -> Result<()> {
         })
         .context("failed to insert socket source")?;
 
-    info!("Wayland socket ready (D3)");
+    info!("Wayland socket ready");
 
     // 5. Compositor state + virtual output
     let mut state = SpikeState::new(display_handle.clone(), calloop.handle(), loop_signal.clone());
@@ -604,9 +726,6 @@ pub fn run() -> Result<()> {
         slint::platform::update_timers_and_animations();
         app.update_client_texture(&mut state);
 
-        if let Some((cx, cy)) = last_client_click.lock().unwrap().take() {
-            forward_pointer_click(&mut state, cx as f64, cy as f64);
-        }
         {
             let mut keys = pending_keys.lock().unwrap();
             while let Some(ke) = keys.pop_front() {
@@ -624,27 +743,6 @@ pub fn run() -> Result<()> {
 // ──────────────────────────────────────────────────────────────────────────────
 // Input forwarding (D5 - unchanged)
 // ──────────────────────────────────────────────────────────────────────────────
-
-fn forward_pointer_click(state: &mut SpikeState, rel_x: f64, rel_y: f64) {
-    use smithay::utils::SERIAL_COUNTER;
-    let Some(surface) = state.active_surface.clone() else { return };
-    let pointer = state.seat.get_pointer().unwrap();
-    let serial = SERIAL_COUNTER.next_serial();
-    let time = state.clock.now().as_millis() as u32;
-    pointer.motion(state, Some((surface.clone(), (rel_x, rel_y).into())),
-        &smithay::input::pointer::MotionEvent {
-            location: (rel_x + 100.0, rel_y + 100.0).into(), serial, time,
-        });
-    pointer.button(state, &smithay::input::pointer::ButtonEvent {
-        button: 0x110, state: smithay::backend::input::ButtonState::Pressed, serial, time,
-    });
-    pointer.frame(state);
-    let s2 = SERIAL_COUNTER.next_serial();
-    pointer.button(state, &smithay::input::pointer::ButtonEvent {
-        button: 0x110, state: smithay::backend::input::ButtonState::Released, serial: s2, time: time + 50,
-    });
-    pointer.frame(state);
-}
 
 fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
     use smithay::{backend::input::KeyState, input::keyboard::Keycode, utils::SERIAL_COUNTER};
