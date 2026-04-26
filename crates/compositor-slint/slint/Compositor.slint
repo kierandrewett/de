@@ -1,0 +1,165 @@
+// Compositor.slint — Top-level component for the Slint-based Wayland compositor.
+// Composes: Wallpaper → LayerSurfaces (bottom/background) → Windows+Chrome →
+//           LayerSurfaces (top/overlay) → Dock → Panel.
+//
+// The Rust side owns the event loop (calloop) and feeds all data through the
+// exported properties below.  Callbacks fire user interactions back to Rust.
+//
+// ── Rust-bindable contract ──────────────────────────────────────────────────
+//   in property <[WindowItem]>  windows    — ordered list of toplevels
+//   in property <[LayerItem]>   layers     — external layer-shell surfaces
+//   in property <string>        focused-app
+//   in property <string>        clock-text
+//   in property <image>         wallpaper
+//   in property <[DockItem]>    dock-items
+//   Callbacks: close-window, minimize-window, maximize-window,
+//              activate-window, launch-app
+//
+// Z-order (Slint requires integer literals for `z`):
+//   0  — wallpaper
+//   10 — windows
+//   20 — bottom/background layer-shell surfaces
+//   30 — top/overlay layer-shell surfaces
+//   40 — dock
+//   50 — panel
+
+import { Tokens } from "./Tokens.slint";
+import { Wallpaper } from "./Wallpaper.slint";
+import { Panel } from "./Panel.slint";
+import { Dock, DockItem } from "./Dock.slint";
+import { WindowChrome } from "./WindowChrome.slint";
+import { LayerSurface } from "./LayerSurface.slint";
+
+// ── Shared data structures ────────────────────────────────────────────────────
+
+// A single toplevel window fed by the Rust compositor state.
+export struct WindowItem {
+    id:      int,
+    title:   string,
+    // Geometry in compositor-space pixels.
+    x:       int,
+    y:       int,
+    w:       int,
+    h:       int,
+    focused: bool,
+    // The client's rendered texture (from SHM or DMA-BUF import).
+    texture: image,
+    // Optional application icon.
+    icon:    image,
+}
+
+// A layer-shell surface from an external client.
+export struct LayerItem {
+    id:            int,
+    surface:       image,
+    // Resolved screen position (Rust computes from anchor + exclusive zone).
+    x:             int,
+    y:             int,
+    w:             int,
+    h:             int,
+    // wlr-layer-shell layer ordinal: 0=background, 1=bottom, 2=top, 3=overlay.
+    layer-ordinal: int,
+}
+
+// Re-export DockItem so importers of Compositor.slint can use it directly.
+export { DockItem }
+
+// ── Top-level Compositor component ───────────────────────────────────────────
+export component Compositor inherits Window {
+    // ── Inbound properties (Rust → Slint) ─────────────────────────────────────
+    in property <[WindowItem]>  windows;
+    in property <[LayerItem]>   layers;
+    in property <string>        focused-app: "";
+    in property <string>        clock-text: "00:00";
+    in property <image>         wallpaper;
+    in property <[DockItem]>    dock-items;
+
+    // ── Callbacks (Slint → Rust) ───────────────────────────────────────────────
+    callback close-window(int);
+    callback minimize-window(int);
+    callback maximize-window(int);
+    callback activate-window(int);
+    callback launch-app(string);
+
+    // Panel forwarding.
+    callback toggle-datetime-popout();
+    callback toggle-control-centre();
+
+    // ── Root geometry ─────────────────────────────────────────────────────────
+    // The Rust side sets the window to fullscreen; default to 1920×1080 for
+    // slint-viewer preview.
+    preferred-width:  1920px;
+    preferred-height: 1080px;
+    background: transparent;
+    no-frame: true;
+
+    // ── Layer 0: Wallpaper ────────────────────────────────────────────────────
+    Wallpaper {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        source: root.wallpaper;
+        z: 0;
+    }
+
+    // ── Layer 1: Background / bottom layer-shell surfaces ────────────────────
+    // Renders surfaces with layer-ordinal 0 (background) or 1 (bottom).
+    for layer in root.layers: LayerSurface {
+        visible: layer.layer-ordinal <= 1;
+        surface: layer.surface;
+        surface-x: layer.x * 1px;
+        surface-y: layer.y * 1px;
+        surface-width: layer.w * 1px;
+        surface-height: layer.h * 1px;
+        z: 20;
+    }
+
+    // ── Layer 2: Windows with SSD chrome ─────────────────────────────────────
+    for win in root.windows: WindowChrome {
+        x: win.x * 1px;
+        y: win.y * 1px;
+        width: win.w * 1px;
+        height: win.h * 1px;
+        title: win.title;
+        focused: win.focused;
+        content: win.texture;
+        z: 10;
+
+        close-clicked    => { root.close-window(win.id); }
+        minimize-clicked => { root.minimize-window(win.id); }
+        maximize-clicked => { root.maximize-window(win.id); }
+    }
+
+    // ── Layer 3: Top / overlay layer-shell surfaces ───────────────────────────
+    // Renders surfaces with layer-ordinal 2 (top) or 3 (overlay).
+    for layer in root.layers: LayerSurface {
+        visible: layer.layer-ordinal >= 2;
+        surface: layer.surface;
+        surface-x: layer.x * 1px;
+        surface-y: layer.y * 1px;
+        surface-width: layer.w * 1px;
+        surface-height: layer.h * 1px;
+        z: 30;
+    }
+
+    // ── Layer 4: Dock ─────────────────────────────────────────────────────────
+    dock := Dock {
+        x: 0;
+        y: parent.height - self.height;
+        width: parent.width;
+        z: 40;
+        items: root.dock-items;
+        icon-clicked(app-id) => { root.launch-app(app-id); }
+    }
+
+    // ── Layer 5: Panel ────────────────────────────────────────────────────────
+    panel := Panel {
+        x: 0; y: 0;
+        width: parent.width;
+        z: 50;
+        focused-app: root.focused-app;
+        clock-text: root.clock-text;
+        toggle-datetime-popout => { root.toggle-datetime-popout(); }
+        toggle-control-centre  => { root.toggle-control-centre(); }
+    }
+}

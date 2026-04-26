@@ -1,0 +1,162 @@
+// Panel.slint — Top-of-screen shell panel.
+// Layout: [Focused App]  [——— Clock ———]  [Network | Audio | Power | CC▼]
+// Matches WINDOW_SPEC dark-active chrome colours: #111318 bg, 0.5px bottom border,
+// rgba(255,255,255,0.8) text, Inter Variable 13 px.
+// Height: 34 px.  Full-width, flush to top.
+
+import { Tokens } from "./Tokens.slint";
+import { StatusIcon } from "./widgets/StatusIcon.slint";
+
+export component Panel {
+    // ── Inbound properties ───────────────────────────────────────────────────
+    // Name of the currently focused application (Rust feeds this).
+    in property <string> focused-app: "";
+    // Clock string — Rust feeds "HH:MM:SS" every second.
+    in property <string> clock-text: "00:00";
+    // Optional status icon images (Rust feeds real symbols when available).
+    in property <image>  icon-network;
+    in property <image>  icon-audio;
+    in property <image>  icon-power;
+
+    // ── Callbacks ─────────────────────────────────────────────────────────────
+    callback toggle-datetime-popout();
+    callback toggle-control-centre();
+
+    // ── Geometry ─────────────────────────────────────────────────────────────
+    width: 100%;
+    height: Tokens.panel-height;
+
+    // Bar background — full-width, flush to top of screen.
+    bar := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Tokens.panel-bg;
+
+        // 0.5 px bottom border (approximate with 1px at 50% opacity).
+        bottom-border := Rectangle {
+            x: 0;
+            y: parent.height - 1px;
+            width: parent.width;
+            height: 1px;
+            background: Tokens.panel-border-bottom;
+        }
+
+        // ── Left zone: focused application name ──────────────────────────────
+        left-zone := Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width / 3;
+            height: parent.height;
+
+            Text {
+                x: 14px;
+                y: 0;
+                width: parent.width - 14px;
+                height: parent.height;
+                text: root.focused-app;
+                color: Tokens.panel-fg;
+                font-family: Tokens.font-family;
+                font-size: Tokens.panel-font-size;
+                font-weight: 500;   // Medium
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        // ── Centre zone: clock ───────────────────────────────────────────────
+        clock-zone := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: 0;
+            width: parent.width / 3;
+            height: parent.height;
+
+            clock-touch := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.toggle-datetime-popout(); }
+            }
+
+            // Hover highlight.
+            Rectangle {
+                width: parent.width;
+                height: parent.height;
+                border-radius: 6px;
+                background: clock-touch.has-hover
+                    ? rgba(255, 255, 255, 0.08)
+                    : transparent;
+                animate background { duration: 100ms; easing: ease-out; }
+            }
+
+            Text {
+                width: parent.width;
+                height: parent.height;
+                text: root.clock-text;
+                color: Tokens.panel-fg;
+                font-family: Tokens.font-family;
+                font-size: Tokens.panel-font-size;
+                font-weight: 500;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // ── Right zone: status icons + control-centre button ─────────────────
+        right-zone := Rectangle {
+            x: parent.width - self.width;
+            y: 0;
+            width: parent.width / 3;
+            height: parent.height;
+
+            cc-touch := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.toggle-control-centre(); }
+            }
+
+            // Hover highlight.
+            Rectangle {
+                width: parent.width;
+                height: parent.height;
+                border-radius: 6px;
+                background: cc-touch.has-hover
+                    ? rgba(255, 255, 255, 0.08)
+                    : transparent;
+                animate background { duration: 100ms; easing: ease-out; }
+            }
+
+            // Icons row — right-aligned inside the zone.
+            icons-row := Rectangle {
+                // Right-align the row with a 14 px margin.
+                x: parent.width - self.width - 14px;
+                y: (parent.height - self.height) / 2;
+                // Width = 3 icons × 16px + 2 gaps × 8px = 64px.
+                width: 3 * 16px + 2 * 8px;
+                height: 16px;
+
+                StatusIcon {
+                    x: 0;
+                    y: 0;
+                    icon: root.icon-network;
+                    name: "network";
+                    tint: Tokens.panel-fg;
+                }
+
+                StatusIcon {
+                    x: 16px + 8px;
+                    y: 0;
+                    icon: root.icon-audio;
+                    name: "audio";
+                    tint: Tokens.panel-fg;
+                }
+
+                StatusIcon {
+                    x: (16px + 8px) * 2;
+                    y: 0;
+                    icon: root.icon-power;
+                    name: "power";
+                    tint: Tokens.panel-fg;
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,86 @@
+// PreviewMain.slint — Standalone preview for slint-viewer.
+// Feeds mock data into the Compositor component so the full scene can be
+// visually inspected without a running Rust binary.
+//
+// Because Compositor inherits Window (and Slint does not allow Window children
+// inside other Windows), PreviewMain inherits directly from Compositor.
+//
+// Run with: slint-viewer slint/preview/PreviewMain.slint
+// (from the crates/compositor-slint-spike/ directory)
+
+import { Compositor, WindowItem, LayerItem, DockItem } from "../Compositor.slint";
+
+export component PreviewMain inherits Compositor {
+    title: "Compositor UI Preview";
+    preferred-width: 1280px;
+    preferred-height: 800px;
+
+    // Clock text — static for preview.
+    clock-text: "14:32:07";
+
+    // Focused app name.
+    focused-app: "Firefox";
+
+    // Mock window list — two windows.
+    windows: [
+        {
+            id: 1,
+            title: "Firefox — Mozilla Firefox",
+            x: 80,
+            y: 60,
+            w: 900,
+            h: 600,
+            focused: true,
+            texture: @image-url(""),
+            icon: @image-url(""),
+        },
+        {
+            id: 2,
+            title: "Terminal",
+            x: 700,
+            y: 300,
+            w: 500,
+            h: 350,
+            focused: false,
+            texture: @image-url(""),
+            icon: @image-url(""),
+        },
+    ];
+
+    // Mock dock items.
+    dock-items: [
+        {
+            icon: @image-url(""),
+            app-id: "firefox",
+            running: true,
+            focused: true,
+            pinned: true,
+        },
+        {
+            icon: @image-url(""),
+            app-id: "org.gnome.Nautilus",
+            running: false,
+            focused: false,
+            pinned: true,
+        },
+        {
+            icon: @image-url(""),
+            app-id: "kitty",
+            running: true,
+            focused: false,
+            pinned: false,
+        },
+    ];
+
+    // No external layer surfaces in preview.
+    layers: [];
+
+    // Callback stubs (do nothing in preview).
+    close-window(id) => { debug("close", id); }
+    minimize-window(id) => { debug("minimize", id); }
+    maximize-window(id) => { debug("maximize", id); }
+    activate-window(id) => { debug("activate", id); }
+    launch-app(app-id) => { debug("launch", app-id); }
+    toggle-datetime-popout => { debug("datetime-popout"); }
+    toggle-control-centre  => { debug("control-centre"); }
+}

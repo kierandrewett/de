@@ -1,0 +1,159 @@
+// Dock.slint — Bottom-centre floating dock, macOS-style.
+// Visual: squircle-approximated (20 px border-radius) translucent dark container
+// (#b5000000), 0.5 px white-15% border, drop shadow.
+// Icons: 48 px squares, hover scale 1.0→1.15 (animate), active dot below running apps,
+// pinned/running separator (1 px vertical line, white-15%, centred vertically).
+//
+// Limitations documented:
+//   - border-radius is a circular arc; true squircle SDF needs the GPU agent's shader.
+//   - Only one drop-shadow layer (Slint per-element limit).
+
+import { Tokens } from "./Tokens.slint";
+
+// ── Data type shared with Rust ────────────────────────────────────────────────
+export struct DockItem {
+    icon:    image,
+    app-id:  string,
+    running: bool,
+    focused: bool,
+    pinned:  bool,
+}
+
+// ── Internal single icon slot ─────────────────────────────────────────────────
+// Each slot is 56 px wide and 64 px tall.  A preceding separator adds 18 px.
+component DockIconSlot {
+    in property <DockItem> item;
+    in property <bool>     show-separator: false;
+
+    callback icon-clicked(string);
+
+    width: 56px;
+    height: 64px;
+
+    // Icon touch area — covers full slot.
+    ta := TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.icon-clicked(root.item.app-id); }
+    }
+
+    // Scale multiplier driven by hover.
+    property <float> icon-scale: ta.has-hover ? 1.15 : 1.0;
+
+    // Icon image — scaled on hover, nudged up slightly.
+    icon-img := Image {
+        width:  Tokens.dock-icon-size * root.icon-scale;
+        height: Tokens.dock-icon-size * root.icon-scale;
+        // Centre horizontally; lift slightly on hover.
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 - (ta.has-hover ? 4px : 0px);
+        source: root.item.icon;
+        image-fit: contain;
+
+        // Scale animation.
+        animate width  { duration: 180ms; easing: ease-out; }
+        animate height { duration: 180ms; easing: ease-out; }
+        animate y      { duration: 180ms; easing: ease-out; }
+    }
+
+    // Active dot — centred below icon for running apps.
+    if item.running: dot := Rectangle {
+        x: (parent.width - 4px) / 2;
+        y: parent.height - 8px;
+        width: 4px;
+        height: 4px;
+        border-radius: 2px;
+        background: item.focused
+            ? rgba(255, 255, 255, 0.90)
+            : rgba(255, 255, 255, 0.50);
+        animate background { duration: 150ms; easing: ease-in-out; }
+    }
+}
+
+// ── Separator between pinned and running sections ─────────────────────────────
+component DockSeparator {
+    width: 18px;
+    height: 64px;
+
+    Rectangle {
+        x: (parent.width - 1px) / 2;
+        y: (parent.height - 32px) / 2;
+        width: 1px;
+        height: 32px;
+        background: rgba(255, 255, 255, 0.15);
+    }
+}
+
+// ── Public Dock component ─────────────────────────────────────────────────────
+export component Dock {
+    // Rust feeds the full list; pinned items come first, then running-only items.
+    in property <[DockItem]> items;
+    callback icon-clicked(string);
+
+    // The dock floats at the bottom-centre of the screen.
+    // Outer Compositor sets x:0, y:parent.height-self.height, width:parent.width.
+    height: 64px + 2 * Tokens.dock-padding + 2 * Tokens.dock-outer-gap;
+
+    // ── Floating container (centred horizontally) ─────────────────────────────
+    // We use a HorizontalLayout at the root level to measure content width,
+    // then wrap in a Rectangle for visual styling.
+    // Since Slint can't auto-size a child Rectangle from a nested layout's
+    // preferred-width, we fix a max-width based on item count × slot-width.
+    //
+    // Rust should set the `items` list so the dock auto-adapts in width.
+    // For the Slint side, we size the container to fill available width and
+    // centre the layout row inside it — this matches how QML Dock.qml works.
+
+    dock-bg := Rectangle {
+        // Centre the container: occupy full width but push content centre.
+        x: 0;
+        y: Tokens.dock-outer-gap;
+        width: parent.width;
+        height: 64px + 2 * Tokens.dock-padding;
+        background: transparent;   // outer is transparent; inner pill has colour
+
+        // Inner pill — visually the dock.
+        pill := Rectangle {
+            // Auto-centre using HorizontalLayout alignment.
+            x: (parent.width - self.width) / 2;
+            y: 0;
+            // Width: items × 56px + separators × 18px + 2 × padding.
+            // We compute a rough width; Rust can refine by setting a bound property.
+            width: items-row.preferred-width + 2 * Tokens.dock-padding;
+            height: parent.height;
+
+            background: Tokens.dock-bg;
+            border-radius: Tokens.dock-corner-radius;
+            border-width: 1px;
+            border-color: Tokens.dock-border;
+
+            // Single-layer shadow — GPU agent composites remaining layers.
+            drop-shadow-blur: 24px;
+            drop-shadow-offset-y: 8px;
+            drop-shadow-color: rgba(0, 0, 0, 0.45);
+
+            // Icons row inside the pill.
+            items-row := HorizontalLayout {
+                padding-left: Tokens.dock-padding;
+                padding-right: Tokens.dock-padding;
+                padding-top: Tokens.dock-padding;
+                padding-bottom: Tokens.dock-padding;
+                spacing: 0px;
+                alignment: center;
+
+                for item[i] in root.items: HorizontalLayout {
+                    spacing: 0px;
+                    // Insert separator before first non-pinned item that
+                    // follows a pinned item.
+                    if i > 0 && !item.pinned && root.items[i - 1].pinned:
+                    DockSeparator { }
+
+                    DockIconSlot {
+                        item: item;
+                        icon-clicked(id) => { root.icon-clicked(id); }
+                    }
+                }
+            }
+        }
+    }
+}

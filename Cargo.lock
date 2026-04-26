@@ -1061,31 +1061,16 @@ dependencies = [
  "pollster",
  "raw-window-handle",
  "slint",
+ "slint-build",
  "smithay",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
  "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
  "wayland-server",
  "wgpu 28.0.0",
- "winit",
-]
-
-[[package]]
-name = "compositor-slint-spike"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calloop 0.13.0",
- "chrono",
- "slint",
- "smithay",
- "softbuffer",
- "thiserror 1.0.69",
- "tracing",
- "tracing-subscriber",
- "wayland-protocols",
- "wayland-server",
  "winit",
 ]
 
@@ -2683,7 +2668,6 @@ version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3224c3aa9f3ea568daf38389d0f7ace164eda4d6f1851042eb83750ac43e1a65"
 dependencies = [
- "bytemuck",
  "calloop 0.14.4",
  "cfg_aliases 0.2.1",
  "drm",
@@ -2691,7 +2675,6 @@ dependencies = [
  "i-slint-core",
  "i-slint-renderer-femtovg",
  "i-slint-renderer-skia",
- "i-slint-renderer-software",
  "input 0.9.1",
  "memmap2",
  "nix 0.30.1",
@@ -2721,7 +2704,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4df6ec88d452e3c22e418d20c96bc1ccbc9509e81e6596426d3388bf226a5f9"
 dependencies = [
  "block2 0.6.2",
- "bytemuck",
  "cfg-if",
  "cfg_aliases 0.2.1",
  "copypasta",
@@ -2732,8 +2714,6 @@ dependencies = [
  "i-slint-core-macros",
  "i-slint-renderer-femtovg",
  "i-slint-renderer-skia",
- "i-slint-renderer-software",
- "imgref",
  "lyon_path",
  "muda",
  "objc2 0.6.4",
@@ -2743,10 +2723,8 @@ dependencies = [
  "objc2-ui-kit 0.3.2",
  "pin-weak",
  "raw-window-handle",
- "rgb",
  "scoped-tls-hkt",
  "scopeguard",
- "softbuffer",
  "strum",
  "vtable",
  "wasm-bindgen",
@@ -2782,6 +2760,7 @@ dependencies = [
  "derive_more",
  "i-slint-common",
  "icu_normalizer",
+ "image 0.25.10",
  "itertools 0.14.0",
  "linked_hash_set",
  "lyon_extra",
@@ -2789,9 +2768,14 @@ dependencies = [
  "num_enum",
  "proc-macro2",
  "quote",
+ "rayon",
+ "resvg 0.47.0",
  "rowan",
+ "rspolib",
+ "skrifa 0.40.0",
  "smol_str 0.3.6",
  "strum",
+ "swash 0.2.7",
  "typed-index-collections",
  "unicode-segmentation",
  "url",
@@ -4511,6 +4495,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "natord"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "308d96db8debc727c3fd9744aac51751243420e46edf401010908da7f8d5e57c"
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6089,6 +6079,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rspolib"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fda9a7796aff63a7b1b39ccc93fffaaf65e20042984b4843041a49ca4677535"
+dependencies = [
+ "lazy_static",
+ "natord",
+ "snafu",
+ "unicode-linebreak",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "rust-ini"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6577,6 +6580,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "slint-build"
+version = "1.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a73854b9adf81fa1600b46df488ffc3796400e8e9b40d504a94a36b55c8f3d0a"
+dependencies = [
+ "derive_more",
+ "fontique",
+ "i-slint-compiler",
+ "spin_on",
+ "toml_edit",
+]
+
+[[package]]
 name = "slint-macros"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6740,6 +6756,27 @@ checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
 dependencies = [
  "borsh",
  "serde_core",
+]
+
+[[package]]
+name = "snafu"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
+dependencies = [
+ "snafu-derive",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7258,6 +7295,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.2",
 ]
 

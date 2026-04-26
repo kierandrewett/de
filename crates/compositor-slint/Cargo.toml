@@ -19,6 +19,8 @@ smithay = { git = "https://github.com/Smithay/smithay.git", features = [
 calloop = "0.13"
 wayland-server = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
+wayland-protocols-misc = { version = "0.3", features = ["server"] }
 
 # Slint UI toolkit — GPU renderer via FemtoVG + wgpu-28
 # renderer-femtovg-wgpu enables FemtoVGWGPURenderer
@@ -55,3 +57,7 @@ chrono = "0.4"
 [[bin]]
 name = "compositor-slint"
 path = "src/main.rs"
+
+[build-dependencies]
+# Compiles slint/Compositor.slint and its imported sub-components into Rust.
+slint-build = "1.16"

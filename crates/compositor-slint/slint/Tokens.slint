@@ -1,0 +1,72 @@
+// Tokens.slint — Design token constants for the compositor shell.
+// All values sourced from WINDOW_SPEC.md and the Figma designs.
+// Import this file in every component that references colours, sizes, or typography.
+
+export global Tokens {
+    // ── Corner radii ──────────────────────────────────────────────────────────
+    // True squircle (corner-smoothing: 0.6) is not supported by Slint's
+    // border-radius (circular arc). We use the spec'd 14 px value as an
+    // approximation. The GPU agent applies the actual squircle SDF shader.
+    out property <length> window-corner-radius-outer: 14px;
+    out property <length> window-corner-radius-inner: 12px;
+    out property <length> dock-corner-radius: 20px;   // squircle-ish approximation
+    out property <length> panel-corner-radius: 0px;   // panel is full-width, flush top
+
+    // ── Panel ────────────────────────────────────────────────────────────────
+    out property <length>  panel-height: 34px;
+    out property <color>   panel-bg: #111318;
+    out property <color>   panel-fg: rgba(255, 255, 255, 0.80);
+    out property <color>   panel-border-bottom: rgba(0, 0, 0, 0.80);
+    out property <length>  panel-font-size: 13px;
+
+    // ── Dock ─────────────────────────────────────────────────────────────────
+    out property <color>   dock-bg: #b5000000;    // ~71% black
+    out property <color>   dock-border: rgba(255, 255, 255, 0.15);
+    out property <length>  dock-padding: 8px;
+    out property <length>  dock-outer-gap: 8px;
+    out property <length>  dock-icon-size: 48px;
+
+    // ── Window chrome — title bar ─────────────────────────────────────────────
+    out property <length>  titlebar-height: 33px;
+    out property <length>  titlebar-padding: 6px;
+    out property <color>   titlebar-bg-dark-active: #111318;
+    out property <color>   titlebar-bg-dark-inactive: rgba(17, 19, 24, 0.75);
+    out property <color>   titlebar-bg-light-active: #ffffff;
+    out property <color>   titlebar-bg-light-inactive: rgba(255, 255, 255, 0.50);
+    out property <color>   titlebar-fg-dark: rgba(255, 255, 255, 0.80);
+    out property <color>   titlebar-fg-light: rgba(0, 0, 0, 0.75);
+    out property <color>   titlebar-border-dark: rgba(0, 0, 0, 0.80);
+    out property <color>   titlebar-border-light: #bbbbbb;
+    out property <length>  titlebar-font-size: 13px;
+
+    // ── Window chrome — outer border ─────────────────────────────────────────
+    out property <color>   border-dark-active: rgba(0, 0, 0, 0.72);
+    out property <color>   border-dark-inactive: rgba(0, 0, 0, 0.55);
+    out property <color>   border-light-active: rgba(0, 0, 0, 0.22);
+    out property <color>   border-light-inactive: rgba(0, 0, 0, 0.15);
+
+    // ── Window chrome — inner highlight (top edge, dark active) ──────────────
+    out property <color>   highlight-dark-active-top: rgba(255, 255, 255, 0.08);
+    out property <color>   highlight-dark-active-bottom: rgba(255, 255, 255, 0.00);
+
+    // ── Window controls ───────────────────────────────────────────────────────
+    out property <length>  control-size: 21px;
+    out property <length>  control-gap: 4px;
+    out property <length>  control-inset: 6px;
+
+    // ── Typography ────────────────────────────────────────────────────────────
+    // Inter Variable is registered by the GPU/renderer agent at runtime.
+    out property <string>  font-family: "Inter Variable";
+    out property <string>  font-family-fallback: "Inter";
+
+    // ── Z-order layers ────────────────────────────────────────────────────────
+    // NOTE: Slint requires `z` to be an integer literal, so these constants
+    // cannot be used directly as `z: Tokens.z-wallpaper`.  They are documented
+    // here for reference; Compositor.slint uses inline literals.
+    //   wallpaper:  0
+    //   windows:   10
+    //   layers-bg: 20
+    //   layers-top: 30
+    //   dock:       40
+    //   panel:      50
+}
