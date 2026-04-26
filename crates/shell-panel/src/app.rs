@@ -147,7 +147,10 @@ impl Default for State {
 
 /// Boot: return the initial state and an empty task.
 pub fn boot() -> (State, Task<Message>) {
-    (State::default(), Task::none())
+    // Auto-open the datetime popout on startup for screenshot capture.
+    // TODO: remove after screenshots are taken.
+    let open_dt = Task::done(Message::ToggleDateTime);
+    (State::default(), open_dt)
 }
 
 /// Update the application state in response to a message.

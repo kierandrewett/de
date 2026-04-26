@@ -234,7 +234,7 @@ impl LayerAccumulators {
 // ─── Shadow computation ──────────────────────────────────────────────────────
 
 /// Compute combined shadow pixel data for all layers.
-fn compute_shadow_pixels(
+pub(crate) fn compute_shadow_pixels(
     window_w: u32,
     window_h: u32,
     layers: &[ShadowLayer],

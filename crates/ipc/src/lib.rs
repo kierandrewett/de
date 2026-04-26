@@ -198,6 +198,28 @@ pub enum ShellRequest {
         window_id: u64,
     },
 
+    /// Move the specified window's top-left corner to the given logical
+    /// coordinates inside its current output. Used by playground scripts
+    /// to deterministically place windows for screenshots / focus tests.
+    MoveWindow {
+        /// Compositor-assigned window identifier.
+        window_id: u64,
+        /// Target X in logical pixels.
+        x: i32,
+        /// Target Y in logical pixels.
+        y: i32,
+    },
+
+    /// Resize the specified window to the given logical size.
+    ResizeWindow {
+        /// Compositor-assigned window identifier.
+        window_id: u64,
+        /// Target width in logical pixels.
+        width: i32,
+        /// Target height in logical pixels.
+        height: i32,
+    },
+
     /// Apply a snap layout to a monitor.
     SetSnapLayout {
         /// Zero-based index of the target monitor.
@@ -248,6 +270,12 @@ pub enum ShellRequest {
 
     /// Suspend the system.
     Suspend,
+
+    /// Switch the compositor's UI theme (currently affects SSD chrome).
+    SetTheme {
+        /// Either `"light"` or `"dark"` (case-insensitive).
+        mode: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

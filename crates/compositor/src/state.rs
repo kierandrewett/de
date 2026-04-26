@@ -176,6 +176,17 @@ pub struct CommonState {
     /// title text). Cached per `(size, scale, focus, title)`.
     pub chrome_iced: crate::chrome_iced::IcedChrome,
 
+    /// Per-window chrome (shadow + decoration overlay) texture cache,
+    /// keyed by `(size_px, scale, focus, dark)`. See
+    /// [`crate::render::window_chrome`] for details.
+    pub window_chrome: crate::render::window_chrome::WindowChromeCache,
+    /// Active theme tokens for window chrome. Held here so the renderer
+    /// can consult colours/radii without re-reading config every frame.
+    pub window_theme: theme::WindowTheme,
+    /// Whether the desktop is in dark mode. Currently a startup constant;
+    /// later wired to a `org.freedesktop.appearance` setting via portal.
+    pub dark_mode: bool,
+
     /// When set, the next render frame copies the framebuffer back to
     /// CPU and writes a PNG to this path. Cleared after a single frame.
     pub pending_screenshot: Option<std::path::PathBuf>,
@@ -326,7 +337,16 @@ impl CommonState {
             }),
             cursor_buffer: None,
             cursor_hotspot: (0, 0),
-            chrome_iced: crate::chrome_iced::IcedChrome::default(),
+            chrome_iced: {
+                let mut c = crate::chrome_iced::IcedChrome::default();
+                c.set_theme(crate::chrome_iced::ChromeTheme::Dark);
+                c
+            },
+            // Cutout colour matches the compositor's clear colour in RGBA bytes
+            // (winit.rs uses linear-ish [0.06, 0.06, 0.07, 1.0]).
+            window_chrome: crate::render::window_chrome::WindowChromeCache::new([15, 15, 18, 255]),
+            window_theme: theme::WindowTheme::default(),
+            dark_mode: true,
             pending_screenshot: None,
             last_frame: Instant::now(),
         }

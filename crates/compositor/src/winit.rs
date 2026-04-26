@@ -45,6 +45,21 @@ pub struct WinitData {
     /// on first frame; `None` means "fall back to rectangular surfaces".
     pub clip_program:
         Option<smithay::backend::renderer::gles::GlesTexProgram>,
+    /// Cached snap-zone preview ghost (translucent squircle drawn at
+    /// the pending snap target during a move drag). Rebuilt only when
+    /// the snap rect or theme mode changes, since the pixmap fill is
+    /// the dominant cost at half-screen sizes.
+    pub snap_preview_cache: Option<SnapPreviewCache>,
+}
+
+/// Cache slot for the snap-zone preview buffer. Keyed by physical
+/// dimensions + dark mode so a theme switch or a different snap target
+/// invalidates the texture.
+pub struct SnapPreviewCache {
+    pub width_px: u32,
+    pub height_px: u32,
+    pub dark: bool,
+    pub buffer: MemoryRenderBuffer,
 }
 
 /// Initialise the winit backend and run the event loop.
@@ -178,6 +193,7 @@ pub fn run() -> anyhow::Result<()> {
         output,
         damage_tracker,
         clip_program: None,
+        snap_preview_cache: None,
     };
     let mut state = State { backend: Backend::Winit(Box::new(winit_data)), common };
 
@@ -508,6 +524,33 @@ fn render_frame(state: &mut State) {
         }
     }
 
+    // Drive minimize / unminimize state machine. The animation springs
+    // are advanced in `tick_animations` above; here we promote any
+    // window whose spring has settled into its terminal "hidden" or
+    // "visible" state.
+    {
+        let (minimizing_done, unminimizing_done) =
+            crate::shell::minimize::tick_minimize_animations(&state.common.shell);
+        for id in minimizing_done {
+            crate::shell::minimize::finish_minimize(&mut state.common.shell, id);
+            if let Some(info) = state.common.shell.window_info(id) {
+                state.common.ipc.broadcast(&ipc::ShellEvent::WindowStateChanged {
+                    window_id: info.id,
+                    state: info.state,
+                });
+            }
+        }
+        for id in unminimizing_done {
+            crate::shell::minimize::finish_unminimize(&mut state.common.shell, id);
+            if let Some(info) = state.common.shell.window_info(id) {
+                state.common.ipc.broadcast(&ipc::ShellEvent::WindowStateChanged {
+                    window_id: info.id,
+                    state: info.state,
+                });
+            }
+        }
+    }
+
     let focused_id = state.common.shell.focused_window_id();
     struct WindowSnapshot {
         window: smithay::desktop::Window,
@@ -533,6 +576,26 @@ fn render_frame(state: &mut State) {
         .elements()
         .filter_map(|w| {
             let content_geo = state.common.space.element_geometry(w)?;
+            // Skip windows that have already finished minimizing — their
+            // chrome would compose with opacity=0 anyway, but we save the
+            // texture allocations and shader passes by dropping them
+            // here. Mid-minimize they're still emitted so the spring
+            // animation is visible.
+            let win_id = w
+                .user_data()
+                .get::<crate::wayland::handlers::xdg_shell::ShellWindowId>()
+                .map(|id| id.0);
+            if let Some(id) = win_id {
+                if state
+                    .common
+                    .shell
+                    .window(id)
+                    .map(|mw| mw.is_minimized && mw.animation.is_complete())
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+            }
             let is_ssd = crate::shell::is_ssd(w);
             // SSD windows extend upward by TITLE_BAR_HEIGHT for the bar.
             let full_geo = if is_ssd {
@@ -720,6 +783,91 @@ fn render_frame(state: &mut State) {
             ));
         cursor_logical.to_physical(scale)
     });
+
+    // ── Snap-zone preview ghost ────────────────────────────────────────
+    // While a window is being moved, render a translucent squircle at
+    // any pending snap target so the user sees where the window will
+    // land before they release. Uses the same theme corner radius as
+    // real windows for visual consistency.
+    let snap_preview: Option<(MemoryRenderBuffer, Point<f64, smithay::utils::Physical>)> = {
+        let pending = state
+            .common
+            .grab
+            .active
+            .as_ref()
+            .and_then(|g| g.pending_snap.as_ref().map(|t| (g.window_id, t.clone())));
+        match pending {
+            Some((win_id, target)) => {
+                // Need a monitor to compute the snap rect. Use the
+                // monitor that contains the window's centre — same logic
+                // as the keyboard shortcuts.
+                let centre = state.common.shell.window(win_id).map(|w| {
+                    let g = w.geometry;
+                    (g.loc.x + g.size.w / 2, g.loc.y + g.size.h / 2)
+                });
+                let mut work_area_opt: Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> = None;
+                if let Some((cx, cy)) = centre {
+                    for output in state.common.space.outputs() {
+                        if let Some(geo) = state.common.space.output_geometry(output) {
+                            if geo.contains(smithay::utils::Point::from((cx, cy))) {
+                                work_area_opt = Some(geo);
+                                break;
+                            }
+                            work_area_opt.get_or_insert(geo);
+                        }
+                    }
+                }
+                if let Some(work_area) = work_area_opt {
+                    // Per-monitor zone layouts — none configured by
+                    // default, so pass an empty slice unless a layout
+                    // is registered for the active output's name.
+                    let no_layouts: Vec<ipc::SnapLayout> = Vec::new();
+                    let layouts: &[ipc::SnapLayout] = &no_layouts;
+                    let snap_rect = crate::shell::snapping::snap_rect_for_target(
+                        &target,
+                        work_area,
+                        layouts,
+                    );
+                    let phys_loc = (
+                        snap_rect.loc.x as f64 * scale.x,
+                        snap_rect.loc.y as f64 * scale.y,
+                    )
+                        .into();
+                    let w_px = (snap_rect.size.w as f64 * scale.x).round().max(1.0) as u32;
+                    let h_px = (snap_rect.size.h as f64 * scale.y).round().max(1.0) as u32;
+                    let dark = state.common.dark_mode;
+                    let radius = state.common.window_theme.corner_radius;
+                    let cache_hit = winit
+                        .snap_preview_cache
+                        .as_ref()
+                        .map(|c| c.width_px == w_px && c.height_px == h_px && c.dark == dark)
+                        .unwrap_or(false);
+                    if !cache_hit {
+                        winit.snap_preview_cache = Some(SnapPreviewCache {
+                            width_px: w_px,
+                            height_px: h_px,
+                            dark,
+                            buffer: crate::render::window_chrome::build_snap_preview_buffer(
+                                w_px, h_px, scale.x, radius, dark,
+                            ),
+                        });
+                    }
+                    winit
+                        .snap_preview_cache
+                        .as_ref()
+                        .map(|c| (c.buffer.clone(), phys_loc))
+                } else {
+                    None
+                }
+            }
+            None => {
+                // No pending snap: drop the cache so we don't leak the
+                // last drag's buffer.
+                winit.snap_preview_cache = None;
+                None
+            }
+        }
+    };
 
     // ── Build title-bar chrome buffers (SSD only) ──────────────────────
     // The bar is rendered once in its *active* style; the inactive
@@ -1220,6 +1368,25 @@ fn render_frame(state: &mut State) {
             }
         }
         let _ = title_bar_by_geo;
+
+        // Snap-zone preview ghost. Pushed last so it sits at the BACK
+        // of `all_overlays` (front-to-back order) — that way the
+        // dragged window's chrome and surface still composite above
+        // the ghost, while the ghost still appears above the desktop
+        // background.
+        if let Some((buffer, loc)) = snap_preview {
+            if let Ok(el) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                loc,
+                &buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                all_overlays.push(CursorElement::Texture(el));
+            }
+        }
 
         // When the SDF clip program is available we own the entire element
         // list — cursor, layer-shell chrome, window chrome, etc. are all in

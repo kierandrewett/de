@@ -167,6 +167,26 @@ fn reader_loop(stream: UnixStream, tx: smithay::reexports::calloop::channel::Sen
 
 /// Dispatch a single [`ShellRequest`] into compositor state. Most variants
 /// are best-effort and do not produce a response — the compositor broadcasts
+/// Look up a smithay [`Window`] by the compositor's stable `id` stored in
+/// its user_data. Materialises the borrow into an owned `Window` (Arc
+/// clone) so the caller can immediately mutate the space.
+fn window_by_id(
+    state: &State,
+    window_id: u64,
+) -> Option<smithay::desktop::Window> {
+    state
+        .common
+        .space
+        .elements()
+        .find(|w| {
+            w.user_data()
+                .get::<crate::wayland::handlers::xdg_shell::ShellWindowId>()
+                .map(|id| id.0)
+                == Some(window_id)
+        })
+        .cloned()
+}
+
 /// state changes via [`ShellEvent`] independently.
 fn handle_request(state: &mut State, req: ShellRequest) {
     use ipc::WindowInfo;
@@ -174,26 +194,88 @@ fn handle_request(state: &mut State, req: ShellRequest) {
     match req {
         ShellRequest::ActivateWindow { window_id } => {
             state.common.shell.focus_window(window_id);
+            // Raise the window in the compositor's space so it lands at
+            // the top of `space.elements()` and becomes the front-most
+            // visual layer.
+            let window = window_by_id(state, window_id);
+            if let Some(window) = window {
+                state.common.space.raise_element(&window, true);
+            }
             broadcast_focus(state);
         }
-        ShellRequest::MinimizeWindow { window_id } => {
+        ShellRequest::MoveWindow { window_id, x, y } => {
             if let Some(w) = state.common.shell.window_mut(window_id) {
-                w.is_minimized = true;
+                w.geometry.loc = (x, y).into();
+                w.animation.geometry.set_position([
+                    x as f64,
+                    y as f64,
+                    w.geometry.size.w as f64,
+                    w.geometry.size.h as f64,
+                ]);
                 broadcast_window_state(state, window_id);
             }
+            let window = window_by_id(state, window_id);
+            if let Some(window) = window {
+                state.common.space.map_element(window, (x, y), false);
+            }
+        }
+        ShellRequest::ResizeWindow { window_id, width, height } => {
+            if let Some(w) = state.common.shell.window_mut(window_id) {
+                w.geometry.size = (width.max(1), height.max(1)).into();
+                w.animation.geometry.set_position([
+                    w.geometry.loc.x as f64,
+                    w.geometry.loc.y as f64,
+                    width as f64,
+                    height as f64,
+                ]);
+                broadcast_window_state(state, window_id);
+            }
+            let window = window_by_id(state, window_id);
+            if let Some(window) = window {
+                if let smithay::desktop::WindowSurface::Wayland(toplevel) =
+                    window.underlying_surface()
+                {
+                    toplevel.with_pending_state(|s| {
+                        s.size = Some((width.max(1), height.max(1)).into());
+                    });
+                    toplevel.send_pending_configure();
+                }
+            }
+        }
+        ShellRequest::MinimizeWindow { window_id } => {
+            // Drive the animated minimize-to-dock state machine — flips
+            // is_minimized on completion via the render-loop tick. Same
+            // path as the keyboard shortcut and the title-bar minimize
+            // button so behaviour stays consistent across triggers.
+            crate::shell::minimize::minimize_window(
+                &mut state.common.shell,
+                window_id,
+                None,
+            );
+            broadcast_window_state(state, window_id);
         }
         ShellRequest::UnminimizeWindow { window_id } => {
-            if let Some(w) = state.common.shell.window_mut(window_id) {
-                w.is_minimized = false;
-                broadcast_window_state(state, window_id);
-            }
+            crate::shell::minimize::unminimize_window(
+                &mut state.common.shell,
+                window_id,
+                None,
+            );
+            broadcast_window_state(state, window_id);
         }
         ShellRequest::CloseWindow { window_id } => {
-            // Window destruction is owned by the wayland xdg-shell handler;
-            // we just drop our shell-side bookkeeping. Future: send the
-            // xdg_toplevel.close request to the client too.
-            state.common.shell.remove_window(window_id);
-            state.common.ipc.broadcast(&ShellEvent::WindowClosed { window_id });
+            // Politely ask the client to close, then start the fade-out
+            // animation. The actual `remove_window` happens in
+            // `winit.rs::render_frame`'s sweep once the opacity spring
+            // has settled near zero, so the broadcast moves there too.
+            let window = window_by_id(state, window_id);
+            if let Some(window) = window {
+                if let smithay::desktop::WindowSurface::Wayland(toplevel) =
+                    window.underlying_surface()
+                {
+                    toplevel.send_close();
+                }
+            }
+            state.common.shell.begin_close(window_id);
         }
         ShellRequest::GetAllWindows => {
             // Replay current windows as WindowOpened events for the requester.
@@ -220,6 +302,14 @@ fn handle_request(state: &mut State, req: ShellRequest) {
         }
         ShellRequest::Lock => {
             tracing::info!("ipc: Lock requested (session-lock not yet wired into shell)");
+        }
+        ShellRequest::SetTheme { mode } => {
+            let theme = match mode.to_ascii_lowercase().as_str() {
+                "dark" => crate::chrome_iced::ChromeTheme::Dark,
+                _ => crate::chrome_iced::ChromeTheme::Light,
+            };
+            tracing::info!("ipc: SetTheme -> {:?}", theme);
+            state.common.chrome_iced.set_theme(theme);
         }
         ShellRequest::TakeScreenshot { region: _ } => {
             // Region cropping is a follow-up; for now we always grab the

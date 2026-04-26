@@ -1,0 +1,14 @@
+[package]
+name = "text-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Kieran Drewett"]
+description = "GTK4/Figma-quality grayscale text rasterizer for Wayland chrome and first-party shell apps."
+
+[dependencies]
+# Pinned to the versions iced 0.13 / iced_graphics 0.13 transitively pull
+# in so apps sharing the global font-system don't get duplicate copies.
+cosmic-text = "0.12"
+swash = "0.1"
+tiny-skia = { workspace = true }

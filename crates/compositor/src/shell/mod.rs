@@ -24,8 +24,11 @@ use ipc::{Rect, SnapLayout, WindowInfo, WindowState};
 // SSD title-bar chrome geometry
 // ---------------------------------------------------------------------------
 
-/// Logical-pixel height of an SSD title bar.
-pub const TITLE_BAR_HEIGHT: i32 = 28;
+/// Logical-pixel height of an SSD title bar. A hair taller than the
+/// 33 px macOS standard so the title text has breathing room. Must stay
+/// in sync with `theme::WindowTheme::default().title_bar_height` — the
+/// chrome cache and the iced title-bar element both read it.
+pub const TITLE_BAR_HEIGHT: i32 = 34;
 /// Diameter of each control button (circle background; the icon inside is 17px with 2px padding).
 pub const BUTTON_SIZE: i32 = 21;
 /// Spacing between adjacent control buttons (edge-to-edge gap).
@@ -47,18 +50,27 @@ pub struct TitleBarChrome {
 }
 
 /// Compute the chrome geometry for a window whose content rect is `geo`.
-/// macOS convention: traffic-light controls are at the LEFT of the bar.
+///
+/// Controls are right-aligned in the order (left → right): minimize,
+/// maximize, close. Matches the iced row layout in [`crate::chrome_iced`]
+/// (`row![min, max, close]` aligned to the right edge with a symmetric
+/// inset of `(bar_height - BUTTON_SIZE) / 2`). The hit-test rects MUST
+/// match the rendered positions or button clicks won't register.
 pub fn title_bar_chrome(geo: Rectangle<i32, Logical>) -> TitleBarChrome {
     let bar_loc = Point::from((geo.loc.x, geo.loc.y - TITLE_BAR_HEIGHT));
     let bar = Rectangle::new(bar_loc, Size::from((geo.size.w, TITLE_BAR_HEIGHT)));
     let center_y = bar_loc.y + (TITLE_BAR_HEIGHT - BUTTON_SIZE) / 2;
+    let inset = ((TITLE_BAR_HEIGHT - BUTTON_SIZE) / 2).max(0);
+    let _ = BUTTON_MARGIN;
 
-    let mut x = bar_loc.x + BUTTON_MARGIN;
+    let right_edge = bar_loc.x + geo.size.w - inset;
+    // Close is rightmost.
+    let mut x = right_edge - BUTTON_SIZE;
     let close = Rectangle::new(Point::from((x, center_y)), Size::from((BUTTON_SIZE, BUTTON_SIZE)));
-    x += BUTTON_SIZE + BUTTON_GAP;
-    let minimize = Rectangle::new(Point::from((x, center_y)), Size::from((BUTTON_SIZE, BUTTON_SIZE)));
-    x += BUTTON_SIZE + BUTTON_GAP;
+    x -= BUTTON_GAP + BUTTON_SIZE;
     let maximize = Rectangle::new(Point::from((x, center_y)), Size::from((BUTTON_SIZE, BUTTON_SIZE)));
+    x -= BUTTON_GAP + BUTTON_SIZE;
+    let minimize = Rectangle::new(Point::from((x, center_y)), Size::from((BUTTON_SIZE, BUTTON_SIZE)));
 
     TitleBarChrome { bar, close, minimize, maximize }
 }
@@ -117,6 +129,10 @@ pub struct WindowAnimState {
     pub opacity: AnimatedFloat,
     /// Animated uniform scale factor (1.0 = original size).
     pub scale: AnimatedFloat,
+    /// Animated focus state in `[0.0, 1.0]` — 0 = inactive, 1 = active.
+    /// Used to crossfade the chrome (border colours, inner highlight,
+    /// shadow layers, title-bar opacity) at composite time.
+    pub focus: AnimatedFloat,
 }
 
 impl WindowAnimState {
@@ -130,13 +146,30 @@ impl WindowAnimState {
             rect.size.h as f64,
         ]);
 
-        let mut opacity: AnimatedFloat = AnimatedValue::new_spring(600.0, 1.0, 0.001);
-        opacity.set_position([1.0]);
+        // Open animation: spring opacity 0 → 1. Spring is purposely
+        // slow (settle ≈ 700 ms) so the fade-in is still in progress
+        // by the time slow-starting clients (kitty/GLFW, GTK4) commit
+        // their first buffer — otherwise the spring burns through
+        // while the surface is still invisible and the window pops in
+        // at full opacity once it becomes renderable.
+        let mut opacity: AnimatedFloat = AnimatedValue::new_spring(40.0, 1.0, 0.001);
+        opacity.set_position([0.0]);
+        opacity.set_target([1.0]);
 
-        let mut scale: AnimatedFloat = AnimatedValue::new_spring(600.0, 1.0, 0.001);
-        scale.set_position([1.0]);
+        // Open animation: spring scale 0.85 → 1.0 over ~700 ms,
+        // matched to the opacity spring.
+        let mut scale: AnimatedFloat = AnimatedValue::new_spring(40.0, 1.0, 0.001);
+        scale.set_position([0.85]);
+        scale.set_target([1.0]);
 
-        Self { geometry, opacity, scale }
+        // Critically-damped, fairly fast spring: ~150 ms settle time.
+        // High damping ratio keeps the crossfade from overshooting
+        // (overshoot would briefly push the chrome past the active
+        // values, which look wrong for opacity-style animations).
+        let mut focus: AnimatedFloat = AnimatedValue::new_spring(800.0, 1.6, 0.001);
+        focus.set_position([0.0]);
+
+        Self { geometry, opacity, scale, focus }
     }
 
     /// Advance all components by `dt` seconds.
@@ -144,11 +177,15 @@ impl WindowAnimState {
         self.geometry.tick(dt);
         self.opacity.tick(dt);
         self.scale.tick(dt);
+        self.focus.tick(dt);
     }
 
     /// Returns `true` when all animations have settled.
     pub fn is_complete(&self) -> bool {
-        self.geometry.is_complete() && self.opacity.is_complete() && self.scale.is_complete()
+        self.geometry.is_complete()
+            && self.opacity.is_complete()
+            && self.scale.is_complete()
+            && self.focus.is_complete()
     }
 
     /// Set the geometry target; animation will spring toward it.
@@ -247,6 +284,16 @@ pub struct MappedWindow {
     pub is_minimized: bool,
     /// Window is in exclusive fullscreen.
     pub is_fullscreen: bool,
+    /// Window is in the middle of its close animation. The wayland
+    /// surface may already be unmapped — we keep the entry alive so
+    /// the opacity spring can finish, then drop everything.
+    pub is_closing: bool,
+    /// Whether the open animation has been kicked off. The spring is
+    /// initially held at its start values; it only begins moving once
+    /// the client commits its first buffer (otherwise the animation
+    /// burns through while the window is still invisible and pops in
+    /// at full opacity by the time it becomes renderable).
+    pub open_anim_started: bool,
     /// Active snap zone, if snapped.
     pub snap_state: Option<snapping::SnapTarget>,
     /// Live animation state driven by the shell.
@@ -279,12 +326,27 @@ impl MappedWindow {
             is_maximized: false,
             is_minimized: false,
             is_fullscreen: false,
+            is_closing: false,
+            open_anim_started: false,
             snap_state: None,
             animation: WindowAnimState::new(geometry),
             app_id,
             title,
             last_frame_texture: None,
         }
+    }
+
+    /// Kick off the open animation. Idempotent — safe to call on every
+    /// commit; only the first call (with `open_anim_started == false`)
+    /// actually moves the springs.
+    pub fn start_open_animation(&mut self) {
+        if self.open_anim_started || self.is_closing {
+            return;
+        }
+        self.open_anim_started = true;
+        self.animation.opacity.set_target([1.0]);
+        self.animation.scale.set_target([1.0]);
+        tracing::info!(id = self.id, "open animation kicked off");
     }
 }
 
@@ -337,8 +399,14 @@ pub struct Workspace {
 pub struct Shell {
     /// All mapped windows in paint order (back = index 0, front = last).
     pub windows: Vec<MappedWindow>,
-    /// Focus stack — window IDs, most-recently-focused last.
+    /// Focus stack — window IDs, most-recently-focused last. Used by
+    /// alt-tab as the cycle order; the *currently* focused window is
+    /// `focus_stack.last()` only when `focus_active` is true.
     pub focus_stack: Vec<u64>,
+    /// Whether something in the stack is currently focused. Cleared by
+    /// [`Shell::unfocus_all`] (e.g. on a click in empty desktop space)
+    /// without losing the stack itself.
+    pub focus_active: bool,
     /// Index of the currently visible workspace.
     pub workspace_index: usize,
     /// All virtual workspaces.
@@ -361,6 +429,7 @@ impl Shell {
         Self {
             windows: Vec::new(),
             focus_stack: Vec::new(),
+            focus_active: false,
             workspace_index: 0,
             workspaces: vec![Workspace {
                 name: "1".to_string(),
@@ -410,17 +479,105 @@ impl Shell {
         Some(win)
     }
 
+    /// Mark `id` as closing and start the fade-out animation. The
+    /// window is *not* removed yet; call [`Shell::sweep_closed_windows`]
+    /// each frame to drop entries whose opacity has settled near zero.
+    pub fn begin_close(&mut self, id: u64) {
+        if let Some(w) = self.window_mut(id) {
+            w.is_closing = true;
+            w.animation.opacity.set_target([0.0]);
+            // Match the open animation in reverse — shrink to 0.85 as
+            // the window fades out.
+            w.animation.scale.set_target([0.85]);
+        }
+        // Closing window relinquishes focus; pop it off the stack and
+        // animate the next-up to focused.
+        self.focus_stack.retain(|&fid| fid != id);
+        if let Some(w) = self.window_mut(id) {
+            w.animation.focus.set_target([0.0]);
+        }
+        if let Some(&next) = self.focus_stack.last() {
+            self.focus_active = true;
+            // Move the now-top focus_stack entry to the active state.
+            for w in &mut self.windows {
+                if !w.is_closing {
+                    w.animation
+                        .focus
+                        .set_target([if w.id == next { 1.0 } else { 0.0 }]);
+                }
+            }
+        } else {
+            self.focus_active = false;
+        }
+    }
+
+    /// Drop windows whose close animation has fully settled. Returns the
+    /// list of window IDs that were removed so the caller can also
+    /// unmap them from `Space` and broadcast `WindowClosed`.
+    pub fn sweep_closed_windows(&mut self) -> Vec<u64> {
+        let mut removed = Vec::new();
+        // Use retain_mut so we drop in-place without indexing dance.
+        self.windows.retain(|w| {
+            if w.is_closing && w.animation.opacity.position()[0] <= 0.01 {
+                removed.push(w.id);
+                false
+            } else {
+                true
+            }
+        });
+        for id in &removed {
+            self.focus_stack.retain(|&fid| fid != *id);
+            for ws in &mut self.workspaces {
+                ws.window_ids.retain(|&wid| wid != *id);
+            }
+        }
+        removed
+    }
+
     /// Push `id` to the top of the focus stack (most recently focused).
+    ///
+    /// Drives the per-window focus AnimatedFloat so chrome crossfades
+    /// from the inactive style to the active style smoothly.
     pub fn focus_window(&mut self, id: u64) {
         if self.window(id).is_some() {
             self.focus_stack.retain(|&fid| fid != id);
             self.focus_stack.push(id);
+            self.focus_active = true;
+            // Animate focus targets: the new focus → 1, everyone else → 0.
+            for w in &mut self.windows {
+                let target = if w.id == id { 1.0 } else { 0.0 };
+                w.animation.focus.set_target([target]);
+            }
         }
     }
 
+    /// Mark "no window focused". Leaves [`focus_stack`] intact so
+    /// alt-tab still has the prior history; just hides the active
+    /// window from [`focused_window_id`] until something is re-focused.
+    /// Also drives every window's focus animation back to 0.
+    pub fn unfocus_all_animate(&mut self) {
+        for w in &mut self.windows {
+            w.animation.focus.set_target([0.0]);
+        }
+        self.unfocus_all();
+    }
+
+    /// Mark "no window focused". Leaves [`focus_stack`] intact so
+    /// alt-tab still has the prior history; just hides the active
+    /// window from [`focused_window_id`] until something is re-focused.
+    pub fn unfocus_all(&mut self) {
+        self.focus_active = false;
+    }
+
     /// The window that currently holds keyboard focus, if any.
+    /// Returns `None` after [`unfocus_all`] until the next
+    /// [`focus_window`] call.
     pub fn focused_window_id(&self) -> Option<u64> {
-        self.focus_stack.last().copied()
+        if self.focus_active {
+            self.focus_stack.last().copied()
+        } else {
+            None
+        }
     }
 
     /// Borrow the currently focused window.

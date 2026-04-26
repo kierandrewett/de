@@ -153,6 +153,13 @@ pub fn tick_minimize_animations(shell: &Shell) -> (Vec<u64>, Vec<u64>) {
     let mut to_finish_unminimize = Vec::new();
 
     for win in &shell.windows {
+        // Closing windows also drive opacity → 0 via `begin_close`. Skip
+        // them so the close path (`sweep_closed_windows`) handles their
+        // teardown — without this we'd race and flip `is_minimized` on a
+        // window that's about to be destroyed.
+        if win.is_closing {
+            continue;
+        }
         if win.animation.is_complete() {
             // Check opacity: near-zero means minimize finished, near-one means
             // unminimize finished.

@@ -97,7 +97,16 @@ case "$CMD" in
         echo "[playground] WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
 
         for proc in shell-panel shell-dock notification portal; do
-            stdbuf -oL "./target/debug/$proc" \
+            extra_env=""
+            if [[ "$proc" == "shell-panel" ]]; then
+                # Force tiny-skia (CPU/wl_shm) backend — wgpu+mesa-vk's wp_fifo
+                # path stalls our nested smithay compositor after ~3 commits.
+                extra_env="ICED_BACKEND=tiny-skia"
+                if [[ -n "${PANEL_WAYLAND_DEBUG:-}" ]]; then
+                    extra_env="$extra_env WAYLAND_DEBUG=1"
+                fi
+            fi
+            stdbuf -oL env $extra_env "./target/debug/$proc" \
                 > "$LOGS/$proc.log" 2>&1 &
             echo $! > "$PIDS/$proc.pid"
             echo "[playground] $proc pid=$(cat $PIDS/$proc.pid)"

@@ -21,8 +21,8 @@ impl WlrLayerShellHandler for State {
         &mut self,
         surface: WlrLayerSurface,
         wl_output: Option<wl_output::WlOutput>,
-        _layer: Layer,
-        _namespace: String,
+        layer: Layer,
+        namespace: String,
     ) {
         // Find the requested output or fall back to the first available output.
         let output = wl_output
@@ -46,7 +46,17 @@ impl WlrLayerShellHandler for State {
         };
 
         let mut map = layer_map_for_output(&output);
-        map.map_layer(&LayerSurface::new(surface, String::new())).ok();
+        let layer_surface = LayerSurface::new(surface, namespace.clone());
+        if let Err(e) = map.map_layer(&layer_surface) {
+            tracing::warn!("layer_shell: map_layer failed for ns={namespace:?}: {e:?}");
+        } else {
+            tracing::info!(
+                output = %output.name(),
+                ns = %namespace,
+                layer = ?layer,
+                "layer_shell: surface mapped",
+            );
+        }
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
