@@ -97,7 +97,7 @@ impl ClientData for ClientState {
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientSurfaceData {
-    pub pixels: Vec<u8>, // RGBA8 premultiplied
+    pub pixels: Vec<u8>, // RGBA8 premultiplied (for slint::Image::from_rgba8_premultiplied)
     pub width: u32,
     pub height: u32,
     pub dirty: bool,
@@ -338,9 +338,16 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
     };
 
     let result = with_buffer_contents(&*buffer, |ptr: *const u8, len: usize, spec| {
+        use smithay::reexports::wayland_server::protocol::wl_shm;
+
         let width = spec.width as u32;
         let height = spec.height as u32;
         let stride = spec.stride as usize;
+
+        // Both ARGB8888 and XRGB8888 store bytes in LE as [B, G, R, A/X].
+        // For XRGB8888 the X byte is always 0 — treat as fully opaque (alpha=255)
+        // so pixels are not zeroed out by the premultiply step below.
+        let has_alpha = matches!(spec.format, wl_shm::Format::Argb8888);
 
         let data = unsafe { std::slice::from_raw_parts(ptr, len) };
 
@@ -353,11 +360,12 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
                 if src + 4 > data.len() {
                     break;
                 }
-                // wl_shm ARGB8888 in LE: [B, G, R, A]
+                // wl_shm ARGB8888/XRGB8888 in LE: [B, G, R, A/X]
                 let b = data[src];
                 let g = data[src + 1];
                 let r = data[src + 2];
-                let a = data[src + 3];
+                let a = if has_alpha { data[src + 3] } else { 255u8 };
+                // Premultiply for slint::Image::from_rgba8_premultiplied().
                 let af = a as f32 / 255.0;
                 rgba[dst] = (r as f32 * af) as u8;
                 rgba[dst + 1] = (g as f32 * af) as u8;
@@ -366,7 +374,7 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
             }
         }
 
-        info!("client surface imported, {}x{} SHM buffer", width, height);
+        info!("client surface imported, {}x{} SHM buffer (fmt={:?})", width, height, spec.format);
 
         ClientSurfaceData {
             pixels: rgba,

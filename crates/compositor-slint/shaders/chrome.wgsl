@@ -157,9 +157,11 @@ fn fs_chrome(in: VertexOut) -> @location(0) vec4<f32> {
     let grad   = clamp(1.0 - y_norm * 1.5, 0.0, 1.0);
 
     let hl_a = u.highlight_a * highlight_stripe * grad;
-    let hl_col = vec4<f32>(1.0, 1.0, 1.0, hl_a);
+    // Premultiply before src-over: hl_rgb * hl_a so the formula works correctly
+    // even when hl_a = 0 (avoids adding (1,1,1) to the output).
+    let hl_col_pm = vec4<f32>(hl_a, hl_a, hl_a, hl_a); // white premultiplied
 
-    colour = hl_col + colour * (1.0 - hl_col.a);
+    colour = hl_col_pm + colour * (1.0 - hl_a);
 
     return colour;
 }
