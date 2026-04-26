@@ -11,8 +11,8 @@ name = "shell-dock"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "0.13", features = ["advanced", "image", "svg", "tokio"] }
-iced_layershell = "0.7"
+iced = { version = "0.14", features = ["advanced", "image", "svg", "tokio"] }
+iced_layershell = { version = "0.18.0-beta4", features = ["unconditional-rendering"] }
 ipc = { path = "../ipc" }
 animation = { path = "../animation" }
 theme = { path = "../theme" }

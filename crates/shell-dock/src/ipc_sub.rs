@@ -14,10 +14,7 @@ struct IpcWorker;
 ///
 /// On disconnect, the subscription automatically retries every two seconds.
 pub fn subscription() -> iced::Subscription<Message> {
-    iced::Subscription::run_with_id(
-        std::any::TypeId::of::<IpcWorker>(),
-        event_stream(),
-    )
+    iced::Subscription::run_with(std::any::TypeId::of::<IpcWorker>(), |_| event_stream())
 }
 
 fn event_stream() -> impl iced::futures::Stream<Item = Message> {

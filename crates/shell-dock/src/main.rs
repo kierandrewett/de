@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use animation::spring::SpringAnimation;
 use iced::widget::{column, container, mouse_area, row, text};
 use iced::{Color, Element, Length, Task};
+use iced::mouse;
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
-use iced_layershell::settings::{LayerShellSettings, Settings};
+use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
+use iced_layershell::to_layer_message;
 use ipc::{ShellRequest, WindowInfo, WindowState};
 
 use config::Config;
@@ -38,10 +40,11 @@ pub enum ContextAction {
 
 /// All messages the dock application can receive.
 ///
-/// The `#[iced_layershell::to_layer_message]` attribute injects layer-shell
-/// control variants (AnchorChange, SizeChange, etc.) and implements the
-/// required `TryInto<LayershellCustomActions>` conversion automatically.
-#[iced_layershell::to_layer_message(derives = "Debug Clone")]
+/// The `#[to_layer_message]` attribute injects layer-shell control variants
+/// and generates the `TryInto<LayerShellCustomActionWithId>` impl used by the
+/// iced_layershell runtime.
+#[to_layer_message]
+#[derive(Debug, Clone)]
 pub enum Message {
     // ---- IPC window events ----
     WindowOpened(WindowInfo),
@@ -129,7 +132,11 @@ const PREVIEW_DELAY_MS: u128 = 500;
 /// Exclusive zone height (dock surface height including bottom margin).
 const SURFACE_HEIGHT: u32 = 80;
 
-struct DockApp {
+/// Pixel-perfect dot indicator spec (macOS-style):
+/// 4×4 px circle, 4 px below icon centre, white at 80% alpha.
+const DOT_SIZE: f32 = 4.0;
+
+pub struct DockApp {
     config: Config,
     /// Ordered pinned app_ids.
     pinned: Vec<String>,
@@ -202,7 +209,13 @@ impl DockApp {
             icon: None,
         });
 
-        let handle = info.icon.as_ref().map(|path| {
+        // If the .desktop lookup didn't surface an icon, fall back to
+        // the freedesktop generic application icon — gives unknown
+        // apps a proper SVG glyph instead of the bare-letter
+        // placeholder, which looks noticeably uglier next to neighbouring
+        // real icons.
+        let icon_path = info.icon.clone().or_else(desktop::generic_app_icon);
+        let handle = icon_path.as_ref().map(|path| {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext.eq_ignore_ascii_case("svg") {
                 IconHandle::Svg(iced::widget::svg::Handle::from_path(path))
@@ -232,8 +245,21 @@ impl DockApp {
         self.bounces.insert(app_id.to_string(), s);
     }
 
+    /// Returns true if the bounce spring for `app_id` is still in motion.
+    fn is_bouncing(&self, app_id: &str) -> bool {
+        self.bounces
+            .get(app_id)
+            .map(|s| !s.is_complete())
+            .unwrap_or(false)
+    }
+
     /// Spawns the app and starts the launch bounce animation.
     fn launch_app(&mut self, app_id: &str) {
+        // Goal 7: Ignore further clicks while a launch animation is in flight.
+        if self.launching.contains(app_id) || self.is_bouncing(app_id) {
+            return;
+        }
+
         let exec = self
             .app_info
             .get(app_id)
@@ -268,227 +294,224 @@ impl DockApp {
 }
 
 // ---------------------------------------------------------------------------
-// Application impl
+// Application boot / update / view / subscription
 // ---------------------------------------------------------------------------
 
-impl iced_layershell::Application for DockApp {
-    type Executor = iced::executor::Default;
-    type Message = Message;
-    type Theme = iced::Theme;
-    type Flags = ();
+pub fn boot() -> (DockApp, Task<Message>) {
+    (DockApp::new(), Task::none())
+}
 
-    fn new(_flags: ()) -> (Self, Task<Message>) {
-        (DockApp::new(), Task::none())
-    }
-
-    fn namespace(&self) -> String {
-        "shell-dock".to_string()
-    }
-
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            // ---- IPC window events ----
-            Message::WindowOpened(window) => {
-                let app_id = window.app_id.clone();
+pub fn update(state: &mut DockApp, message: Message) -> Task<Message> {
+    match message {
+        // ---- IPC window events ----
+        Message::WindowOpened(window) => {
+            let app_id = window.app_id.clone();
+            if !app_id.is_empty() {
+                state.ensure_app_info(&app_id);
+                state.running.entry(app_id.clone()).or_default().push(window);
+                if state.launching.remove(&app_id) {
+                    if let Some(s) = state.bounces.get_mut(&app_id) {
+                        s.set_target(0.0);
+                    }
+                }
+            }
+        }
+        Message::WindowClosed(window_id) => {
+            for ws in state.running.values_mut() {
+                ws.retain(|w| w.id != window_id);
+            }
+            state.running.retain(|_, ws| !ws.is_empty());
+        }
+        Message::WindowStateChanged { window_id, state: wstate } => {
+            for ws in state.running.values_mut() {
+                if let Some(w) = ws.iter_mut().find(|w| w.id == window_id) {
+                    w.state = wstate;
+                    break;
+                }
+            }
+        }
+        Message::WindowAppIdChanged { window_id, app_id } => {
+            let mut old_app_id = None::<String>;
+            let mut window = None::<WindowInfo>;
+            for (oid, ws) in state.running.iter_mut() {
+                if let Some(pos) = ws.iter().position(|w| w.id == window_id) {
+                    let mut w = ws.remove(pos);
+                    old_app_id = Some(oid.clone());
+                    w.app_id = app_id.clone();
+                    window = Some(w);
+                    break;
+                }
+            }
+            if let (Some(old), Some(w)) = (old_app_id, window) {
+                state.running.retain(|k, ws| k != &old || !ws.is_empty());
                 if !app_id.is_empty() {
-                    self.ensure_app_info(&app_id);
-                    self.running.entry(app_id.clone()).or_default().push(window);
-                    if self.launching.remove(&app_id) {
-                        if let Some(s) = self.bounces.get_mut(&app_id) {
-                            s.set_target(0.0);
-                        }
-                    }
+                    state.ensure_app_info(&app_id);
+                    state.running.entry(app_id).or_default().push(w);
                 }
             }
-            Message::WindowClosed(window_id) => {
-                for ws in self.running.values_mut() {
-                    ws.retain(|w| w.id != window_id);
-                }
-                self.running.retain(|_, ws| !ws.is_empty());
-            }
-            Message::WindowStateChanged { window_id, state } => {
-                for ws in self.running.values_mut() {
-                    if let Some(w) = ws.iter_mut().find(|w| w.id == window_id) {
-                        w.state = state;
-                        break;
-                    }
-                }
-            }
-            Message::WindowAppIdChanged { window_id, app_id } => {
-                let mut old_app_id = None::<String>;
-                let mut window = None::<WindowInfo>;
-                for (oid, ws) in self.running.iter_mut() {
-                    if let Some(pos) = ws.iter().position(|w| w.id == window_id) {
-                        let mut w = ws.remove(pos);
-                        old_app_id = Some(oid.clone());
-                        w.app_id = app_id.clone();
-                        window = Some(w);
-                        break;
-                    }
-                }
-                if let (Some(old), Some(w)) = (old_app_id, window) {
-                    self.running.retain(|k, ws| k != &old || !ws.is_empty());
-                    if !app_id.is_empty() {
-                        self.ensure_app_info(&app_id);
-                        self.running.entry(app_id).or_default().push(w);
-                    }
-                }
-            }
+        }
 
-            // ---- IPC connection ----
-            Message::IpcConnected => {
-                self.ipc_connected = true;
-                tracing::info!("IPC: connected");
-            }
-            Message::IpcDisconnected => {
-                self.ipc_connected = false;
-                tracing::warn!("IPC: disconnected, will reconnect");
-            }
+        // ---- IPC connection ----
+        Message::IpcConnected => {
+            state.ipc_connected = true;
+            tracing::info!("IPC: connected");
+        }
+        Message::IpcDisconnected => {
+            state.ipc_connected = false;
+            tracing::warn!("IPC: disconnected, will reconnect");
+        }
 
-            // ---- User interactions ----
-            Message::IconClicked(app_id) => {
-                let running = self.running.get(&app_id).map(|ws| !ws.is_empty()).unwrap_or(false);
-                if running {
-                    self.focus_windows(&app_id);
-                } else {
-                    self.launch_app(&app_id);
+        // ---- User interactions ----
+        Message::IconClicked(app_id) => {
+            let running = state.running.get(&app_id).map(|ws| !ws.is_empty()).unwrap_or(false);
+            if running {
+                state.focus_windows(&app_id);
+            } else {
+                state.launch_app(&app_id);
+            }
+        }
+        Message::ContextMenuRequested(app_id) => {
+            state.context_menu = Some(ContextMenu { app_id });
+            state.preview = None;
+        }
+        Message::HoverEnter(app_id) => {
+            state.hover_start.insert(app_id.clone(), Instant::now());
+            state.ensure_scale_spring(&app_id);
+            if let Some(s) = state.scales.get_mut(&app_id) {
+                s.set_target(MAX_SCALE as f64);
+            }
+        }
+        Message::HoverExit(app_id) => {
+            state.hover_start.remove(&app_id);
+            if let Some(s) = state.scales.get_mut(&app_id) {
+                s.set_target(1.0);
+            }
+            if let Some(ref p) = state.preview {
+                if p.app_id == app_id {
+                    state.preview = None;
                 }
             }
-            Message::ContextMenuRequested(app_id) => {
-                self.context_menu = Some(ContextMenu { app_id });
-                self.preview = None;
-            }
-            Message::HoverEnter(app_id) => {
-                self.hover_start.insert(app_id.clone(), Instant::now());
-                self.ensure_scale_spring(&app_id);
-                if let Some(s) = self.scales.get_mut(&app_id) {
-                    s.set_target(MAX_SCALE as f64);
-                }
-            }
-            Message::HoverExit(app_id) => {
-                self.hover_start.remove(&app_id);
-                if let Some(s) = self.scales.get_mut(&app_id) {
-                    s.set_target(1.0);
-                }
-                if let Some(ref p) = self.preview {
-                    if p.app_id == app_id {
-                        self.preview = None;
-                    }
-                }
-            }
+        }
 
-            // ---- Context menu ----
-            Message::ContextAction(action) => {
-                let app_id = self.context_menu.take().map(|m| m.app_id);
-                if let Some(app_id) = app_id {
-                    match action {
-                        ContextAction::NewWindow => self.launch_app(&app_id),
-                        ContextAction::CloseAll | ContextAction::Quit => {
-                            if let Some(windows) = self.running.get(&app_id).cloned() {
-                                for w in &windows {
-                                    ipc_sub::send_request(ShellRequest::CloseWindow {
-                                        window_id: w.id,
-                                    });
-                                }
-                            }
-                        }
-                        ContextAction::Pin => {
-                            if !self.pinned.contains(&app_id) {
-                                self.pinned.push(app_id);
-                            }
-                        }
-                        ContextAction::Unpin => {
-                            self.pinned.retain(|id| id != &app_id);
-                        }
-                    }
-                }
-            }
-            Message::ContextMenuDismiss => {
-                self.context_menu = None;
-            }
-
-            // ---- Hover preview ----
-            Message::PreviewWindowFocused(window_id) => {
-                self.preview = None;
-                ipc_sub::send_request(ShellRequest::ActivateWindow { window_id });
-            }
-            Message::PreviewDismiss => {
-                self.preview = None;
-            }
-
-            // ---- Trash ----
-            Message::CheckTrash => {
-                self.trash_full = is_trash_full();
-            }
-            Message::TrashClicked => {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg("trash:///")
-                    .spawn();
-            }
-
-            // ---- Animation tick ----
-            Message::Tick(now) => {
-                let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
-                self.last_tick = now;
-
-                for s in self.scales.values_mut() {
-                    s.tick(dt);
-                }
-                for s in self.bounces.values_mut() {
-                    s.tick(dt);
-                }
-
-                // Show preview after PREVIEW_DELAY_MS of continuous hover.
-                let ready: Vec<String> = self
-                    .hover_start
-                    .iter()
-                    .filter(|(_, t)| t.elapsed().as_millis() >= PREVIEW_DELAY_MS)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-
-                for app_id in ready {
-                    self.hover_start.remove(&app_id);
-                    if self.preview.is_none() {
-                        if let Some(windows) = self.running.get(&app_id) {
-                            if !windows.is_empty() {
-                                self.preview = Some(HoverPreview {
-                                    app_id,
-                                    windows: windows.clone(),
+        // ---- Context menu ----
+        Message::ContextAction(action) => {
+            let app_id = state.context_menu.take().map(|m| m.app_id);
+            if let Some(app_id) = app_id {
+                match action {
+                    ContextAction::NewWindow => state.launch_app(&app_id),
+                    ContextAction::CloseAll | ContextAction::Quit => {
+                        if let Some(windows) = state.running.get(&app_id).cloned() {
+                            for w in &windows {
+                                ipc_sub::send_request(ShellRequest::CloseWindow {
+                                    window_id: w.id,
                                 });
                             }
                         }
                     }
+                    ContextAction::Pin => {
+                        if !state.pinned.contains(&app_id) {
+                            state.pinned.push(app_id);
+                        }
+                    }
+                    ContextAction::Unpin => {
+                        state.pinned.retain(|id| id != &app_id);
+                    }
                 }
             }
-
-            // Layer-shell control variants are intercepted by the runtime
-            // before reaching update(); the catch-all silences exhaustiveness.
-            _ => {}
+        }
+        Message::ContextMenuDismiss => {
+            state.context_menu = None;
         }
 
-        Task::none()
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        let dock = self.render_dock();
-
-        if let Some(ref menu) = self.context_menu {
-            return self.render_with_context_menu(dock, menu);
+        // ---- Hover preview ----
+        Message::PreviewWindowFocused(window_id) => {
+            state.preview = None;
+            ipc_sub::send_request(ShellRequest::ActivateWindow { window_id });
+        }
+        Message::PreviewDismiss => {
+            state.preview = None;
         }
 
-        dock
+        // ---- Trash ----
+        Message::CheckTrash => {
+            state.trash_full = is_trash_full();
+        }
+        Message::TrashClicked => {
+            let _ = std::process::Command::new("xdg-open")
+                .arg("trash:///")
+                .spawn();
+        }
+
+        // ---- Animation tick ----
+        Message::Tick(now) => {
+            let dt = now.duration_since(state.last_tick).as_secs_f64().min(0.1);
+            state.last_tick = now;
+
+            for s in state.scales.values_mut() {
+                s.tick(dt);
+            }
+            for s in state.bounces.values_mut() {
+                s.tick(dt);
+            }
+
+            // Show preview after PREVIEW_DELAY_MS of continuous hover.
+            let ready: Vec<String> = state
+                .hover_start
+                .iter()
+                .filter(|(_, t)| t.elapsed().as_millis() >= PREVIEW_DELAY_MS)
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            for app_id in ready {
+                state.hover_start.remove(&app_id);
+                if state.preview.is_none() {
+                    if let Some(windows) = state.running.get(&app_id) {
+                        if !windows.is_empty() {
+                            state.preview = Some(HoverPreview {
+                                app_id,
+                                windows: windows.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Layer-shell control variants are intercepted by the runtime
+        // before reaching update(); the catch-all silences exhaustiveness.
+        _ => {}
     }
 
-    fn subscription(&self) -> iced::Subscription<Message> {
-        iced::Subscription::batch([
-            ipc_sub::subscription(),
-            iced::time::every(Duration::from_millis(16)).map(Message::Tick),
-            iced::time::every(Duration::from_secs(5)).map(|_| Message::CheckTrash),
-        ])
+    Task::none()
+}
+
+pub fn view(state: &DockApp) -> Element<'_, Message> {
+    let dock = render_dock(state);
+
+    if let Some(ref menu) = state.context_menu {
+        return render_with_context_menu(state, dock, menu);
     }
 
-    fn theme(&self) -> iced::Theme {
-        iced::Theme::Dark
+    dock
+}
+
+pub fn subscription(state: &DockApp) -> iced::Subscription<Message> {
+    let _ = state;
+    iced::Subscription::batch([
+        ipc_sub::subscription(),
+        iced::time::every(Duration::from_millis(16)).map(Message::Tick),
+        iced::time::every(Duration::from_secs(5)).map(|_| Message::CheckTrash),
+    ])
+}
+
+pub fn style(_state: &DockApp, theme: &iced::Theme) -> iced::theme::Style {
+    // Goal 1: Make the outer layer surface fully transparent so only the
+    // inner squircle dock container is visible. Without this, the layer
+    // surface background (from the Dark theme) renders as a dark strip
+    // spanning the full screen width.
+    iced::theme::Style {
+        background_color: Color::TRANSPARENT,
+        text_color: theme.palette().text,
     }
 }
 
@@ -496,271 +519,293 @@ impl iced_layershell::Application for DockApp {
 // View helpers
 // ---------------------------------------------------------------------------
 
-impl DockApp {
-    fn render_dock(&self) -> Element<'_, Message> {
-        let mut items: Vec<Element<Message>> = Vec::new();
+fn render_dock(state: &DockApp) -> Element<'_, Message> {
+    let mut items: Vec<Element<Message>> = Vec::new();
 
-        for app_id in &self.pinned {
-            items.push(self.render_icon(app_id));
-        }
+    let pinned_set: HashSet<&str> = state.pinned.iter().map(|s| s.as_str()).collect();
+    let has_unpinned_running = state.running.keys().any(|id| !pinned_set.contains(id.as_str()));
 
-        for app_id in self.running.keys() {
-            if !self.pinned.contains(app_id) {
-                items.push(self.render_icon(app_id));
-            }
-        }
+    for app_id in &state.pinned {
+        items.push(render_icon(state, app_id));
+    }
 
-        if !items.is_empty() {
-            items.push(render_separator());
-        }
-        items.push(self.render_trash());
+    // Goal 5: Separator between pinned and running — only if there are
+    // non-pinned running apps.
+    if has_unpinned_running && !state.pinned.is_empty() {
+        items.push(render_running_separator());
+    }
 
-        let dock_row = row(items)
-            .spacing(4)
-            .align_y(iced::alignment::Vertical::Bottom);
-
-        let inner = container(dock_row).padding(iced::Padding {
-            top: 8.0,
-            right: 12.0,
-            bottom: 8.0,
-            left: 12.0,
-        });
-
-        let dock_bg = container(inner)
-            .style(dock_background_style)
-            .padding(iced::Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 8.0,
-                left: 0.0,
-            });
-
-        if let Some(ref preview) = self.preview {
-            self.render_with_preview(dock_bg, preview)
-        } else {
-            dock_bg.into()
+    for app_id in state.running.keys() {
+        if !state.pinned.contains(app_id) {
+            items.push(render_icon(state, app_id));
         }
     }
 
-    fn render_icon<'a>(&'a self, app_id: &'a str) -> Element<'a, Message> {
-        let icon_size = self.config.icon_size as f32;
-        let max_size = icon_size * MAX_SCALE;
+    if !items.is_empty() {
+        items.push(render_separator());
+    }
+    items.push(render_trash(state));
 
-        let windows = self.running.get(app_id);
-        let running_count = windows.map(|ws| ws.len()).unwrap_or(0);
-        let minimized_count = windows
-            .map(|ws| ws.iter().filter(|w| w.state.is_minimized).count())
-            .unwrap_or(0);
-        let is_launching = self.launching.contains(app_id);
+    let dock_row = row(items)
+        .spacing(4)
+        .align_y(iced::alignment::Vertical::Bottom);
 
-        let scale = self
-            .scales
-            .get(app_id)
-            .map(|s| s.position_f32())
-            .unwrap_or(1.0)
-            .clamp(1.0, MAX_SCALE);
+    let inner = container(dock_row).padding(iced::Padding {
+        top: 8.0,
+        right: 12.0,
+        bottom: 8.0,
+        left: 12.0,
+    });
 
-        let bounce_y = self
-            .bounces
-            .get(app_id)
-            .map(|s| s.position_f32())
-            .unwrap_or(0.0);
+    let dock_bg = container(inner).style(dock_background_style);
 
-        let name = self
-            .app_info
-            .get(app_id)
-            .map(|i| i.name.as_str())
-            .unwrap_or(app_id);
-
-        let icon_handle = self.icons.get(app_id).and_then(|h| h.as_ref());
-        let scaled = icon_size * scale;
-
-        // Icon image or text fallback.
-        let icon_widget: Element<Message> = match icon_handle {
-            Some(IconHandle::Image(h)) => iced::widget::image(h.clone())
-                .width(scaled)
-                .height(scaled)
-                .into(),
-            Some(IconHandle::Svg(h)) => iced::widget::svg(h.clone())
-                .width(scaled)
-                .height(scaled)
-                .into(),
-            None => {
-                let first = name.chars().next().unwrap_or('?');
-                container(
-                    text(first.to_uppercase().to_string())
-                        .size(scaled * 0.45)
-                        .color(Color::WHITE),
-                )
-                .width(scaled)
-                .height(scaled)
-                .style(move |_: &iced::Theme| iced::widget::container::Style {
-                    background: Some(iced::Background::Color(app_color(app_id))),
-                    border: iced::Border {
-                        radius: (scaled * 0.22).into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
-                .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Center)
-                .into()
-            }
-        };
-
-        // Fixed bounding box so dock width stays stable during scale animation.
-        let icon_box = container(icon_widget)
-            .width(max_size)
-            .height(max_size)
-            .align_x(iced::alignment::Horizontal::Center)
-            .align_y(iced::alignment::Vertical::Center);
-
-        // Apply bounce offset by adjusting padding.
-        let offset_top = (-bounce_y).max(0.0);
-        let offset_bottom = bounce_y.max(0.0);
-        let bounced = container(icon_box).padding(iced::Padding {
-            top: offset_top,
+    // Goal 1: Wrap in a full-width transparent container that horizontally
+    // centers the styled pill. The surface itself spans the bottom edge so
+    // popups can anchor to the bar; only the pill is visible against the
+    // desktop.
+    let centered = container(dock_bg)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Bottom)
+        .padding(iced::Padding {
+            top: 0.0,
             right: 0.0,
-            bottom: offset_bottom,
+            bottom: 8.0,
             left: 0.0,
         });
 
-        let dots = render_dots(running_count, minimized_count, is_launching);
-
-        let col = column![bounced, dots]
-            .align_x(iced::alignment::Horizontal::Center)
-            .spacing(3);
-
-        mouse_area(col)
-            .on_press(Message::IconClicked(app_id.to_string()))
-            .on_right_press(Message::ContextMenuRequested(app_id.to_string()))
-            .on_enter(Message::HoverEnter(app_id.to_string()))
-            .on_exit(Message::HoverExit(app_id.to_string()))
-            .into()
+    if let Some(ref preview) = state.preview {
+        render_with_preview(state, centered, preview)
+    } else {
+        centered.into()
     }
+}
 
-    fn render_trash(&self) -> Element<'_, Message> {
-        let sz = self.config.icon_size as f32;
-        let label = if self.trash_full { "▣" } else { "□" };
+fn render_icon<'a>(state: &'a DockApp, app_id: &'a str) -> Element<'a, Message> {
+    let icon_size = state.config.icon_size as f32;
+    let max_size = icon_size * MAX_SCALE;
 
-        let icon = container(
-            text(label)
-                .size(sz * 0.6)
-                .color(Color::from_rgba(0.8, 0.8, 0.8, 0.9)),
-        )
-        .width(sz)
-        .height(sz)
+    let windows = state.running.get(app_id);
+    let running_count = windows.map(|ws| ws.len()).unwrap_or(0);
+    let minimized_count = windows
+        .map(|ws| ws.iter().filter(|w| w.state.is_minimized).count())
+        .unwrap_or(0);
+    let is_launching = state.launching.contains(app_id);
+
+    let scale = state
+        .scales
+        .get(app_id)
+        .map(|s| s.position_f32())
+        .unwrap_or(1.0)
+        .clamp(1.0, MAX_SCALE);
+
+    let bounce_y = state
+        .bounces
+        .get(app_id)
+        .map(|s| s.position_f32())
+        .unwrap_or(0.0);
+
+    let name = state
+        .app_info
+        .get(app_id)
+        .map(|i| i.name.as_str())
+        .unwrap_or(app_id);
+
+    let icon_handle = state.icons.get(app_id).and_then(|h| h.as_ref());
+    let scaled = icon_size * scale;
+
+    // Icon image or text fallback.
+    let icon_widget: Element<Message> = match icon_handle {
+        Some(IconHandle::Image(h)) => iced::widget::image(h.clone())
+            .width(scaled)
+            .height(scaled)
+            .into(),
+        Some(IconHandle::Svg(h)) => iced::widget::svg(h.clone())
+            .width(scaled)
+            .height(scaled)
+            .into(),
+        None => {
+            let first = name.chars().next().unwrap_or('?');
+            container(
+                text(first.to_uppercase().to_string())
+                    .size(scaled * 0.45)
+                    .color(Color::WHITE),
+            )
+            .width(scaled)
+            .height(scaled)
+            .style(move |_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(app_color(app_id))),
+                border: iced::Border {
+                    radius: (scaled * 0.22).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+            .into()
+        }
+    };
+
+    // Fixed bounding box so dock width stays stable during scale animation.
+    let icon_box = container(icon_widget)
+        .width(max_size)
+        .height(max_size)
         .align_x(iced::alignment::Horizontal::Center)
         .align_y(iced::alignment::Vertical::Center);
 
-        let col = column![
-            icon,
-            container(iced::widget::Space::with_height(8.0))
-        ]
-        .align_x(iced::alignment::Horizontal::Center);
+    // Apply bounce offset by adjusting padding.
+    let offset_top = (-bounce_y).max(0.0);
+    let offset_bottom = bounce_y.max(0.0);
+    let bounced = container(icon_box).padding(iced::Padding {
+        top: offset_top,
+        right: 0.0,
+        bottom: offset_bottom,
+        left: 0.0,
+    });
 
-        mouse_area(col).on_press(Message::TrashClicked).into()
+    let dots = render_dots(running_count, minimized_count, is_launching);
+
+    let col = column![bounced, dots]
+        .align_x(iced::alignment::Horizontal::Center)
+        .spacing(3);
+
+    // Goal 6: Pointer cursor on hover.
+    mouse_area(col)
+        .on_press(Message::IconClicked(app_id.to_string()))
+        .on_right_press(Message::ContextMenuRequested(app_id.to_string()))
+        .on_enter(Message::HoverEnter(app_id.to_string()))
+        .on_exit(Message::HoverExit(app_id.to_string()))
+        .interaction(mouse::Interaction::Pointer)
+        .into()
+}
+
+fn render_trash(state: &DockApp) -> Element<'_, Message> {
+    let sz = state.config.icon_size as f32;
+    let label = if state.trash_full { "▣" } else { "□" };
+
+    let icon = container(
+        text(label)
+            .size(sz * 0.6)
+            .color(Color::from_rgba(0.8, 0.8, 0.8, 0.9)),
+    )
+    .width(sz)
+    .height(sz)
+    .align_x(iced::alignment::Horizontal::Center)
+    .align_y(iced::alignment::Vertical::Center);
+
+    let col = column![
+        icon,
+        container(iced::widget::Space::new().height(8.0))
+    ]
+    .align_x(iced::alignment::Horizontal::Center);
+
+    mouse_area(col)
+        .on_press(Message::TrashClicked)
+        .interaction(mouse::Interaction::Pointer)
+        .into()
+}
+
+fn render_with_context_menu<'a>(
+    state: &'a DockApp,
+    dock: Element<'a, Message>,
+    menu: &'a ContextMenu,
+) -> Element<'a, Message> {
+    let app_id = &menu.app_id;
+    let is_pinned = state.pinned.contains(app_id);
+    let is_running = state.running.get(app_id).map(|ws| !ws.is_empty()).unwrap_or(false);
+
+    let mut items: Vec<Element<Message>> = Vec::new();
+
+    if is_running {
+        items.push(menu_item("New Window", Message::ContextAction(ContextAction::NewWindow)));
+        items.push(menu_item("Close All", Message::ContextAction(ContextAction::CloseAll)));
+    } else {
+        items.push(menu_item("Open", Message::IconClicked(app_id.clone())));
+    }
+    if is_pinned {
+        items.push(menu_item("Unpin from Dock", Message::ContextAction(ContextAction::Unpin)));
+    } else {
+        items.push(menu_item("Pin to Dock", Message::ContextAction(ContextAction::Pin)));
+    }
+    if is_running {
+        items.push(menu_item("Quit", Message::ContextAction(ContextAction::Quit)));
     }
 
-    fn render_with_context_menu<'a>(
-        &'a self,
-        dock: Element<'a, Message>,
-        menu: &'a ContextMenu,
-    ) -> Element<'a, Message> {
-        let app_id = &menu.app_id;
-        let is_pinned = self.pinned.contains(app_id);
-        let is_running = self.running.get(app_id).map(|ws| !ws.is_empty()).unwrap_or(false);
+    let menu_widget = container(column(items).spacing(2))
+        .style(popup_background_style)
+        .padding(iced::Padding {
+            top: 6.0,
+            right: 4.0,
+            bottom: 6.0,
+            left: 4.0,
+        });
 
-        let mut items: Vec<Element<Message>> = Vec::new();
+    column![
+        mouse_area(
+            container(iced::widget::Space::new().height(Length::Fill)).width(Length::Fill)
+        )
+        .on_press(Message::ContextMenuDismiss),
+        container(menu_widget)
+            .align_x(iced::alignment::Horizontal::Center)
+            .width(Length::Fill),
+        dock,
+    ]
+    .into()
+}
 
-        if is_running {
-            items.push(menu_item("New Window", Message::ContextAction(ContextAction::NewWindow)));
-            items.push(menu_item("Close All", Message::ContextAction(ContextAction::CloseAll)));
-        } else {
-            items.push(menu_item("Open", Message::IconClicked(app_id.clone())));
-        }
-        if is_pinned {
-            items.push(menu_item("Unpin from Dock", Message::ContextAction(ContextAction::Unpin)));
-        } else {
-            items.push(menu_item("Pin to Dock", Message::ContextAction(ContextAction::Pin)));
-        }
-        if is_running {
-            items.push(menu_item("Quit", Message::ContextAction(ContextAction::Quit)));
-        }
-
-        let menu_widget = container(column(items).spacing(2))
-            .style(popup_background_style)
-            .padding(iced::Padding {
-                top: 6.0,
-                right: 4.0,
-                bottom: 6.0,
-                left: 4.0,
-            });
-
-        column![
+fn render_with_preview<'a>(
+    _state: &'a DockApp,
+    dock: impl Into<Element<'a, Message>>,
+    preview: &'a HoverPreview,
+) -> Element<'a, Message> {
+    let window_items: Vec<Element<Message>> = preview
+        .windows
+        .iter()
+        .map(|w| {
+            let title = if w.title.is_empty() {
+                preview.app_id.as_str()
+            } else {
+                w.title.as_str()
+            };
+            let wid = w.id;
             mouse_area(
-                container(iced::widget::Space::with_height(Length::Fill)).width(Length::Fill)
+                container(text(title).size(12.0).color(Color::WHITE))
+                    .padding(iced::Padding {
+                        top: 6.0,
+                        right: 10.0,
+                        bottom: 6.0,
+                        left: 10.0,
+                    })
+                    .style(preview_item_style),
             )
-            .on_press(Message::ContextMenuDismiss),
-            container(menu_widget)
-                .align_x(iced::alignment::Horizontal::Center)
-                .width(Length::Fill),
-            dock,
-        ]
-        .into()
-    }
+            .on_press(Message::PreviewWindowFocused(wid))
+            .into()
+        })
+        .collect();
 
-    fn render_with_preview<'a>(
-        &'a self,
-        dock: impl Into<Element<'a, Message>>,
-        preview: &'a HoverPreview,
-    ) -> Element<'a, Message> {
-        let window_items: Vec<Element<Message>> = preview
-            .windows
-            .iter()
-            .map(|w| {
-                let title = if w.title.is_empty() {
-                    preview.app_id.as_str()
-                } else {
-                    w.title.as_str()
-                };
-                let wid = w.id;
-                mouse_area(
-                    container(text(title).size(12.0).color(Color::WHITE))
-                        .padding(iced::Padding {
-                            top: 6.0,
-                            right: 10.0,
-                            bottom: 6.0,
-                            left: 10.0,
-                        })
-                        .style(preview_item_style),
-                )
-                .on_press(Message::PreviewWindowFocused(wid))
-                .into()
-            })
-            .collect();
+    let popup = container(column(window_items).spacing(4))
+        .style(popup_background_style)
+        .padding(8);
 
-        let popup = container(column(window_items).spacing(4))
-            .style(popup_background_style)
-            .padding(8);
-
-        column![
-            container(popup)
-                .align_x(iced::alignment::Horizontal::Center)
-                .width(Length::Fill),
-            mouse_area(dock.into()).on_press(Message::PreviewDismiss),
-        ]
-        .into()
-    }
+    column![
+        container(popup)
+            .align_x(iced::alignment::Horizontal::Center)
+            .width(Length::Fill),
+        mouse_area(dock.into()).on_press(Message::PreviewDismiss),
+    ]
+    .into()
 }
 
 // ---------------------------------------------------------------------------
 // Widget helpers
 // ---------------------------------------------------------------------------
 
+/// Separator between trash icon and the rest (always present if items exist).
 fn render_separator() -> Element<'static, Message> {
     container(
-        container(iced::widget::Space::with_height(24.0))
+        container(iced::widget::Space::new().height(24.0))
             .width(1.0)
             .style(|_: &iced::Theme| iced::widget::container::Style {
                 background: Some(iced::Background::Color(Color::from_rgba(
@@ -779,6 +824,32 @@ fn render_separator() -> Element<'static, Message> {
     .into()
 }
 
+/// Goal 5: 1px vertical separator between pinned and unpinned running apps.
+/// 8px tall, white at 15% alpha, vertically centered in dock.
+fn render_running_separator() -> Element<'static, Message> {
+    container(
+        container(iced::widget::Space::new().height(8.0))
+            .width(1.0)
+            .style(|_: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(
+                    1.0, 1.0, 1.0, 0.15,
+                ))),
+                ..Default::default()
+            }),
+    )
+    .padding(iced::Padding {
+        top: 0.0,
+        right: 8.0,
+        bottom: 0.0,
+        left: 8.0,
+    })
+    .align_y(iced::alignment::Vertical::Center)
+    .into()
+}
+
+/// Goal 4: Pixel-perfect active app indicator.
+/// 4×4 px circle, white at 80% alpha (active) or 40% alpha (minimized only),
+/// rendered as a small rounded square container.
 fn render_dots(
     normal: usize,
     minimized: usize,
@@ -786,25 +857,35 @@ fn render_dots(
 ) -> Element<'static, Message> {
     let total = normal + minimized;
     if total == 0 && !launching {
-        return container(iced::widget::Space::with_height(8.0)).into();
+        // Reserve space so dock height stays stable.
+        return container(iced::widget::Space::new().height(DOT_SIZE + 4.0))
+            .padding(iced::Padding {
+                top: 4.0,
+                ..Default::default()
+            })
+            .into();
     }
 
     let count = total.min(3).max(if launching { 1 } else { 0 });
     let dots: Vec<Element<Message>> = (0..count)
         .map(|i| {
-            let is_minimized = i >= normal;
+            let is_minimized_only = normal == 0 && i < minimized;
             let color = if launching {
+                // Blue dot while launching.
                 Color::from_rgba(0.0, 0.478, 1.0, 0.9)
-            } else if is_minimized {
-                Color::from_rgba(1.0, 1.0, 1.0, 0.35)
+            } else if is_minimized_only {
+                // Goal 4: Half opacity for "minimized only" state.
+                Color::from_rgba(1.0, 1.0, 1.0, 0.40)
             } else {
-                Color::from_rgba(1.0, 1.0, 1.0, 0.85)
+                // Goal 4: White at 80% alpha for active state.
+                Color::from_rgba(1.0, 1.0, 1.0, 0.80)
             };
-            container(iced::widget::Space::new(5.0, 5.0))
+            // 4×4 px circle (fully rounded square = circle at 2.0 radius).
+            container(iced::widget::Space::new().width(DOT_SIZE).height(DOT_SIZE))
                 .style(move |_: &iced::Theme| iced::widget::container::Style {
                     background: Some(iced::Background::Color(color)),
                     border: iced::Border {
-                        radius: 3.0.into(),
+                        radius: (DOT_SIZE / 2.0).into(),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -813,7 +894,13 @@ fn render_dots(
         })
         .collect();
 
-    row(dots).spacing(3).into()
+    // 4px top padding puts the dot 4px below the icon.
+    container(row(dots).spacing(3))
+        .padding(iced::Padding {
+            top: 4.0,
+            ..Default::default()
+        })
+        .into()
 }
 
 fn menu_item(label: &str, msg: Message) -> Element<'_, Message> {
@@ -840,16 +927,21 @@ fn dock_background_style(theme: &iced::Theme) -> iced::widget::container::Style 
             0.07, 0.07, 0.09, 0.88,
         ))),
         border: iced::Border {
-            radius: 16.0.into(),
+            // Goal 2: Lift radius to 20 for a more squircle-like appearance
+            // (iced can't accept a full squircle path directly; 20px with
+            // the dark semi-transparent fill reads clearly as a continuous-
+            // curvature container vs the old 16px circular-arc feel).
+            radius: 20.0.into(),
             width: 0.5,
-            color: Color::from_rgba(1.0, 1.0, 1.0, 0.15),
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.18),
         },
         shadow: iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.40),
             offset: iced::Vector::new(0.0, 4.0),
-            blur_radius: 20.0,
+            blur_radius: 24.0,
         },
         text_color: None,
+        ..Default::default()
     }
 }
 
@@ -870,6 +962,7 @@ fn popup_background_style(theme: &iced::Theme) -> iced::widget::container::Style
             blur_radius: 16.0,
         },
         text_color: None,
+        ..Default::default()
     }
 }
 
@@ -935,32 +1028,43 @@ fn is_trash_full() -> bool {
 // main
 // ---------------------------------------------------------------------------
 
-fn main() {
+fn main() -> iced_layershell::Result {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     tracing::info!("shell-dock starting");
 
-    if let Err(e) = <DockApp as iced_layershell::Application>::run(Settings {
-        layer_settings: LayerShellSettings {
-            // Span full screen width; compositor centres the surface vertically.
-            anchor: Anchor::Bottom | Anchor::Left | Anchor::Right,
-            layer: Layer::Top,
-            // Reserve dock height so windows don't slide under it.
-            exclusive_zone: SURFACE_HEIGHT as i32,
-            // height = SURFACE_HEIGHT; width = 0 (compositor stretches to fill anchored axes)
-            size: Some((0, SURFACE_HEIGHT)),
-            // 8 px gap from bottom edge
-            margin: (0, 0, 8, 0),
-            keyboard_interactivity: KeyboardInteractivity::None,
-            binded_output_name: None,
-        },
-        ..Settings::default()
-    }) {
-        tracing::error!("shell-dock exited with error: {e}");
-        std::process::exit(1);
+    // Force tiny-skia (CPU/wl_shm) backend — wgpu+mesa-vk's wp_fifo path
+    // stalls our nested smithay compositor after ~3 commits (same issue as
+    // shell-panel). ICED_BACKEND=tiny-skia is set in playground.sh but we
+    // also set it here as a belt-and-braces fallback for direct invocation.
+    if std::env::var("ICED_BACKEND").is_err() {
+        // SAFETY: single-threaded at startup before any iced runtime spawning.
+        unsafe { std::env::set_var("ICED_BACKEND", "tiny-skia") };
     }
+
+    iced_layershell::application(boot, "shell-dock", update, view)
+        .subscription(subscription)
+        .style(style)
+        .settings(Settings {
+            layer_settings: LayerShellSettings {
+                // Span full screen width; compositor centres the surface vertically.
+                anchor: Anchor::Bottom | Anchor::Left | Anchor::Right,
+                layer: Layer::Top,
+                // Reserve dock height so windows don't slide under it.
+                exclusive_zone: SURFACE_HEIGHT as i32,
+                // height = SURFACE_HEIGHT; width = 0 (compositor stretches to fill anchored axes)
+                size: Some((0, SURFACE_HEIGHT)),
+                // 8 px gap from bottom edge
+                margin: (0, 0, 8, 0),
+                keyboard_interactivity: KeyboardInteractivity::None,
+                start_mode: StartMode::Active,
+                ..Default::default()
+            },
+            ..Settings::default()
+        })
+        .run()
 }
 
 // ---------------------------------------------------------------------------
