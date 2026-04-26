@@ -25,14 +25,20 @@ impl CompositorHandler for SpikeState {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        let is_active = self
-            .active_surface
-            .as_ref()
-            .map(|s| s == surface)
-            .unwrap_or(false);
+        // Import SHM buffer for any toplevel that just committed.
+        // We find the matching ToplevelInfo entry and update its pixel buffer.
+        // We use an index loop to avoid borrow conflicts with self.toplevels.
+        let toplevel_idx = self.toplevels.iter().position(|t| &t.surface == surface);
+        if let Some(idx) = toplevel_idx {
+            // Temporarily take the Arc to avoid borrow conflicts.
+            let pixels = self.toplevels[idx].pixels.clone();
+            import_shm_buffer(surface, &pixels);
 
-        if is_active {
-            import_shm_buffer(surface, &self.client_pixels);
+            // Also update legacy single-surface buffer if this is the active surface.
+            let is_active = self.active_surface.as_ref().map(|s| s == surface).unwrap_or(false);
+            if is_active {
+                import_shm_buffer(surface, &self.client_pixels.clone());
+            }
         }
     }
 }

@@ -43,11 +43,11 @@ use smithay::{
         },
         wayland_server::Display,
     },
-    utils::Transform,
+    utils::{Transform, SERIAL_COUNTER},
     wayland::socket::ListeningSocketSource,
 };
 
-use slint::{ComponentHandle, LogicalPosition, SharedString, VecModel};
+use slint::{ComponentHandle, LogicalPosition, Model, SharedString, VecModel};
 
 use winit::{
     application::ApplicationHandler,
@@ -62,6 +62,7 @@ use winit::{
 };
 
 use crate::{
+    chrome_shader::{ChromeShader, WindowChromeParams},
     platform::{CalloopPlatform, GpuWindowAdapter},
     wayland_state::{ClientState, SpikeState},
     Compositor, DockItem,
@@ -71,13 +72,35 @@ const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 960;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Pending keyboard events (D5 - unchanged from spike)
+// Pending input events (processed in the main loop where SpikeState is available)
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PendingKeyEvent {
     pub scancode: u32,
     pub pressed: bool,
+}
+
+/// Pointer motion or button event, queued during winit window_event()
+/// and forwarded to smithay in the main loop.
+#[derive(Debug, Clone)]
+pub enum PendingPointerEvent {
+    /// Pointer moved to compositor-space (x, y).
+    Motion { x: f64, y: f64 },
+    /// Mouse button pressed/released. `button` is the Linux evdev button code.
+    Button { button: u32, pressed: bool },
+}
+
+/// Map a winit `MouseButton` to a Linux evdev button code.
+fn winit_button_to_evdev(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left   => 0x110, // BTN_LEFT
+        MouseButton::Right  => 0x111, // BTN_RIGHT
+        MouseButton::Middle => 0x112, // BTN_MIDDLE
+        MouseButton::Back   => 0x116, // BTN_SIDE
+        MouseButton::Forward=> 0x115, // BTN_EXTRA
+        _                   => 0x110,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -88,6 +111,7 @@ pub struct PendingKeyEvent {
 /// MUST be created with the same device as FemtoVGWGPURenderer.
 /// RENDER_ATTACHMENT is required by FemtoVGWGPURenderer.
 /// COPY_SRC is needed to blit into the swapchain.
+/// TEXTURE_BINDING is needed by the chrome shader to sample the Slint scene.
 fn make_render_texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("slint-render-target"),
@@ -96,7 +120,9 @@ fn make_render_texture(device: &wgpu::Device, width: u32, height: u32, format: w
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     })
 }
@@ -153,6 +179,7 @@ struct CompositorApp {
     swapchain_format: Option<wgpu::TextureFormat>,
     // Offscreen texture that Slint/FemtoVG renders into each frame.
     // Created with the shared device — same Device as FemtoVG.
+    // TEXTURE_BINDING is added so the chrome shader can sample the scene.
     render_texture: Option<wgpu::Texture>,
     render_texture_size: (u32, u32),
 
@@ -161,10 +188,16 @@ struct CompositorApp {
     window_ref: Arc<Mutex<Option<Rc<GpuWindowAdapter>>>>,
     ui: Option<Compositor>,
 
+    // Chrome shader — squircle clip + stroke + highlight + shadow post-pass.
+    // Initialised lazily in resumed() once the swapchain format is known.
+    chrome_shader: Option<ChromeShader>,
+
     pointer_pos: (f64, f64),
     start_time: Instant,
     last_clock_update: Instant,
     pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
+    /// Pending pointer events — queued in window_event(), processed in the main loop.
+    pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
     frame_count: u64,
 }
 
@@ -173,6 +206,7 @@ impl CompositorApp {
         window_ref: Arc<Mutex<Option<Rc<GpuWindowAdapter>>>>,
         ui: Compositor,
         pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
+        pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
     ) -> Self {
         Self {
             window: None,
@@ -183,10 +217,12 @@ impl CompositorApp {
             gpu_window: None,
             window_ref,
             ui: Some(ui),
+            chrome_shader: None,
             pointer_pos: (0.0, 0.0),
             start_time: Instant::now(),
             last_clock_update: Instant::now(),
             pending_keys,
+            pending_pointers,
             frame_count: 0,
         }
     }
@@ -256,6 +292,11 @@ impl ApplicationHandler for CompositorApp {
         );
         info!("wgpu swapchain ready, format={:?} (shared device)", format);
 
+        // Initialise the chrome shader now that we have a format.
+        let chrome = ChromeShader::new(&gpu_window.wgpu_device, format);
+        self.chrome_shader = Some(chrome);
+        info!("ChromeShader initialised (squircle clip + shadow)");
+
         gpu_window.resize(WIDTH, HEIGHT);
 
         if let Some(ui) = &self.ui {
@@ -302,14 +343,23 @@ impl ApplicationHandler for CompositorApp {
                 }
                 gpu_window.resize(w, h);
                 self.render_texture = None; // force recreate at new size
+                // Invalidate chrome shader bind group cache — texture changed.
+                if let Some(cs) = self.chrome_shader.as_mut() {
+                    cs.invalidate_cache();
+                }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_pos = (position.x, position.y);
+                // Forward to Slint for hit-testing (panel buttons, window chrome).
                 gpu_window.inner_window().dispatch_event(
                     slint::platform::WindowEvent::PointerMoved {
                         position: LogicalPosition::new(position.x as f32, position.y as f32),
                     },
+                );
+                // Also queue for wayland client forwarding (D2).
+                self.pending_pointers.lock().unwrap().push_back(
+                    PendingPointerEvent::Motion { x: position.x, y: position.y }
                 );
             }
 
@@ -332,6 +382,12 @@ impl ApplicationHandler for CompositorApp {
                     },
                 };
                 gpu_window.inner_window().dispatch_event(slint_event);
+                // Also queue for wayland client forwarding (D2).
+                let evdev_btn = winit_button_to_evdev(button);
+                let pressed = state == ElementState::Pressed;
+                self.pending_pointers.lock().unwrap().push_back(
+                    PendingPointerEvent::Button { button: evdev_btn, pressed }
+                );
             }
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
@@ -404,11 +460,13 @@ impl CompositorApp {
             Err(e) => { warn!("swapchain: {}", e); return; }
         };
 
-        // Blit offscreen texture -> swapchain frame.
+        // Blit offscreen texture -> swapchain frame, then run chrome pass.
         if let Some(render_tex) = self.render_texture.as_ref() {
             let mut encoder = device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("blit") }
+                &wgpu::CommandEncoderDescriptor { label: Some("blit+chrome") }
             );
+
+            // Step 1: Copy Slint scene into swapchain as the base layer.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: render_tex,
@@ -424,6 +482,45 @@ impl CompositorApp {
                 },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
+
+            // Step 2: Run chrome pass — squircle clip, outer stroke, inner highlight,
+            // and multi-layer shadow — composited over the swapchain frame.
+            if let Some(chrome) = self.chrome_shader.as_mut() {
+                // Build per-window params from the current Slint window list.
+                let chrome_windows: Vec<WindowChromeParams> = if let Some(ui) = self.ui.as_ref() {
+                    let model = ui.get_windows();
+                    let len = model.row_count();
+                    (0..len)
+                        .map(|i| {
+                            let item = model.row_data(i).unwrap();
+                            WindowChromeParams {
+                                x: item.x as f32,
+                                y: item.y as f32,
+                                w: item.w as f32,
+                                h: item.h as f32,
+                                active: item.focused,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                if !chrome_windows.is_empty() {
+                    let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    chrome.render(
+                        device,
+                        queue,
+                        &mut encoder,
+                        render_tex,
+                        &frame_view,
+                        w,
+                        h,
+                        &chrome_windows,
+                    );
+                }
+            }
+
             queue.submit(std::iter::once(encoder.finish()));
         }
 
@@ -433,74 +530,171 @@ impl CompositorApp {
     /// Update the `windows` property on the Compositor from the wayland surface map.
     /// One WindowItem per mapped xdg-toplevel (SHM texture + title + geometry).
     fn update_windows(&mut self, state: &mut SpikeState) {
+        use smithay::wayland::compositor::with_states;
+        use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+
         let Some(ui) = self.ui.as_ref() else { return };
+        let active_surface = state.active_surface.clone();
 
         let mut items: Vec<crate::WindowItem> = Vec::new();
 
-        // Pull the single active SHM surface if present.
-        let client_data = state.client_pixels.lock().unwrap();
-        let has_surface = client_data.width > 0;
+        for (idx, toplevel) in state.toplevels.iter().enumerate() {
+            let client_data = toplevel.pixels.lock().unwrap();
+            if client_data.width == 0 {
+                continue;
+            }
 
-        if has_surface {
-            // Build a slint Image from the current pixel buffer.
+            // Build a Slint Image from the pixel buffer.
             let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
                 &client_data.pixels,
                 client_data.width,
                 client_data.height,
             );
             let texture = slint::Image::from_rgba8_premultiplied(pixel_buf);
+            let (w, h) = (client_data.width as i32, client_data.height as i32);
+            drop(client_data);
 
-            // Get the toplevel title via smithay's compositor surface data map.
-            let title = state
-                .active_surface
-                .as_ref()
-                .and_then(|wl_surface| {
-                    use smithay::wayland::compositor::with_states;
-                    use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
-                    with_states(wl_surface, |states| {
-                        states
-                            .data_map
-                            .get::<XdgToplevelSurfaceData>()
-                            .and_then(|data| data.lock().ok()?.title.clone())
-                    })
-                })
-                .unwrap_or_else(|| "Window".to_string());
+            // Get window title from xdg-toplevel surface data.
+            let title = with_states(&toplevel.surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|data| data.lock().ok()?.title.clone())
+            })
+            .unwrap_or_else(|| "Window".to_string());
+
+            let focused = active_surface.as_ref().map(|s| s == &toplevel.surface).unwrap_or(false);
 
             items.push(crate::WindowItem {
-                id: 1,
+                id: (idx + 1) as i32,
                 title: SharedString::from(title),
-                x: 100,
-                y: 100,
-                w: client_data.width as i32,
-                h: client_data.height as i32,
-                focused: true,
+                x: toplevel.x,
+                y: toplevel.y,
+                w,
+                h,
+                focused,
                 texture,
                 icon: slint::Image::default(),
             });
         }
-        drop(client_data);
 
         let model = std::rc::Rc::new(VecModel::from(items));
         ui.set_windows(slint::ModelRc::from(model));
     }
 
-    /// Update Slint client texture from SHM pixel data (legacy D3/D4 path —
-    /// kept for compatibility; update_windows() now drives the Compositor UI).
+    /// Poll all toplevels for dirty SHM buffers and update Slint if any changed.
     fn update_client_texture(&mut self, state: &mut SpikeState) {
-        let mut client_data = state.client_pixels.lock().unwrap();
-        if !client_data.dirty || client_data.width == 0 {
-            return;
-        }
-        client_data.dirty = false;
-        drop(client_data);
+        let mut any_dirty = false;
 
-        // Mark dirty so the next render picks up fresh WindowItems.
-        if let Some(gpu_window) = self.gpu_window.as_ref() {
-            gpu_window.mark_dirty();
+        // Check each toplevel's pixel buffer for dirty flag.
+        for toplevel in state.toplevels.iter() {
+            let mut client_data = toplevel.pixels.lock().unwrap();
+            if client_data.dirty && client_data.width > 0 {
+                client_data.dirty = false;
+                any_dirty = true;
+            }
         }
 
-        self.update_windows(state);
-        debug!("SHM client texture updated → windows property refreshed");
+        // Also check the legacy single-surface buffer.
+        {
+            let mut client_data = state.client_pixels.lock().unwrap();
+            if client_data.dirty && client_data.width > 0 {
+                client_data.dirty = false;
+                any_dirty = true;
+            }
+        }
+
+        if any_dirty {
+            if let Some(gpu_window) = self.gpu_window.as_ref() {
+                gpu_window.mark_dirty();
+            }
+            self.update_windows(state);
+            debug!("SHM client texture updated → windows property refreshed");
+        }
+    }
+
+    /// Forward a pointer motion event to the wayland client whose window is under the pointer.
+    /// `x`, `y` are compositor-space logical coordinates.
+    fn forward_pointer_motion(&self, state: &mut SpikeState, x: f64, y: f64) {
+        use smithay::input::pointer::MotionEvent;
+        use smithay::utils::{Logical, Point};
+
+        let pointer = match state.seat.get_pointer() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = state.clock.now().as_millis() as u32;
+
+        // Find the topmost window under the pointer (last in the list = topmost).
+        // The window's content area starts at (win.x, win.y + TITLEBAR_HEIGHT).
+        const TITLEBAR_HEIGHT: f64 = 33.0;
+        let mut hit: Option<(smithay::reexports::wayland_server::protocol::wl_surface::WlSurface, f64, f64)> = None;
+
+        for toplevel in state.toplevels.iter().rev() {
+            let client_data = toplevel.pixels.lock().unwrap();
+            let (w, h) = (client_data.width as f64, client_data.height as f64);
+            drop(client_data);
+
+            let wx = toplevel.x as f64;
+            let wy = toplevel.y as f64 + TITLEBAR_HEIGHT;
+            if x >= wx && x < wx + w && y >= wy && y < wy + h {
+                let local_x = x - wx;
+                let local_y = y - wy;
+                hit = Some((toplevel.surface.clone(), local_x, local_y));
+                break;
+            }
+        }
+
+        if let Some((surface, local_x, local_y)) = hit {
+            pointer.motion(
+                state,
+                Some((surface, Point::from((local_x, local_y)))),
+                &MotionEvent {
+                    location: Point::from((x, y)),
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(state);
+        } else {
+            // Pointer not over any client window — clear focus.
+            pointer.motion(
+                state,
+                None,
+                &MotionEvent {
+                    location: Point::from((x, y)),
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(state);
+        }
+    }
+
+    /// Forward a pointer button event to the currently focused wayland client.
+    fn forward_pointer_button(&self, state: &mut SpikeState, button: u32, pressed: bool) {
+        use smithay::input::pointer::ButtonEvent;
+
+        let pointer = match state.seat.get_pointer() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = state.clock.now().as_millis() as u32;
+        let button_state = if pressed {
+            smithay::backend::input::ButtonState::Pressed
+        } else {
+            smithay::backend::input::ButtonState::Released
+        };
+
+        pointer.button(
+            state,
+            &ButtonEvent { serial, time, button, state: button_state },
+        );
+        pointer.frame(state);
     }
 }
 
@@ -707,7 +901,8 @@ pub fn run() -> Result<()> {
     winit_event_loop.set_control_flow(ControlFlow::Poll);
 
     let pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let mut app = CompositorApp::new(window_ref, ui, pending_keys.clone());
+    let pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let mut app = CompositorApp::new(window_ref, ui, pending_keys.clone(), pending_pointers.clone());
 
     // 7. Main loop
     info!("Entering GPU compositor main loop");
@@ -722,14 +917,37 @@ pub fn run() -> Result<()> {
 
         if state.should_exit { break; }
 
+        // D4 — send wl_surface.frame callbacks + signal fifo barriers each frame.
+        state.send_frame_callbacks(&output);
+        state.pre_render_drive_clients();
+
         state.display_handle.flush_clients().ok();
         slint::platform::update_timers_and_animations();
         app.update_client_texture(&mut state);
 
+        // D3 — forward keyboard events.
         {
             let mut keys = pending_keys.lock().unwrap();
             while let Some(ke) = keys.pop_front() {
                 forward_keyboard_event(&mut state, ke);
+            }
+        }
+
+        // D2 — forward pointer events to wayland clients.
+        {
+            let events: Vec<PendingPointerEvent> = {
+                let mut pointers = pending_pointers.lock().unwrap();
+                pointers.drain(..).collect()
+            };
+            for pe in events {
+                match pe {
+                    PendingPointerEvent::Motion { x, y } => {
+                        app.forward_pointer_motion(&mut state, x, y);
+                    }
+                    PendingPointerEvent::Button { button, pressed } => {
+                        app.forward_pointer_button(&mut state, button, pressed);
+                    }
+                }
             }
         }
 

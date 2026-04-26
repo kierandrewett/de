@@ -8,6 +8,7 @@
 
 use smithay::{
     delegate_commit_timing, delegate_fifo, delegate_presentation,
+    output::Output,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     wayland::compositor::{with_surface_tree_downward, TraversalAction},
 };
@@ -29,6 +30,36 @@ delegate_commit_timing!(SpikeState);
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl SpikeState {
+    /// Send wl_surface.frame callbacks to all currently-active surfaces so
+    /// clients (kitty, etc.) know the compositor is ready for the next frame.
+    /// Must be called once per rendered frame.
+    pub fn send_frame_callbacks(&self, output: &Output) {
+        use smithay::desktop::utils::send_frames_surface_tree;
+        use std::time::Duration;
+
+        let time: Duration = self.clock.now().into();
+
+        let mut surfaces: Vec<WlSurface> = Vec::new();
+        if let Some(s) = &self.active_surface {
+            surfaces.push(s.clone());
+        }
+        for li in &self.layer_surfaces {
+            surfaces.push(li.surface.wl_surface().clone());
+        }
+
+        for surface in &surfaces {
+            send_frames_surface_tree(
+                surface,
+                output,
+                time,
+                Some(Duration::from_secs(1)),
+                |_, _| Some(output.clone()),
+            );
+        }
+
+        debug!("send_frame_callbacks: sent to {} surfaces", surfaces.len());
+    }
+
     /// Signal wp_fifo barriers and drain blocked transaction queues.
     ///
     /// Call this BEFORE submitting the frame to the display so that clients

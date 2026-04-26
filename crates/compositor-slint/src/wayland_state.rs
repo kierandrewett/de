@@ -104,6 +104,21 @@ pub struct ClientSurfaceData {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Per-toplevel window info (multi-window bookkeeping)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ToplevelInfo {
+    /// The wayland surface for this toplevel.
+    pub surface: WlSurface,
+    /// Cascaded compositor-space position.
+    pub x: i32,
+    pub y: i32,
+    /// Pixel buffer — updated by import_shm_buffer on each commit.
+    pub pixels: Arc<Mutex<ClientSurfaceData>>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Compositor state
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -176,10 +191,13 @@ pub struct SpikeState {
     /// Currently-focused xdg toplevel surface.
     pub active_surface: Option<WlSurface>,
 
+    /// All mapped toplevels (multi-window support, insertion-ordered).
+    pub toplevels: Vec<ToplevelInfo>,
+
     /// All mapped layer-shell surfaces (populated by WlrLayerShellHandler).
     pub layer_surfaces: Vec<LayerInfo>,
 
-    /// Shared pixel buffer (SHM surface → Slint texture).
+    /// Shared pixel buffer (SHM surface → Slint texture) — legacy single-window path.
     pub client_pixels: Arc<Mutex<ClientSurfaceData>>,
 
     pub should_exit: bool,
@@ -292,6 +310,7 @@ impl SpikeState {
             xdg_toplevel_icon_manager,
             xdg_toplevel_tag_manager,
             active_surface: None,
+            toplevels: Vec::new(),
             layer_surfaces: Vec::new(),
             client_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             should_exit: false,

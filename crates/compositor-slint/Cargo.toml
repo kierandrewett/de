@@ -15,6 +15,7 @@ smithay = { git = "https://github.com/Smithay/smithay.git", features = [
     "renderer_gl",
     "use_system_lib",
     "backend_egl",
+    "desktop",
 ] }
 calloop = "0.13"
 wayland-server = "0.31"
@@ -50,6 +51,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+# bytemuck — safe bytes casting for wgpu uniform buffers
+bytemuck = { version = "1", features = ["derive"] }
 
 # Time
 chrono = "0.4"
