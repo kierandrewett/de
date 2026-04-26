@@ -31,6 +31,8 @@ mod wayland_state;
 mod wayland;
 mod platform;
 mod renderer;
+mod wallpaper;
+mod desktop;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
