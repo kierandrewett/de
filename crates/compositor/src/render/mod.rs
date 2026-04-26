@@ -31,7 +31,10 @@ pub mod border;
 pub mod clip;
 pub mod decoration;
 pub mod effects;
+pub mod layer_chrome;
 pub mod shadow;
+pub mod squircle_clip;
+pub mod window_chrome;
 
 pub use border::BorderRenderer;
 pub use clip::{ClipRenderer, ClipStrategy};
