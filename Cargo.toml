@@ -17,6 +17,7 @@ members = [
     "crates/shell-panel",
     "crates/text-render",
     "crates/compositor-slint-spike",
+    "crates/compositor-slint",
 ]
 
 [workspace.package]

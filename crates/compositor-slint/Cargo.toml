@@ -1,0 +1,57 @@
+[package]
+name = "compositor-slint"
+version = "0.1.0"
+edition = "2021"
+
+# GPU migration of compositor-slint-spike.
+# Replaces SoftwareRenderer + softbuffer with FemtoVGWGPURenderer + wgpu swapchain.
+# SHM client buffers uploaded as wgpu textures (CPU memcpy path).
+# DMA-BUF: documented blocker, SHM-only for now.
+
+[dependencies]
+# Wayland compositor plumbing
+smithay = { git = "https://github.com/Smithay/smithay.git", features = [
+    "wayland_frontend",
+    "renderer_gl",
+    "use_system_lib",
+    "backend_egl",
+] }
+calloop = "0.13"
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+
+# Slint UI toolkit — GPU renderer via FemtoVG + wgpu-28
+# renderer-femtovg-wgpu enables FemtoVGWGPURenderer
+# unstable-wgpu-28 exposes the wgpu-28 integration API and re-exports
+slint = { version = "1.16", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "renderer-femtovg-wgpu",
+    "unstable-wgpu-28",
+] }
+
+# wgpu 28 — required by Slint FemtoVGWGPURenderer.
+# Cargo allows this to coexist with wgpu-27 used by iced 0.14 in other crates.
+wgpu = "28.0.0"
+
+# raw-window-handle 0.6 — for creating wgpu Surface from winit window
+raw-window-handle = "0.6"
+
+# pollster — block_on() for wgpu adapter/device requests (no tokio needed here)
+pollster = "0.3"
+
+# winit 0.30 — window creation + pump_app_events for interleaving with calloop
+winit = "0.30"
+
+# Utility
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Time
+chrono = "0.4"
+
+[[bin]]
+name = "compositor-slint"
+path = "src/main.rs"
