@@ -84,6 +84,12 @@ pub struct State {
 
     /// Current local time (updated every tick).
     pub now: chrono::DateTime<chrono::Local>,
+    /// Monotonic count of `Message::Tick` updates received. Surfaced
+    /// in the panel as `t=N` while debugging frame-callback / event
+    /// loop liveness — if this stops climbing between screenshots,
+    /// iced's `time::every` subscription has died (compositor not
+    /// dispatching events / shell-panel hung).
+    pub tick_count: u64,
     /// App name / title of the currently focused window.
     pub focused_app: Option<String>,
 
@@ -121,6 +127,7 @@ impl Default for State {
             cc_id: None,
             datetime_id: None,
             now: chrono::Local::now(),
+            tick_count: 0,
             focused_app: None,
             is_recording: false,
             recording_elapsed: None,
@@ -149,6 +156,12 @@ pub fn update(state: &mut State, msg: Message) -> Task<Message> {
         // ── Time ────────────────────────────────────────────────────────────
         Message::Tick => {
             state.now = chrono::Local::now();
+            state.tick_count = state.tick_count.wrapping_add(1);
+            // Debug: log every tick at info so we can confirm in
+            // playground/logs/shell-panel.log whether the
+            // `time::every(1s)` subscription is delivering messages
+            // even when the rendered view appears frozen.
+            tracing::info!(t = state.tick_count, "panel Tick fired");
         }
 
         // ── Window management ────────────────────────────────────────────────
@@ -363,7 +376,10 @@ pub fn view(state: &State, id: IcedId) -> Element<'_, Message> {
 /// Active subscriptions: clock tick, IPC events, tray, and D-Bus monitors.
 pub fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([
-        iced::time::every(Duration::from_secs(30)).map(|_| Message::Tick),
+        // Debug-pace tick — 1 s instead of the natural 30 s, so the
+        // panel surfaces seconds + tick counter we render in the bar.
+        // Drop back to 30 s once we trust the event loop.
+        iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
         Subscription::run(dbus::ipc_subscription),
         Subscription::run(dbus::tray_subscription),
         Subscription::run(dbus::network::subscription),
