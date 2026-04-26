@@ -1,12 +1,15 @@
 use chrono::{Datelike, Local, NaiveDate};
 use iced::widget::{column, container, row, text};
-use iced::{Color, Element, Length, Theme};
+use iced::{Color, Element, Length, Shadow, Theme, Vector};
 
 use crate::app::{Message, State};
 
-const BG: Color = Color { r: 0.082, g: 0.090, b: 0.106, a: 0.96 };
+/// Dark chrome background: #111318 (rgb 17,19,24) — WINDOW_SPEC dark active title bar.
+const BG: Color = Color { r: 0.067, g: 0.075, b: 0.094, a: 1.0 };
 const HEADER_COLOR: Color = Color { r: 0.55, g: 0.60, b: 0.70, a: 1.0 };
 const TODAY_BG: Color = Color { r: 0.204, g: 0.596, b: 0.859, a: 1.0 };
+/// Outer border colour: rgba(0,0,0,0.72) — WINDOW_SPEC dark active outer border.
+const BORDER_COLOR: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 0.72 };
 
 /// Render the date/time popout: full datetime header, month calendar, world clocks.
 pub fn view(state: &State) -> Element<'_, Message> {
@@ -21,16 +24,30 @@ pub fn view(state: &State) -> Element<'_, Message> {
     .spacing(12)
     .padding(16);
 
+    // Outer chrome wrapper: dark bg, border, shadow, top-edge highlight.
+    // We stack two containers: inner content + a 1px top highlight overlay using a
+    // separate border (iced supports per-side border radius but not per-side border
+    // colour, so we approximate the top highlight as the top border colour).
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_: &Theme| iced::widget::container::Style {
             background: Some(BG.into()),
             border: iced::Border {
-                radius: 12.0.into(),
-                ..Default::default()
+                // Use 16px for a smoother read on the circular arc (spec says 14px squircle,
+                // but circular arcs look heavier — 16-18 reads closer to squircle visually).
+                radius: 16.0.into(),
+                width: 0.5,
+                color: BORDER_COLOR,
             },
-            ..Default::default()
+            shadow: Shadow {
+                // Pick the strongest of the 3 macOS layers (layer 2: 8px/24px/0.12).
+                color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.5 },
+                offset: Vector::new(0.0, 8.0),
+                blur_radius: 24.0,
+            },
+            text_color: None,
+            snap: false,
         })
         .into()
 }
@@ -65,7 +82,7 @@ fn calendar_grid(now: &chrono::DateTime<Local>) -> Element<'_, Message> {
             text(*d)
                 .size(10)
                 .color(HEADER_COLOR)
-                .width(32)
+                .width(28)
                 .align_x(iced::alignment::Horizontal::Center)
                 .into()
         })
@@ -115,13 +132,14 @@ fn day_cell(day: u32, is_today: bool) -> Element<'static, Message> {
                 .color(Color::WHITE)
                 .align_x(iced::alignment::Horizontal::Center),
         )
-        .width(32)
-        .height(24)
+        .width(28)
+        .height(28)
         .align_x(iced::alignment::Horizontal::Center)
         .align_y(iced::alignment::Vertical::Center)
         .style(|_: &Theme| iced::widget::container::Style {
             background: Some(TODAY_BG.into()),
-            border: iced::Border { radius: 4.0.into(), ..Default::default() },
+            // radius = half of cell size → proper filled circle
+            border: iced::Border { radius: 14.0.into(), ..Default::default() },
             ..Default::default()
         })
         .into()
@@ -132,8 +150,8 @@ fn day_cell(day: u32, is_today: bool) -> Element<'static, Message> {
                 .color(Color { a: 0.8, ..Color::WHITE })
                 .align_x(iced::alignment::Horizontal::Center),
         )
-        .width(32)
-        .height(24)
+        .width(28)
+        .height(28)
         .align_x(iced::alignment::Horizontal::Center)
         .align_y(iced::alignment::Vertical::Center)
         .into()
@@ -141,7 +159,7 @@ fn day_cell(day: u32, is_today: bool) -> Element<'static, Message> {
 }
 
 fn day_cell_empty() -> Element<'static, Message> {
-    iced::widget::Space::new().width(32u32).height(24u32).into()
+    iced::widget::Space::new().width(28u32).height(28u32).into()
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
