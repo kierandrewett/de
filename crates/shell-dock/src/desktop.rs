@@ -16,25 +16,45 @@ pub struct AppInfo {
 /// Resolves `AppInfo` for `app_id` by searching standard `.desktop` directories.
 ///
 /// Falls back to a best-effort entry (name derived from `app_id`) if no
-/// `.desktop` file is found.
+/// `.desktop` file is found. Even in the fallback path, an icon
+/// matching `app_id` is searched for directly — covers cases like
+/// `firefox` where the binary name is the icon name but the desktop
+/// file is reverse-DNS (`org.mozilla.firefox.desktop`).
 pub fn resolve(app_id: &str) -> Option<AppInfo> {
+    // Build the list of `.desktop` filename candidates to try, in
+    // priority order. Beyond the literal app_id we also try the
+    // reverse-DNS leaf and a few common namespaced wrappings so apps
+    // with mismatched binary/desktop names (firefox vs
+    // org.mozilla.firefox) still resolve.
+    let mut candidates: Vec<String> = vec![
+        format!("{app_id}.desktop"),
+        format!("{}.desktop", app_id.to_lowercase()),
+    ];
+    if let Some(leaf) = app_id.rsplit('.').next() {
+        if leaf != app_id {
+            candidates.push(format!("{leaf}.desktop"));
+            candidates.push(format!("{}.desktop", leaf.to_lowercase()));
+        }
+    }
+    for prefix in ["org.gnome.", "org.mozilla.", "org.kde."] {
+        candidates.push(format!("{prefix}{app_id}.desktop"));
+    }
+
     for dir in &search_dirs() {
-        // Try exact match first, then lowercase variant.
-        for candidate in &[
-            format!("{app_id}.desktop"),
-            format!("{}.desktop", app_id.to_lowercase()),
-        ] {
+        for candidate in &candidates {
             if let Some(info) = parse_file(&dir.join(candidate), app_id) {
                 return Some(info);
             }
         }
     }
 
-    // Fallback: synthesise an entry from the app_id.
+    // Fallback path — no .desktop file. Still try `app_id` directly as
+    // an icon-theme name; many apps have an icon installed even when
+    // their .desktop file's basename doesn't match.
     Some(AppInfo {
         name: pretty_name(app_id),
         exec: app_id.to_string(),
-        icon: None,
+        icon: resolve_icon(app_id).or_else(|| resolve_icon(&app_id.to_lowercase())),
     })
 }
 
@@ -130,8 +150,21 @@ fn resolve_icon(icon_name: &str) -> Option<PathBuf> {
     }
 
     let home = home_dir();
-    let sizes = ["48x48/apps", "64x64/apps", "scalable/apps", "256x256/apps"];
-    let exts = ["png", "svg", "xpm"];
+    // Prefer scalable (SVG) so the dock's bilinear resample doesn't
+    // make a 48 px PNG look fuzzy when scaled up by hover. Then fall
+    // back to large→small raster sizes.
+    let sizes = [
+        "scalable/apps",
+        "256x256/apps",
+        "128x128/apps",
+        "96x96/apps",
+        "64x64/apps",
+        "48x48/apps",
+        "32x32/apps",
+        "24x24/apps",
+        "scalable/mimetypes",
+    ];
+    let exts = ["svg", "png", "xpm"];
 
     let theme_roots: &[PathBuf] = &[
         home.join(".local/share/icons/hicolor"),
@@ -161,6 +194,14 @@ fn resolve_icon(icon_name: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Generic icon to use when no app-specific icon resolved. Falls back
+/// to the freedesktop mimetypes/application-x-executable across the
+/// usual icon themes.
+pub fn generic_app_icon() -> Option<PathBuf> {
+    resolve_icon("application-x-executable")
+        .or_else(|| resolve_icon("application-x-generic"))
 }
 
 /// Converts a reverse-DNS `app_id` or kebab-case name into a human-readable name.

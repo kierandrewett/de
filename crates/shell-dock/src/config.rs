@@ -50,10 +50,16 @@ impl Default for Config {
             icon_size: 48,
             margin: 8,
             icon_padding: 6,
+            // Default pins. Each entry's icon is resolved first by
+            // looking up `<app_id>.desktop`, then by trying the literal
+            // string as an icon-theme name. Fedora ships
+            // `org.mozilla.firefox.desktop` (not `firefox.desktop`)
+            // and no `org.gnome.Terminal` at all, so those are the
+            // canonical names to use across distros.
             pinned: vec![
                 PinnedApp { app_id: "org.gnome.Nautilus".into() },
-                PinnedApp { app_id: "firefox".into() },
-                PinnedApp { app_id: "org.gnome.Terminal".into() },
+                PinnedApp { app_id: "org.mozilla.firefox".into() },
+                PinnedApp { app_id: "kitty".into() },
             ],
             auto_hide: false,
         }
