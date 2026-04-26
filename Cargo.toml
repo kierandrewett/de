@@ -15,6 +15,7 @@ members = [
     "crates/shell-launcher",
     "crates/shell-dock",
     "crates/shell-panel",
+    "crates/text-render",
 ]
 
 [workspace.package]
@@ -42,3 +43,13 @@ strip = true
 
 [profile.dev]
 opt-level = 1
+
+# Vendored fork of iced_tiny_skia 0.14.0 with a single patch:
+# `present()` always issues full damage rather than trusting
+# `softbuffer::Buffer::age()`, which lies on Wayland with wl_shm and causes
+# the panel/dock to fade to black on partial-damage repaints (mouse hover,
+# clock tick, etc.). See `vendor/iced_tiny_skia/src/window/compositor.rs`
+# for the patch comment. Drop this `[patch]` if iced upstream fixes the
+# softbuffer interaction or if we move to wgpu for the shell apps.
+[patch.crates-io]
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
