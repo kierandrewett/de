@@ -770,6 +770,7 @@ name = "compositor-slint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "calloop 0.13.0",
  "chrono",
  "pollster",

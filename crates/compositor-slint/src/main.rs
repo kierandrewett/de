@@ -31,6 +31,7 @@ mod wayland_state;
 mod wayland;
 mod platform;
 mod renderer;
+mod chrome_shader;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
