@@ -1,27 +1,107 @@
 // Tokens.slint — Design token constants for the compositor shell.
 // All values sourced from WINDOW_SPEC.md and the Figma designs.
 // Import this file in every component that references colours, sizes, or typography.
+//
+// ── Theme system ──────────────────────────────────────────────────────────────
+// The `Theme` global holds the current mode and computes mode-aware colour
+// values.  Individual components bind to these properties and declare their own
+// `animate` blocks to crossfade when the mode changes.
+//
+// NOTE: Slint global components cannot have `animate` blocks directly.
+//       Animations must be declared in the components that use the properties.
+
+export enum TokenMode { Dark, Light }
+
+export global Theme {
+    // ── Current mode (set from Rust via Theme::get(&handle).set_mode(...)) ─────
+    in-out property <TokenMode> mode: TokenMode.Dark;
+
+    // ── Panel colours ─────────────────────────────────────────────────────────
+    out property <color> panel-bg: mode == TokenMode.Dark
+        ? #111318
+        : #f0f0f0;
+    out property <color> panel-fg: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.80)
+        : rgba(0, 0, 0, 0.75);
+    out property <color> panel-border-bottom: mode == TokenMode.Dark
+        ? rgba(0, 0, 0, 0.80)
+        : rgba(0, 0, 0, 0.20);
+
+    // ── Dock colours ──────────────────────────────────────────────────────────
+    out property <color> dock-bg: mode == TokenMode.Dark
+        ? #b5000000
+        : rgba(240, 240, 240, 0.80);
+    out property <color> dock-border: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.15)
+        : rgba(0, 0, 0, 0.12);
+
+    // ── Title bar colours — per mode ──────────────────────────────────────────
+    out property <color> titlebar-bg-dark-active:    #111318;
+    out property <color> titlebar-bg-dark-inactive:  rgba(17, 19, 24, 0.75);
+    out property <color> titlebar-fg-dark:           rgba(255, 255, 255, 0.80);
+    out property <color> titlebar-border-dark:       rgba(0, 0, 0, 0.80);
+    out property <color> titlebar-bg-light-active:   #ffffff;
+    out property <color> titlebar-bg-light-inactive: rgba(255, 255, 255, 0.50);
+    out property <color> titlebar-fg-light:          rgba(0, 0, 0, 0.75);
+    out property <color> titlebar-border-light:      #bbbbbb;
+
+    // ── Window chrome — outer border ──────────────────────────────────────────
+    out property <color> border-dark-active:    rgba(0, 0, 0, 0.72);
+    out property <color> border-dark-inactive:  rgba(0, 0, 0, 0.55);
+    out property <color> border-light-active:   rgba(0, 0, 0, 0.22);
+    out property <color> border-light-inactive: rgba(0, 0, 0, 0.15);
+
+    // ── Window chrome — inner highlight (top edge) ────────────────────────────
+    out property <color> highlight-dark-active-top:   rgba(255, 255, 255, 0.08);
+    out property <color> highlight-dark-inactive-top: rgba(255, 255, 255, 0.04);
+    out property <color> highlight-light-active-top:  rgba(255, 255, 255, 0.50);
+    out property <color> highlight-light-inactive-top:rgba(255, 255, 255, 0.25);
+
+    // ── Content area background ────────────────────────────────────────────────
+    out property <color> window-content-bg: mode == TokenMode.Dark
+        ? #1d1d1d
+        : #f6f6f6;
+
+    // ── Window control button colours (mode-aware) ────────────────────────────
+    out property <color> control-bg: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.08)
+        : rgba(0, 0, 0, 0.06);
+    out property <color> control-bg-hover: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.20)
+        : rgba(0, 0, 0, 0.12);
+    out property <color> control-bg-pressed: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.30)
+        : rgba(0, 0, 0, 0.18);
+    out property <color> control-icon-tint: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.80)
+        : rgba(0, 0, 0, 0.80);
+
+    // ── Dock running-dot colours (mode-aware) ─────────────────────────────────
+    out property <color> dock-dot-focused: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.90)
+        : rgba(0, 0, 0, 0.70);
+    out property <color> dock-dot-running: mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.50)
+        : rgba(0, 0, 0, 0.35);
+}
 
 export global Tokens {
     // ── Corner radii ──────────────────────────────────────────────────────────
-    // True squircle (corner-smoothing: 0.6) is not supported by Slint's
-    // border-radius (circular arc). We use the spec'd 14 px value as an
-    // approximation. The GPU agent applies the actual squircle SDF shader.
     out property <length> window-corner-radius-outer: 14px;
     out property <length> window-corner-radius-inner: 12px;
-    out property <length> dock-corner-radius: 20px;   // squircle-ish approximation
-    out property <length> panel-corner-radius: 0px;   // panel is full-width, flush top
+    out property <length> dock-corner-radius: 20px;
+    out property <length> panel-corner-radius: 0px;
 
     // ── Panel ────────────────────────────────────────────────────────────────
     out property <length>  panel-height: 34px;
-    out property <color>   panel-bg: #111318;
-    out property <color>   panel-fg: rgba(255, 255, 255, 0.80);
-    out property <color>   panel-border-bottom: rgba(0, 0, 0, 0.80);
+    out property <color>   panel-bg: Theme.panel-bg;
+    out property <color>   panel-fg: Theme.panel-fg;
+    out property <color>   panel-border-bottom: Theme.panel-border-bottom;
     out property <length>  panel-font-size: 13px;
 
     // ── Dock ─────────────────────────────────────────────────────────────────
-    out property <color>   dock-bg: #b5000000;    // ~71% black
-    out property <color>   dock-border: rgba(255, 255, 255, 0.15);
+    out property <color>   dock-bg: Theme.dock-bg;
+    out property <color>   dock-border: Theme.dock-border;
     out property <length>  dock-padding: 8px;
     out property <length>  dock-outer-gap: 8px;
     out property <length>  dock-icon-size: 48px;
@@ -29,24 +109,24 @@ export global Tokens {
     // ── Window chrome — title bar ─────────────────────────────────────────────
     out property <length>  titlebar-height: 33px;
     out property <length>  titlebar-padding: 6px;
-    out property <color>   titlebar-bg-dark-active: #111318;
-    out property <color>   titlebar-bg-dark-inactive: rgba(17, 19, 24, 0.75);
-    out property <color>   titlebar-bg-light-active: #ffffff;
-    out property <color>   titlebar-bg-light-inactive: rgba(255, 255, 255, 0.50);
-    out property <color>   titlebar-fg-dark: rgba(255, 255, 255, 0.80);
-    out property <color>   titlebar-fg-light: rgba(0, 0, 0, 0.75);
-    out property <color>   titlebar-border-dark: rgba(0, 0, 0, 0.80);
-    out property <color>   titlebar-border-light: #bbbbbb;
+    out property <color>   titlebar-bg-dark-active: Theme.titlebar-bg-dark-active;
+    out property <color>   titlebar-bg-dark-inactive: Theme.titlebar-bg-dark-inactive;
+    out property <color>   titlebar-bg-light-active: Theme.titlebar-bg-light-active;
+    out property <color>   titlebar-bg-light-inactive: Theme.titlebar-bg-light-inactive;
+    out property <color>   titlebar-fg-dark: Theme.titlebar-fg-dark;
+    out property <color>   titlebar-fg-light: Theme.titlebar-fg-light;
+    out property <color>   titlebar-border-dark: Theme.titlebar-border-dark;
+    out property <color>   titlebar-border-light: Theme.titlebar-border-light;
     out property <length>  titlebar-font-size: 13px;
 
     // ── Window chrome — outer border ─────────────────────────────────────────
-    out property <color>   border-dark-active: rgba(0, 0, 0, 0.72);
-    out property <color>   border-dark-inactive: rgba(0, 0, 0, 0.55);
-    out property <color>   border-light-active: rgba(0, 0, 0, 0.22);
-    out property <color>   border-light-inactive: rgba(0, 0, 0, 0.15);
+    out property <color>   border-dark-active: Theme.border-dark-active;
+    out property <color>   border-dark-inactive: Theme.border-dark-inactive;
+    out property <color>   border-light-active: Theme.border-light-active;
+    out property <color>   border-light-inactive: Theme.border-light-inactive;
 
-    // ── Window chrome — inner highlight (top edge, dark active) ──────────────
-    out property <color>   highlight-dark-active-top: rgba(255, 255, 255, 0.08);
+    // ── Window chrome — inner highlight ──────────────────────────────────────
+    out property <color>   highlight-dark-active-top: Theme.highlight-dark-active-top;
     out property <color>   highlight-dark-active-bottom: rgba(255, 255, 255, 0.00);
 
     // ── Window controls ───────────────────────────────────────────────────────
@@ -55,14 +135,10 @@ export global Tokens {
     out property <length>  control-inset: 6px;
 
     // ── Typography ────────────────────────────────────────────────────────────
-    // Inter Variable is registered by the GPU/renderer agent at runtime.
     out property <string>  font-family: "Inter Variable";
     out property <string>  font-family-fallback: "Inter";
 
     // ── Z-order layers ────────────────────────────────────────────────────────
-    // NOTE: Slint requires `z` to be an integer literal, so these constants
-    // cannot be used directly as `z: Tokens.z-wallpaper`.  They are documented
-    // here for reference; Compositor.slint uses inline literals.
     //   wallpaper:  0
     //   windows:   10
     //   layers-bg: 20

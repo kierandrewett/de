@@ -1,18 +1,25 @@
 // WindowChrome.slint — Server-side decoration chrome for a single toplevel window.
-// Renders per WINDOW_SPEC (dark mode / dark-active state as default):
+// Renders per WINDOW_SPEC, supporting both dark and light mode via the Theme global.
+//
 //   - 14 px border-radius outer (circular arc approximation of squircle SDF)
-//   - 0.5 px outer border: rgba(0,0,0,0.72)
-//   - 1 px inner highlight gradient: rgba(255,255,255,0.08) top → 0 at 2/3 height
+//   - 0.5 px outer border — alpha varies by mode × focus state (animated)
+//   - 1 px inner highlight gradient — brighter in light mode / active state
 //   - Drop shadow: one strong layer (Slint limit); GPU agent adds the other two
-//   - Title bar: 33 px, #111318, 0.5 px bottom divider, title text centred Inter SemiBold 13px
+//   - Title bar: 33 px, background varies by mode × focus (animated)
 //   - Controls: close/min/max right-aligned 21×21px circles with 6px insets
 //
 // Approximations documented:
 //   - border-radius is circular arc not squircle SDF
 //   - Only one drop-shadow layer (Slint per-element limit)
 //   - 0.5px border approximated as 1px at reduced opacity
+//
+// Animation strategy:
+//   The component holds locally-resolved colour properties whose values change
+//   based on Theme.mode and the `focused` in-property.  Slint `animate` blocks
+//   on these local properties produce the 200 ms ease-in-out crossfade whenever
+//   either the mode or focus state changes.
 
-import { Tokens } from "./Tokens.slint";
+import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { IconButton } from "./widgets/IconButton.slint";
 
 export component WindowChrome {
@@ -28,22 +35,55 @@ export component WindowChrome {
     callback maximize-clicked();
 
     // ── Geometry — caller positions this component absolutely ─────────────────
-    // Minimum sensible size; caller will set width/height from WindowItem geometry.
     min-width:  200px;
     min-height: Tokens.titlebar-height + 100px;
 
-    // Resolved colours based on focus state.
-    property <color> resolved-border: focused
-        ? Tokens.border-dark-active
-        : Tokens.border-dark-inactive;
-    property <color> resolved-titlebar-bg: focused
-        ? Tokens.titlebar-bg-dark-active
-        : Tokens.titlebar-bg-dark-inactive;
-    property <color> resolved-titlebar-fg: Tokens.titlebar-fg-dark;
-    property <color> resolved-titlebar-border: Tokens.titlebar-border-dark;
+    // ── Locally-resolved colour properties (animated) ─────────────────────────
+    // Each one computes the "target" colour from the current mode + focus state.
+    // Slint sees the value change and drives the animate block.
 
-    animate resolved-border         { duration: 200ms; easing: ease-in-out; }
-    animate resolved-titlebar-bg    { duration: 200ms; easing: ease-in-out; }
+    property <color> resolved-border: Theme.mode == TokenMode.Dark
+        ? (focused ? Tokens.border-dark-active   : Tokens.border-dark-inactive)
+        : (focused ? Tokens.border-light-active  : Tokens.border-light-inactive);
+
+    property <color> resolved-titlebar-bg: Theme.mode == TokenMode.Dark
+        ? (focused ? Tokens.titlebar-bg-dark-active   : Tokens.titlebar-bg-dark-inactive)
+        : (focused ? Tokens.titlebar-bg-light-active  : Tokens.titlebar-bg-light-inactive);
+
+    property <color> resolved-titlebar-fg: Theme.mode == TokenMode.Dark
+        ? Tokens.titlebar-fg-dark
+        : Tokens.titlebar-fg-light;
+
+    property <color> resolved-titlebar-border: Theme.mode == TokenMode.Dark
+        ? Tokens.titlebar-border-dark
+        : Tokens.titlebar-border-light;
+
+    // Inner highlight top alpha per WINDOW_SPEC:
+    //   dark-active=0.08, dark-inactive=0.04, light-active=0.50, light-inactive=0.25
+    property <color> resolved-highlight-top: Theme.mode == TokenMode.Dark
+        ? (focused ? rgba(255,255,255,0.08) : rgba(255,255,255,0.04))
+        : (focused ? rgba(255,255,255,0.50) : rgba(255,255,255,0.25));
+
+    // Content area background (no focus dependency — mode only).
+    property <color> resolved-content-bg: Theme.window-content-bg;
+
+    // Window control tint.
+    property <color> resolved-control-bg:         Theme.control-bg;
+    property <color> resolved-control-bg-hover:   Theme.control-bg-hover;
+    property <color> resolved-control-bg-pressed: Theme.control-bg-pressed;
+    property <color> resolved-control-icon-tint:  Theme.control-icon-tint;
+
+    // ── Animation blocks — 200 ms ease-in-out on all colour transitions ───────
+    animate resolved-border              { duration: 200ms; easing: ease-in-out; }
+    animate resolved-titlebar-bg         { duration: 200ms; easing: ease-in-out; }
+    animate resolved-titlebar-fg         { duration: 200ms; easing: ease-in-out; }
+    animate resolved-titlebar-border     { duration: 200ms; easing: ease-in-out; }
+    animate resolved-highlight-top       { duration: 200ms; easing: ease-in-out; }
+    animate resolved-content-bg          { duration: 200ms; easing: ease-in-out; }
+    animate resolved-control-bg          { duration: 200ms; easing: ease-in-out; }
+    animate resolved-control-bg-hover    { duration: 200ms; easing: ease-in-out; }
+    animate resolved-control-bg-pressed  { duration: 200ms; easing: ease-in-out; }
+    animate resolved-control-icon-tint   { duration: 200ms; easing: ease-in-out; }
 
     // ── Outer frame with border and shadow ────────────────────────────────────
     outer-frame := Rectangle {
@@ -68,7 +108,6 @@ export component WindowChrome {
             width: parent.width;
             height: Tokens.titlebar-height;
             background: root.resolved-titlebar-bg;
-            // Top corners follow outer radius; bottom is square (to abut content).
             border-top-left-radius: Tokens.window-corner-radius-outer;
             border-top-right-radius: Tokens.window-corner-radius-outer;
             border-bottom-left-radius: 0px;
@@ -84,9 +123,8 @@ export component WindowChrome {
                 opacity: 0.80;
             }
 
-            // Title text — centred, leaving room for controls on the right.
+            // Title text.
             Text {
-                // Leave 3 × (control + gap) + inset on the right for buttons.
                 x: Tokens.titlebar-padding;
                 y: 0;
                 width: parent.width
@@ -97,16 +135,13 @@ export component WindowChrome {
                 color: root.resolved-titlebar-fg;
                 font-family: Tokens.font-family;
                 font-size: Tokens.titlebar-font-size;
-                font-weight: 600;   // Semi Bold per WINDOW_SPEC
+                font-weight: 600;
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 overflow: elide;
-
-                animate color { duration: 200ms; easing: ease-in-out; }
             }
 
-            // ── Window controls (right-to-left: minimize, maximize, close) ──
-            // Position: 6 px from top, 6 px from right edge.
+            // ── Window controls ──────────────────────────────────────────────
             controls := Rectangle {
                 x: parent.width
                     - (Tokens.control-size * 3 + Tokens.control-gap * 2)
@@ -121,11 +156,11 @@ export component WindowChrome {
                     x: 0;
                     y: 0;
                     diameter: Tokens.control-size;
-                    bg: rgba(255, 255, 255, 0.08);
-                    bg-hover: rgba(255, 255, 255, 0.20);
-                    bg-pressed: rgba(255, 255, 255, 0.30);
+                    bg: root.resolved-control-bg;
+                    bg-hover: root.resolved-control-bg-hover;
+                    bg-pressed: root.resolved-control-bg-pressed;
                     icon: @image-url("assets/minimize.svg");
-                    icon-tint: rgba(255, 255, 255, 0.80);
+                    icon-tint: root.resolved-control-icon-tint;
                     clicked => { root.minimize-clicked(); }
                 }
 
@@ -134,24 +169,24 @@ export component WindowChrome {
                     x: Tokens.control-size + Tokens.control-gap;
                     y: 0;
                     diameter: Tokens.control-size;
-                    bg: rgba(255, 255, 255, 0.08);
-                    bg-hover: rgba(255, 255, 255, 0.20);
-                    bg-pressed: rgba(255, 255, 255, 0.30);
+                    bg: root.resolved-control-bg;
+                    bg-hover: root.resolved-control-bg-hover;
+                    bg-pressed: root.resolved-control-bg-pressed;
                     icon: @image-url("assets/maximize.svg");
-                    icon-tint: rgba(255, 255, 255, 0.80);
+                    icon-tint: root.resolved-control-icon-tint;
                     clicked => { root.maximize-clicked(); }
                 }
 
-                // Close (rightmost)
+                // Close (rightmost) — always uses red-tinted hover
                 close-btn := IconButton {
                     x: (Tokens.control-size + Tokens.control-gap) * 2;
                     y: 0;
                     diameter: Tokens.control-size;
-                    bg: rgba(255, 255, 255, 0.08);
+                    bg: root.resolved-control-bg;
                     bg-hover: rgba(200, 60, 60, 0.80);
                     bg-pressed: rgba(180, 40, 40, 0.90);
                     icon: @image-url("assets/close.svg");
-                    icon-tint: rgba(255, 255, 255, 0.80);
+                    icon-tint: root.resolved-control-icon-tint;
                     clicked => { root.close-clicked(); }
                 }
             }
@@ -163,7 +198,7 @@ export component WindowChrome {
             y: Tokens.titlebar-height;
             width: parent.width;
             height: parent.height - Tokens.titlebar-height;
-            background: #1d1d1d;
+            background: root.resolved-content-bg;
             border-bottom-left-radius: Tokens.window-corner-radius-outer;
             border-bottom-right-radius: Tokens.window-corner-radius-outer;
             clip: true;
@@ -178,10 +213,7 @@ export component WindowChrome {
 
         // ── Inner highlight overlay (on top of everything) ────────────────────
         // Simulates top-down lighting on glass per WINDOW_SPEC.
-        // Rendered as a 1 px inset rectangle with a vertical gradient brush:
-        //   top:    rgba(255,255,255,0.08)
-        //   bottom: rgba(255,255,255,0.00)
-        // The gradient fades to zero at 2/3 of the window height.
+        // The highlight alpha varies by mode × focus (animated via resolved-highlight-top).
         highlight := Rectangle {
             x: 1px;
             y: 1px;
@@ -189,11 +221,6 @@ export component WindowChrome {
             height: parent.height - 2px;
             border-radius: Tokens.window-corner-radius-outer - 1px;
             background: transparent;
-            // Slint doesn't support per-edge strokes; we use a thin rectangle
-            // filled with a gradient as the inset highlight layer.
-            // The Rectangle background gradient goes from the highlight colour
-            // at the top to fully transparent — we give it only 4 px height so
-            // it only touches the very top edge of the frame.
             border-width: 0;
 
             // Top-edge highlight strip (gradient Rectangle, 2 px tall).
@@ -205,7 +232,7 @@ export component WindowChrome {
                 border-top-left-radius: parent.border-radius;
                 border-top-right-radius: parent.border-radius;
                 background: @linear-gradient(180deg,
-                    rgba(255, 255, 255, 0.08) 0%,
+                    root.resolved-highlight-top 0%,
                     rgba(255, 255, 255, 0.00) 100%);
             }
         }

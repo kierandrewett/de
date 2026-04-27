@@ -39,6 +39,7 @@ mod wayland;
 mod platform;
 mod renderer;
 mod chrome_shader;
+mod theme;
 mod wallpaper;
 mod desktop;
 mod cursor;

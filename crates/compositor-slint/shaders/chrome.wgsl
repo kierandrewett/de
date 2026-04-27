@@ -13,6 +13,22 @@
 // All passes use the same fullscreen-quad vertex shader (vs_main).
 // All UV coordinates are in [0,1] relative to the SURFACE (output texture) dimensions.
 // Fragment positions in physical pixels are derived as: frag_px = in.uv * vec2(surface_w, surface_h).
+//
+// ── Four-state palette ────────────────────────────────────────────────────────
+//
+// `mode_t`  (0=dark,     1=light)
+// `focus_t` (0=inactive, 1=active)
+//
+// Values are lerped between the four WINDOW_SPEC states:
+//
+//   dark_active:   outer a=0.72 / highlight_top a=0.08 / shadow 3 layers
+//   dark_inactive: outer a=0.55 / highlight_top a=0.04 / shadow 2 layers
+//   light_active:  outer a=0.22 / highlight_top a=0.50 / shadow 3 layers
+//   light_inactive:outer a=0.15 / highlight_top a=0.25 / shadow 2 layers
+//
+// Each component is lerped: dark_val + mode_t*(light_val - dark_val)
+//                           inactive_val + focus_t*(active_val - inactive_val)
+// i.e. bilinear blend over the (mode_t, focus_t) unit square.
 
 // ── Structs ──────────────────────────────────────────────────────────────────
 
@@ -28,22 +44,16 @@ struct ChromeUniforms {
     // Style parameters.
     radius_px:  f32,     // outer corner radius (14 px)
     smoothing:  f32,     // squircle smoothing  (0.6)
-    // Outer stroke colour (rgba, premultiplied NOT required — we blend manually)
-    stroke_r:   f32,
-    stroke_g:   f32,
-    stroke_b:   f32,
-    stroke_a:   f32,
-    // Inner highlight top colour alpha (bottom is always 0)
-    highlight_a: f32,
-    // 1 = active, 0 = inactive (controls highlight intensity)
-    is_active:  f32,
-    // Shadow colour alpha for this layer
+    // Theme crossfade parameters (0→1 animated by Rust).
+    mode_t:     f32,     // 0 = dark, 1 = light
+    focus_t:    f32,     // 0 = inactive, 1 = active
+    // Shadow colour alpha for this layer (shadow pass only).
     shadow_a:   f32,
-    // Shadow Y offset in physical pixels
+    // Shadow Y offset in physical pixels (shadow pass only).
     shadow_oy:  f32,
-    // Shadow X offset in physical pixels
+    // Shadow X offset in physical pixels (shadow pass only).
     shadow_ox:  f32,
-    // Blur sigma for Gaussian passes (in pixels)
+    // Blur sigma for Gaussian shadow passes (pixels). 0.0 in chrome pass.
     blur_sigma: f32,
     _pad0:      f32,
     _pad1:      f32,
@@ -226,16 +236,41 @@ fn fs_shadow_composite(in: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, alpha);
 }
 
+// ── Four-state colour helpers ─────────────────────────────────────────────────
+//
+// Bilinear blend over (mode_t, focus_t):
+//   dark_inactive (0,0)  dark_active (0,1)
+//   light_inactive(1,0)  light_active(1,1)
+
+// Returns the outer stroke alpha, lerped across all four states.
+fn outer_stroke_alpha(mode_t: f32, focus_t: f32) -> f32 {
+    // dark:  inactive=0.55, active=0.72
+    // light: inactive=0.15, active=0.22
+    let dark_a  = mix(0.55, 0.72, focus_t);
+    let light_a = mix(0.15, 0.22, focus_t);
+    return mix(dark_a, light_a, mode_t);
+}
+
+// Returns the inner highlight top-edge alpha, lerped across all four states.
+fn highlight_top_alpha(mode_t: f32, focus_t: f32) -> f32 {
+    // dark:  inactive=0.04, active=0.08
+    // light: inactive=0.25, active=0.50
+    let dark_a  = mix(0.04, 0.08, focus_t);
+    let light_a = mix(0.25, 0.50, focus_t);
+    return mix(dark_a, light_a, mode_t);
+}
+
 // ── Chrome fragment stage ─────────────────────────────────────────────────────
 //
-// BORDER-OVERLAID CONTRACT (Wave 1D deliverable):
-//   The client texture extends to the FULL window rect.
-//   Chrome composites the squircle alpha mask + outer border + inner highlight
-//   ON TOP of the full client texture.
+// BORDER-OVERLAID CONTRACT:
+//   The client texture extends to the FULL window rect. Chrome composites the
+//   squircle alpha mask + outer border + inner highlight ON TOP of the full
+//   client texture (no hard clip, no halo).
 //
 //   1. Squircle alpha mask multiplied into client pixel's alpha → smooth corners.
-//   2. Outer 0.5 px border stroke overlaid on top.
-//   3. Inner 1 px highlight with vertical gradient overlaid on top.
+//   2. Outer 0.5 px black stroke; alpha lerped via outer_stroke_alpha(mode_t, focus_t).
+//   3. Inner 1 px highlight with vertical gradient; top alpha lerped via
+//      highlight_top_alpha(mode_t, focus_t).
 
 @fragment
 fn fs_chrome(in: VertexOut) -> @location(0) vec4<f32> {
@@ -264,18 +299,29 @@ fn fs_chrome(in: VertexOut) -> @location(0) vec4<f32> {
     // rgb channels are already premultiplied — scale them by mask_alpha too.
     var colour = vec4<f32>(scene_col.rgb * mask_alpha, scene_col.a * mask_alpha);
 
-    // ── 2. Outer stroke (0.5 px) — OVERLAID on top ────────────────────────────
-    let stroke_alpha = smoothstep(-1.0, 0.0, d) * (1.0 - smoothstep(-0.5, 0.5, d));
-    let stroke_col   = vec4<f32>(u.stroke_r, u.stroke_g, u.stroke_b, u.stroke_a * stroke_alpha);
+    // ── 2. Outer stroke (0.5 px, black with mode/focus-lerped alpha) ──────────
+    // The stroke sits just inside (d < 0) the squircle edge.
+    // stroke_alpha peaks at d == -0.25 (centre of 0.5 px stroke).
+    let stroke_a_base = outer_stroke_alpha(u.mode_t, u.focus_t);
+    let stroke_alpha  = smoothstep(-1.0, 0.0, d) * (1.0 - smoothstep(-0.5, 0.5, d));
+    let stroke_col    = vec4<f32>(0.0, 0.0, 0.0, stroke_a_base * stroke_alpha);
+    // Porter-Duff src-over: stroke over the squircle-masked content.
     colour = stroke_col + colour * (1.0 - stroke_col.a);
 
     // ── 3. Inner highlight (1 px inset) — OVERLAID on top ─────────────────────
     let highlight_stripe = smoothstep(-2.0, -1.0, d) * (1.0 - smoothstep(-1.0, 0.0, d));
     let y_norm = (frag_px.y - u.win_y) / u.win_h;
     let grad   = clamp(1.0 - y_norm * 1.5, 0.0, 1.0);
-    let hl_a = u.highlight_a * highlight_stripe * grad;
+    let hl_top_a = highlight_top_alpha(u.mode_t, u.focus_t);
+    let hl_a     = hl_top_a * highlight_stripe * grad;
+    // Premultiply white before src-over: hl_rgb * hl_a so the formula works
+    // correctly even when hl_a = 0 (no spurious (1,1,1) added to output).
     let hl_col_pm = vec4<f32>(hl_a, hl_a, hl_a, hl_a);
     colour = hl_col_pm + colour * (1.0 - hl_a);
 
     return colour;
 }
+
+// (Legacy single-pass `fs_shadow` removed — replaced by the multi-pass
+// separable Gaussian pipeline above: fs_shadow_mask → fs_blur_h →
+// fs_blur_v → fs_shadow_composite.)
