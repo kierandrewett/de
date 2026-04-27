@@ -72,6 +72,7 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::wayland::layer_shell::LayerInfo;
+use smithay::wayland::shell::xdg::ToplevelSurface;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Client state (per-connection user data)
@@ -111,6 +112,8 @@ pub struct ClientSurfaceData {
 pub struct ToplevelInfo {
     /// The wayland surface for this toplevel.
     pub surface: WlSurface,
+    /// The ToplevelSurface handle (for sending configure / close to the client).
+    pub toplevel: ToplevelSurface,
     /// Cascaded compositor-space position.
     pub x: i32,
     pub y: i32,

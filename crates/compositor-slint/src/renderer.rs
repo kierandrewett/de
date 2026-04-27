@@ -810,24 +810,27 @@ impl CompositorApp {
 
     /// Send an xdg_toplevel.close request to the client.
     fn send_xdg_close(&self, surface: &WlSurface, state: &mut SpikeState) {
-        // smithay requires the ToplevelSurface handle (stored in XdgShellState)
-        // to send the actual close request.  For now we begin the WM close
-        // animation; the surface will be destroyed by the client after it
-        // receives the close event which is sent by smithay on drop.
         for toplevel in &state.toplevels {
             if &toplevel.surface == surface {
-                debug!("WM: beginning close for surface");
+                debug!("WM: sending xdg_toplevel.close to client");
+                toplevel.toplevel.send_close();
                 break;
             }
         }
     }
 
-    /// Send xdg_toplevel configure with a new size.
-    fn send_configure(&self, _surface: &WlSurface, w: i32, h: i32, _state: &mut SpikeState) {
-        // The ToplevelSurface handle needed to call send_configure is stored in
-        // smithay's XdgShellState.  We update the WM geometry and rely on the
-        // client re-configuring on the next commit.
-        debug!("configure requested: {}x{}", w, h);
+    /// Send xdg_toplevel configure with a new size to the client.
+    fn send_configure(&self, surface: &WlSurface, w: i32, h: i32, state: &mut SpikeState) {
+        for toplevel in &state.toplevels {
+            if &toplevel.surface == surface {
+                debug!("WM: sending xdg_toplevel configure {}x{}", w, h);
+                toplevel.toplevel.with_pending_state(|s| {
+                    s.size = Some((w, h).into());
+                });
+                toplevel.toplevel.send_configure();
+                break;
+            }
+        }
     }
 
     /// Forward a pointer motion event to the wayland client whose window is under the pointer.
