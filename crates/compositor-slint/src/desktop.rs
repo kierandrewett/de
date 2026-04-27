@@ -4,11 +4,101 @@
 //! `crates/shell-dock/src/config.rs`.  No external crate dependency on
 //! `freedesktop-desktop-entry` — we parse the INI format ourselves to
 //! avoid adding a crate that may not be in the workspace lock file.
+//!
+//! ## SVG icon decoding
+//!
+//! Slint's `FemtoVG` backend does not decode SVG natively (no resvg integration
+//! in the `renderer-femtovg-wgpu` feature).  We use the `resvg` crate directly:
+//! when `load_icon` receives a `.svg` path it rasterises at `DOCK_ICON_SIZE × DOCK_ICON_SIZE`
+//! and converts the tiny-skia `Pixmap` to a premultiplied RGBA8 `slint::Image`.
+//!
+//! Results are cached per (path, size) in a process-global `OnceLock`-backed HashMap
+//! so repeated calls for the same icon are O(1) (the dock reloads the item list on
+//! every running-state update).
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+/// Dock icon size in logical pixels.  Rasterise SVG icons at this size.
+const DOCK_ICON_SIZE: u32 = 48;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SVG icon cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-process cache mapping (absolute path string, pixel size) → Slint Image.
+/// We store the raw RGBA bytes rather than the `slint::Image` so the cache
+/// can live in a `Mutex<HashMap<…>>` without `slint::Image` needing to be `Send`.
+struct SvgCache {
+    /// (canonical path, size_px) → premultiplied RGBA8 bytes + (width, height)
+    entries: HashMap<(String, u32), (Vec<u8>, u32, u32)>,
+}
+
+impl SvgCache {
+    fn new() -> Self {
+        Self { entries: HashMap::new() }
+    }
+}
+
+static SVG_CACHE: std::sync::OnceLock<Mutex<SvgCache>> = std::sync::OnceLock::new();
+
+fn svg_cache() -> &'static Mutex<SvgCache> {
+    SVG_CACHE.get_or_init(|| Mutex::new(SvgCache::new()))
+}
+
+/// Rasterise an SVG file at `target_size × target_size` and return premultiplied
+/// RGBA8 bytes plus (width, height).  Uses a per-process cache.
+fn rasterise_svg(path: &Path, target_size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let canonical = path.canonicalize().ok()?;
+    let key = (canonical.to_string_lossy().to_string(), target_size);
+
+    // Fast path: cache hit.
+    {
+        let cache = svg_cache().lock().ok()?;
+        if let Some(entry) = cache.entries.get(&key) {
+            return Some(entry.clone());
+        }
+    }
+
+    // Slow path: rasterise with resvg.
+    let svg_data = std::fs::read(path).ok()?;
+
+    let opt = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(&svg_data, &opt).ok()?;
+
+    let view_box = tree.size();
+    let scale_x = target_size as f32 / view_box.width();
+    let scale_y = target_size as f32 / view_box.height();
+    let scale = scale_x.min(scale_y);
+
+    let px_w = (view_box.width() * scale).ceil() as u32;
+    let px_h = (view_box.height() * scale).ceil() as u32;
+    let px_w = px_w.max(1);
+    let px_h = px_h.max(1);
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(px_w, px_h)?;
+
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // tiny-skia Pixmap stores premultiplied RGBA8 natively — perfect for Slint.
+    let bytes = pixmap.data().to_vec();
+
+    let result = (bytes, px_w, px_h);
+
+    // Store in cache.
+    if let Ok(mut cache) = svg_cache().lock() {
+        cache.entries.insert(key, result.clone());
+    }
+
+    Some(result)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -247,21 +337,28 @@ pub fn generic_app_icon() -> Option<PathBuf> {
 /// Load an icon from disk and return a Slint `Image`.  Falls back to a
 /// default (empty) image if the path is missing or loading fails.
 ///
-/// For SVG icons: first tries `slint::Image::load_from_path` (works if the
-/// Slint build includes the resvg backend); if that fails, looks for a sibling
-/// PNG at the same icon-theme path.  For raster icons the `image` crate is
-/// used directly.
+/// For SVG icons: rasterise at `DOCK_ICON_SIZE × DOCK_ICON_SIZE` using `resvg`
+/// (via the `rasterise_svg` helper which maintains a per-process cache).
+/// This path works correctly with Slint's `FemtoVG` backend which does NOT
+/// decode SVG natively.
+///
+/// For raster icons (PNG/JPEG/etc.): the `image` crate is used directly.
 pub fn load_icon(icon_path: &Path) -> slint::Image {
     let ext = icon_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     if ext == "svg" {
-        // Attempt Slint's own SVG loader (requires resvg support in the build).
-        match slint::Image::load_from_path(icon_path) {
-            Ok(img) => return img,
-            Err(_) => {
-                // Slint SVG failed — look for a PNG sibling at a raster size.
+        // Rasterise via resvg at the dock icon size.
+        match rasterise_svg(icon_path, DOCK_ICON_SIZE) {
+            Some((bytes, w, h)) => {
+                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                    &bytes, w, h,
+                );
+                debug!("SVG icon {:?} rasterised at {}×{}", icon_path, w, h);
+                return slint::Image::from_rgba8_premultiplied(buf);
+            }
+            None => {
+                // resvg failed — look for a PNG sibling at a raster size.
                 if let Some(icon_name) = icon_path.file_stem().and_then(|s| s.to_str()) {
-                    // Try common raster sizes as fallback.
                     for size in &["48x48/apps", "64x64/apps", "256x256/apps", "32x32/apps"] {
                         for root in &[
                             PathBuf::from("/usr/share/icons/hicolor"),
@@ -276,13 +373,11 @@ pub fn load_icon(icon_path: &Path) -> slint::Image {
                         }
                     }
                 }
-                debug!("SVG icon {:?} could not be loaded by Slint and no PNG fallback found", icon_path);
+                debug!("SVG icon {:?} could not be rasterised and no PNG fallback found", icon_path);
             }
         }
-    } else {
-        if let Some(img) = load_raster(icon_path) {
-            return img;
-        }
+    } else if let Some(img) = load_raster(icon_path) {
+        return img;
     }
 
     slint::Image::default()
