@@ -485,6 +485,14 @@ impl ChromeShader {
 
         let dynamic_offset = 0u32;
 
+        // Pass 1 (mask) doesn't sample any texture — `fs_shadow_mask` only
+        // emits the squircle silhouette — but the pipeline layout still
+        // requires a bound texture. Bind a *different* texture so wgpu
+        // doesn't see `mask_view` as both COLOR_TARGET (output) and
+        // RESOURCE (sampled) within the same render pass scope. We pick
+        // `vblur_view` since pass 1 doesn't read or write it.
+        let mask_bg_dummy = self.make_bind_group(device, &vblur_view);
+        // Pass 2 reads mask_view; pass 3 reads hblur_view.
         let mask_bg   = self.make_bind_group(device, &mask_view);
         let hblur_bg  = self.make_bind_group(device, &hblur_view);
 
@@ -511,8 +519,10 @@ impl ChromeShader {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.shadow_mask_pipeline);
-            // Use a dummy bind group for the scene texture binding (not sampled in mask pass).
-            pass.set_bind_group(0, &mask_bg, &[dynamic_offset]);
+            // mask_bg_dummy points at vblur_view (NOT mask_view) so wgpu
+            // doesn't see mask_view as both color attachment and sampled
+            // resource within the same pass scope.
+            pass.set_bind_group(0, &mask_bg_dummy, &[dynamic_offset]);
             pass.draw(0..6, 0..1);
         }
 
