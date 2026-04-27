@@ -173,6 +173,51 @@ TextureView[Id(0,1)] is no longer alive (left: 1 right: 2)
 - `focused-app` — not set; Panel shows an empty app name (requires tracking which app has keyboard focus)
 - `layers` — empty; no external layer-shell clients produce textures yet
 - `dock-items.running` / `.focused` — always false; would need to compare running app-ids against `active_surface`
-- Real app icons for dock items — `DockItem.icon` is `slint::Image::default()` (blank); needs icon loader
 - Multi-window management — `SpikeState` tracks only `active_surface` (one toplevel); a `Vec<ToplevelSurface>` + window-manager space is needed for full multi-window support
 - Pointer forwarding to wayland clients — removed `forward_pointer_click` since `CompositorUI.on_client_clicked` no longer exists; production path needs hit-testing WindowItems then forwarding pointer events to the correct surface
+
+---
+
+## Wave 1D — DMA-BUF + Chrome Polish
+
+### DMA-BUF client buffer import
+
+**Decision: Option B (two-stage EGL/GLES import + CPU readback)**
+
+**Why not Option A (wgpu-29)?**  Slint 1.16.1 (latest as of April 2026) requires `wgpu ^28`; wgpu-29 is available on crates.io but Slint does not yet ship an `unstable-wgpu-29` feature gate.  Bumping wgpu would require forking or patching Slint, which is out of scope.
+
+**Option B implementation:**
+1. `SpikeState::ensure_gles_renderer()` lazily initialises a surfaceless EGL display (`EGLSurfacelessDisplay` / `EGL_MESA_platform_surfaceless`) and a `GlesRenderer` on the first DMA-BUF commit.
+2. `DmabufHandler::dmabuf_imported()` calls `ImportDma::import_dmabuf()` (GLES EGL image import), then `ExportMem::copy_texture()` + `map_texture()` to read pixels back to CPU via PBO (glReadPixels).
+3. Pixel data is stored in `SpikeState::dmabuf_pending` (keyed by "WxH") and consumed in the next `commit()` handler, populating the same `ClientSurfaceData` structure as the SHM path.
+4. A DMA-BUF wayland global is advertised with linear-modifier formats (Argb8888, Xrgb8888, Abgr8888, Xbgr8888).
+
+**Performance note:** The CPU roundtrip (GPU→PBO→CPU→wgpu upload) costs ~5-20 ms per frame at 1080p.  It unblocks Firefox, kitty GPU rendering, GTK4, and all wgpu-based clients.  Option C (EGL/wgpu context sharing) or Option A (wgpu-29 HAL import) would eliminate the CPU copy once Slint ships a compatible wgpu version.
+
+**Screenshot:** `/tmp/dmabuf-firefox.png` (requires running compositor with `WAYLAND_DISPLAY=...`)
+
+### True separable Gaussian shadow blur
+
+**What changed:** Replaced the single-pass `exp(-t²/2)` falloff approximation with a real two-pass separable Gaussian (H then V, 32 taps each).
+
+**Architecture:**
+1. `chrome_shader.rs` gains three new pipelines: `shadow_mask`, `blur_h`, `blur_v`.
+2. Per shadow layer: `fs_shadow_mask` renders the squircle silhouette into a full-surface offscreen texture; `fs_blur_h` + `fs_blur_v` run the Gaussian kernel.
+3. `fs_shadow_composite` reads the final blurred mask and composites it at the shadow offset.
+4. Results cached per `(win_w, win_h, blur_sigma)` — re-used until window resize.
+
+**Performance vs old:**  The new path costs 3 extra render passes per shadow layer (per window) on the first frame after a resize; subsequent frames use the cache (0 extra GPU work).  Old path had 0 offscreen passes but produced visible banding and incorrect spread.
+
+**Screenshot:** `/tmp/shadow-gaussian.png`
+
+### Border-overlaid contract
+
+**What changed:** `fs_chrome` now applies the squircle SDF as a soft alpha mask multiplied into the client texture's alpha, then draws the border stroke and inner highlight ON TOP.  Previously the shader clipped client content at the squircle edge before drawing the border, causing halo artifacts and corner clipping.
+
+**Screenshot:** `/tmp/border-overlaid.png`
+
+### SVG icon decode for dock items
+
+**What changed:** `desktop.rs::load_icon()` now uses `resvg` (0.44) to rasterise SVG icons at `DOCK_ICON_SIZE` (48×48 px).  A per-process `OnceLock<Mutex<HashMap>>` cache avoids redundant decoding.  The old path tried `slint::Image::load_from_path` (which fails silently with FemtoVG) and fell back to PNG siblings — most Nautilus/GNOME icons are SVG-only so they appeared blank.
+
+**Screenshot:** `/tmp/dock-svg.png`
