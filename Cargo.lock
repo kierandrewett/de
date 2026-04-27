@@ -776,6 +776,7 @@ dependencies = [
  "image",
  "pollster",
  "raw-window-handle",
+ "resvg 0.44.0",
  "serde",
  "serde_json",
  "slint",

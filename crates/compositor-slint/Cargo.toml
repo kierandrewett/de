@@ -65,6 +65,15 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# SVG icon decode for dock items (resvg rasterises SVG → RGBA at any size).
+# Pulls in usvg + tiny-skia transitively.
+resvg = "0.44"
+
+# DMA-BUF two-stage import: smithay imports DMA-BUF via EGL/GLES, we read
+# pixels back to CPU and upload as a wgpu texture.  All EGL/GLES symbols come
+# from smithay's renderer_gl + backend_egl features (already enabled above).
+# drm-fourcc is re-exported by smithay's allocator module so no direct dep needed.
+
 [[bin]]
 name = "compositor-slint"
 path = "src/main.rs"

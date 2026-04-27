@@ -1030,6 +1030,29 @@ pub fn run() -> Result<()> {
     // 5. Compositor state + virtual output
     let mut state = SpikeState::new(display_handle.clone(), calloop.handle(), loop_signal.clone());
 
+    // Advertise DMA-BUF support to clients.  We advertise common 8-bit formats
+    // with the LINEAR modifier; the GLES renderer (surfaceless EGL) will accept
+    // any format that EGL/Mesa supports at runtime.  Clients that want
+    // non-linear (tiled/compressed) formats will fall back to SHM.
+    {
+        use smithay::backend::allocator::{Fourcc, Format, Modifier};
+
+        // DrmModifier::Linear == 0
+        let linear = Modifier::Linear;
+        let formats: Vec<Format> = vec![
+            Format { code: Fourcc::Argb8888, modifier: linear },
+            Format { code: Fourcc::Xrgb8888, modifier: linear },
+            Format { code: Fourcc::Abgr8888, modifier: linear },
+            Format { code: Fourcc::Xbgr8888, modifier: linear },
+        ];
+
+        let _dmabuf_global = state.dmabuf_state.create_global::<SpikeState>(
+            &display_handle,
+            formats,
+        );
+        info!("DMA-BUF global advertised (Option B: EGL/GLES two-stage import)");
+    }
+
     let output = Output::new(
         "slint-gpu-output".to_owned(),
         PhysicalProperties {

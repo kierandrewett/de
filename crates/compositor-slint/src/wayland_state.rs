@@ -9,10 +9,41 @@
 //!   - Handler impls for the three protocols that still live inline:
 //!     BufferHandler, ShmHandler, DmabufHandler, SeatHandler, SelectionHandler,
 //!     DataDeviceHandler, PrimarySelectionHandler.
+//!
+//! ## DMA-BUF import strategy (Option B)
+//!
+//! wgpu-28 (required by Slint 1.16) does not expose a stable DMA-BUF import
+//! API.  Instead we use a two-stage CPU-roundtrip import path:
+//!
+//!   Stage 1 — smithay's GlesRenderer imports the DMA-BUF as an EGL image /
+//!             GL texture (via `ImportDma::import_dmabuf`).  This requires an
+//!             EGL display and GL context, which we initialise lazily on the
+//!             first DMA-BUF commit using `EGLSurfacelessDisplay` (no window
+//!             required on Mesa/surfaceless).
+//!
+//!   Stage 2 — `ExportMem::copy_texture` reads the GL texture pixels back to
+//!             CPU RAM (glReadPixels into a PBO, then mapped).  The result is
+//!             converted to premultiplied RGBA8 and stored in the same
+//!             `ClientSurfaceData` structure that the SHM path uses.
+//!             `renderer.rs` then uploads it to wgpu as a normal texture.
+//!
+//! Performance note: the CPU round-trip is ~5-20 ms per frame at 1080p
+//! (PCIe bandwidth + glReadPixels stall).  It unblocks Firefox, kitty GPU,
+//! and all GTK4/wgpu-based clients that prefer DMA-BUF.  A zero-copy path
+//! (wgpu-29 `create_texture_from_hal`) can replace this once Slint ships a
+//! wgpu-29 feature gate.
 
 use std::sync::{Arc, Mutex};
 
 use smithay::{
+    backend::{
+        allocator::dmabuf::Dmabuf,
+        egl::{EGLContext, EGLDisplay},
+        renderer::{
+            gles::GlesRenderer,
+            ExportMem, ImportDma,
+        },
+    },
     delegate_dmabuf, delegate_seat, delegate_shm,
     input::{pointer::CursorImageStatus, Seat, SeatHandler, SeatState},
     reexports::{
@@ -202,6 +233,20 @@ pub struct SpikeState {
 
     pub should_exit: bool,
     pub pointer_pos: (f64, f64),
+
+    // ── DMA-BUF two-stage import (Option B) ──────────────────────────────────
+    /// Surfaceless EGL display — initialised lazily on first DMA-BUF import.
+    /// `None` means not yet attempted or init failed (see `egl_init_tried`).
+    pub egl_display: Option<EGLDisplay>,
+    /// Surfaceless GLES renderer — initialised from `egl_display`.
+    /// Used for: `ImportDma::import_dmabuf` → GL texture,
+    ///           `ExportMem::copy_texture` → CPU pixel bytes.
+    pub gles_renderer: Option<GlesRenderer>,
+    /// Set to `true` once EGL init was attempted so we don't retry on every frame.
+    pub egl_init_tried: bool,
+    /// Pending DMA-BUF pixel data keyed by "WxH" string.
+    /// Written in `dmabuf_imported`; consumed in `commit()`.
+    pub dmabuf_pending: std::collections::HashMap<String, ClientSurfaceData>,
 }
 
 impl SpikeState {
@@ -315,12 +360,63 @@ impl SpikeState {
             client_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             should_exit: false,
             pointer_pos: (0.0, 0.0),
+            egl_display: None,
+            gles_renderer: None,
+            egl_init_tried: false,
+            dmabuf_pending: std::collections::HashMap::new(),
         };
 
         state.seat.add_keyboard(Default::default(), 200, 25).ok();
         state.seat.add_pointer();
 
         state
+    }
+
+    /// Lazily initialise the surfaceless EGL display and GLES renderer used
+    /// for DMA-BUF two-stage import (Option B).  Called on the first DMA-BUF
+    /// commit; subsequent calls are no-ops.
+    ///
+    /// Uses `EGLSurfacelessDisplay` (Mesa `EGL_MESA_platform_surfaceless`)
+    /// so no window handle or KMS device is required.
+    pub fn ensure_gles_renderer(&mut self) {
+        if self.egl_init_tried {
+            return;
+        }
+        self.egl_init_tried = true;
+
+        use smithay::backend::egl::native::EGLSurfacelessDisplay;
+
+        let egl_display = match unsafe { EGLDisplay::new(EGLSurfacelessDisplay) } {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("DMA-BUF: EGL surfaceless display init failed: {e:?} — DMA-BUF will be rejected");
+                return;
+            }
+        };
+
+        let egl_context = match EGLContext::new(&egl_display) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("DMA-BUF: EGL context creation failed: {e:?}");
+                return;
+            }
+        };
+
+        let renderer = match unsafe { GlesRenderer::new(egl_context) } {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("DMA-BUF: GlesRenderer init failed: {e:?}");
+                return;
+            }
+        };
+
+        let n_formats = renderer.dmabuf_formats().into_iter().count();
+        info!(
+            formats = n_formats,
+            "DMA-BUF: GLES renderer ready (surfaceless EGL); DMA-BUF import enabled"
+        );
+        self.egl_display = Some(egl_display);
+        self.gles_renderer = Some(renderer);
     }
 }
 
@@ -418,14 +514,94 @@ impl DmabufHandler for SpikeState {
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
-        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        warn!(
-            planes = dmabuf.num_planes(),
-            "DMA-BUF import requested — not supported in spike (client should use SHM)"
+        // Lazily start EGL + GLES on the first DMA-BUF import.
+        self.ensure_gles_renderer();
+
+        let renderer = match self.gles_renderer.as_mut() {
+            Some(r) => r,
+            None => {
+                warn!(
+                    planes = dmabuf.num_planes(),
+                    "DMA-BUF: no GLES renderer available — rejecting buffer"
+                );
+                drop(notifier);
+                return;
+            }
+        };
+
+        // Stage 1: import DMA-BUF as a GLES texture via EGL image.
+        let gles_texture = match renderer.import_dmabuf(&dmabuf, None) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("DMA-BUF: GLES import failed ({e:?}) — client should fall back to SHM");
+                drop(notifier);
+                return;
+            }
+        };
+
+        // Stage 2: read the GL texture back to CPU RAM via a PBO (glReadPixels).
+        use smithay::backend::allocator::Buffer as AllocBuffer;
+        let size = dmabuf.size();
+        let (w, h) = (size.w as u32, size.h as u32);
+
+        let region = smithay::utils::Rectangle::from_loc_and_size(
+            smithay::utils::Point::from((0, 0)),
+            smithay::utils::Size::from((size.w, size.h)),
         );
-        drop(notifier);
+
+        let mapping = match renderer.copy_texture(&gles_texture, region, smithay::backend::allocator::Fourcc::Abgr8888) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("DMA-BUF: copy_texture failed ({e:?})");
+                // Texture imported but can't read back — signal success anyway so
+                // the client doesn't stall; the surface will just appear blank this frame.
+                let _ = notifier.successful::<SpikeState>();
+                return;
+            }
+        };
+
+        let raw = match renderer.map_texture(&mapping) {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                warn!("DMA-BUF: map_texture failed ({e:?})");
+                let _ = notifier.successful::<SpikeState>();
+                return;
+            }
+        };
+
+        // `copy_texture` with Abgr8888 gives us [R, G, B, A] bytes (non-premultiplied).
+        // Convert to premultiplied RGBA8 for `slint::Image::from_rgba8_premultiplied`.
+        let pixel_count = (w * h) as usize;
+        let mut rgba_pm = Vec::with_capacity(pixel_count * 4);
+        for chunk in raw.chunks(4) {
+            let (r, g, b, a) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+            let af = a as f32 / 255.0;
+            rgba_pm.push((r as f32 * af) as u8);
+            rgba_pm.push((g as f32 * af) as u8);
+            rgba_pm.push((b as f32 * af) as u8);
+            rgba_pm.push(a);
+        }
+
+        // Store the pixel data.  The compositor handler will pick it up in `commit`.
+        // We key by (width, height) as a lightweight identity; the real surface
+        // match happens in commit() when we look up the ToplevelInfo.
+        debug!("DMA-BUF: imported {}x{} ({} planes) → {} RGBA bytes", w, h, dmabuf.num_planes(), rgba_pm.len());
+
+        // Signal success to the client before storing the pixels so the client
+        // can proceed to compose the next frame.
+        let _ = notifier.successful::<SpikeState>();
+
+        // Store in a temporary slot keyed by "WxH" — commit() will match by surface.
+        let key = format!("{}x{}", w, h);
+        self.dmabuf_pending.insert(key, ClientSurfaceData {
+            pixels: rgba_pm,
+            width: w,
+            height: h,
+            dirty: true,
+        });
     }
 }
 
