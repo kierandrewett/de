@@ -9,8 +9,15 @@
 //!       * GPU rendering via `FemtoVGWGPURenderer` (wgpu-28) — see `renderer.rs`
 //!   - Each frame: Slint renders to a wgpu texture, blitted to the winit swapchain
 //!   - Client SHM buffers are uploaded as wgpu textures each commit
-//!   - DMA-BUF client buffers are documented as a follow-up (wgpu-28 lacks a
-//!     stable HAL DMA-BUF import path; tracked in SPIKE_LOG.md).
+//!   - DMA-BUF client buffers: Option B two-stage import (EGL/GLES → CPU → wgpu).
+//!     Enables Firefox, GTK4, kitty GPU, and wgpu-based clients.
+//!     See SPIKE_LOG.md "Wave 1D" for the full option comparison.
+//!
+//! Wave 1D additions:
+//!   - DMA-BUF Option B import (wayland_state.rs)
+//!   - True separable Gaussian shadow blur (chrome.wgsl, chrome_shader.rs)
+//!   - Border-overlaid chrome contract (chrome.wgsl)
+//!   - SVG icon decode via resvg (desktop.rs)
 //!
 //! This is the seed of the production compositor; the iced-based
 //! `crates/compositor` is being phased out.
