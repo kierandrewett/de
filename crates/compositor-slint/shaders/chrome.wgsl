@@ -9,6 +9,22 @@
 // a uniform buffer.  The shader is invoked once per window in a `for`
 // loop on the CPU side; each invocation re-binds the uniform buffer
 // with the current window's parameters.
+//
+// ── Four-state palette ────────────────────────────────────────────────────────
+//
+// `mode_t`  (0=dark,     1=light)
+// `focus_t` (0=inactive, 1=active)
+//
+// Values are lerped between the four WINDOW_SPEC states:
+//
+//   dark_active:   outer a=0.72 / highlight_top a=0.08 / shadow 3 layers
+//   dark_inactive: outer a=0.55 / highlight_top a=0.04 / shadow 2 layers
+//   light_active:  outer a=0.22 / highlight_top a=0.50 / shadow 3 layers
+//   light_inactive:outer a=0.15 / highlight_top a=0.25 / shadow 2 layers
+//
+// Each component is lerped: dark_val + mode_t*(light_val - dark_val)
+//                           inactive_val + focus_t*(active_val - inactive_val)
+// i.e. bilinear blend over the (mode_t, focus_t) unit square.
 
 // ── Structs ──────────────────────────────────────────────────────────────────
 
@@ -24,24 +40,19 @@ struct ChromeUniforms {
     // Style parameters.
     radius_px:  f32,     // outer corner radius (14 px)
     smoothing:  f32,     // squircle smoothing  (0.6)
-    // Outer stroke colour (rgba, premultiplied NOT required — we blend manually)
-    stroke_r:   f32,
-    stroke_g:   f32,
-    stroke_b:   f32,
-    stroke_a:   f32,
-    // Inner highlight top colour alpha (bottom is always 0)
-    highlight_a: f32,
-    // 1 = active, 0 = inactive (controls highlight intensity)
-    is_active:  f32,
-    // Shadow colour alpha for this layer
+    // Theme crossfade parameters (0→1 animated by Rust).
+    mode_t:     f32,     // 0 = dark, 1 = light
+    focus_t:    f32,     // 0 = inactive, 1 = active
+    // Shadow colour alpha for this layer (shadow pass only).
     shadow_a:   f32,
-    // Shadow Y offset in physical pixels
+    // Shadow Y offset in physical pixels (shadow pass only).
     shadow_oy:  f32,
-    // Shadow X offset in physical pixels
+    // Shadow X offset in physical pixels (shadow pass only).
     shadow_ox:  f32,
+    // blur_sigma is repurposed into this slot for shadow pass.
+    blur_sigma: f32,
     _pad0:      f32,
     _pad1:      f32,
-    _pad2:      f32,
 }
 
 @group(0) @binding(0) var<uniform> u: ChromeUniforms;
@@ -103,11 +114,35 @@ fn squircle_sdf(pos: vec2<f32>, half_size: vec2<f32>, radius: f32, smoothing: f3
     return mix(arc_dist, reach_dist * (radius / max(reach, 0.001)), blend * smoothing);
 }
 
+// ── Four-state colour helpers ─────────────────────────────────────────────────
+//
+// Bilinear blend over (mode_t, focus_t):
+//   dark_inactive (0,0)  dark_active (0,1)
+//   light_inactive(1,0)  light_active(1,1)
+
+// Returns the outer stroke alpha, lerped across all four states.
+fn outer_stroke_alpha(mode_t: f32, focus_t: f32) -> f32 {
+    // dark:  inactive=0.55, active=0.72
+    // light: inactive=0.15, active=0.22
+    let dark_a  = mix(0.55, 0.72, focus_t);
+    let light_a = mix(0.15, 0.22, focus_t);
+    return mix(dark_a, light_a, mode_t);
+}
+
+// Returns the inner highlight top-edge alpha, lerped across all four states.
+fn highlight_top_alpha(mode_t: f32, focus_t: f32) -> f32 {
+    // dark:  inactive=0.04, active=0.08
+    // light: inactive=0.25, active=0.50
+    let dark_a  = mix(0.04, 0.08, focus_t);
+    let light_a = mix(0.25, 0.50, focus_t);
+    return mix(dark_a, light_a, mode_t);
+}
+
 // ── Chrome fragment stage ─────────────────────────────────────────────────────
 //
 // Composites over whatever is already in the render target:
 //   1. Clips the Slint scene texture to the squircle.
-//   2. Draws a 0.5 px outer stroke (stroke_rgba) just inside the edge.
+//   2. Draws a 0.5 px outer stroke (lerped alpha, black colour).
 //   3. Draws a 1 px inner highlight with alpha modulated by vertical gradient.
 
 @fragment
@@ -139,11 +174,12 @@ fn fs_chrome(in: VertexOut) -> @location(0) vec4<f32> {
     // The window content, clipped.
     var colour = scene_col * clip_alpha;
 
-    // ── 2. Outer stroke (0.5 px, stroke_rgba) ─────────────────────────────────
+    // ── 2. Outer stroke (0.5 px, black with mode/focus-lerped alpha) ───────────
     // The stroke sits just inside (d < 0) the squircle edge.
     // stroke_alpha peaks at d == -0.25 (centre of 0.5 px stroke).
-    let stroke_alpha = smoothstep(-1.0, 0.0, d) * (1.0 - smoothstep(-0.5, 0.5, d));
-    let stroke_col   = vec4<f32>(u.stroke_r, u.stroke_g, u.stroke_b, u.stroke_a * stroke_alpha);
+    let stroke_a_base = outer_stroke_alpha(u.mode_t, u.focus_t);
+    let stroke_alpha  = smoothstep(-1.0, 0.0, d) * (1.0 - smoothstep(-0.5, 0.5, d));
+    let stroke_col    = vec4<f32>(0.0, 0.0, 0.0, stroke_a_base * stroke_alpha);
 
     // Porter-Duff src-over: stroke over clipped content.
     colour = stroke_col + colour * (1.0 - stroke_col.a);
@@ -156,7 +192,8 @@ fn fs_chrome(in: VertexOut) -> @location(0) vec4<f32> {
     let y_norm = (frag_px.y - u.win_y) / u.win_h;
     let grad   = clamp(1.0 - y_norm * 1.5, 0.0, 1.0);
 
-    let hl_a = u.highlight_a * highlight_stripe * grad;
+    let hl_top_a = highlight_top_alpha(u.mode_t, u.focus_t);
+    let hl_a     = hl_top_a * highlight_stripe * grad;
     // Premultiply before src-over: hl_rgb * hl_a so the formula works correctly
     // even when hl_a = 0 (avoids adding (1,1,1) to the output).
     let hl_col_pm = vec4<f32>(hl_a, hl_a, hl_a, hl_a); // white premultiplied
@@ -174,30 +211,17 @@ fn fs_chrome(in: VertexOut) -> @location(0) vec4<f32> {
 //
 // The shadow shape is the squircle silhouette shifted by shadow_ox/oy,
 // blurred with an exponential falloff that approximates Gaussian spread.
-// The blur width is passed via u.radius_px (repurposed as blur_sigma for
-// this pass).  The actual corner radius remains u.smoothing for reuse.
+// The blur width is passed via u.blur_sigma.
+// The actual corner radius is always 14 px (outer window corner).
+// Note: same shadow layers for both light and dark modes per WINDOW_SPEC.
 
 @fragment
 fn fs_shadow(in: VertexOut) -> @location(0) vec4<f32> {
     let frag_px = in.uv * vec2<f32>(u.surface_w, u.surface_h);
 
-    // Shadow parameters from uniforms:
-    //   win bounds (win_x, win_y, win_w, win_h) describe the WINDOW, not shadow.
-    //   shadow_ox/oy is the shadow offset.
-    //   radius_px is used as the CORNER radius of the window shape (14 px).
-    //   shadow_a   is the shadow layer alpha.
-    //   smoothing  is the squircle smoothing (0.6).
-    //
-    // We evaluate the squircle SDF at the shadow-offset fragment position,
-    // then apply an exponential falloff proportional to the blur radius stored
-    // in u.highlight_a (we repurpose it as blur_sigma for the shadow pass;
-    // see chrome_shader.rs where the uniform is constructed).
-
-    let blur_sigma = u.highlight_a; // repurposed field for shadow pass
-
     // Early discard: fragments more than 3×blur_sigma away from the shadow bounding
     // box will have negligible alpha (exp(-9/2) ≈ 0.01).
-    let shadow_slack = blur_sigma * 3.0 + 20.0;
+    let shadow_slack = u.blur_sigma * 3.0 + 20.0;
     if frag_px.x < (u.win_x - shadow_slack + u.shadow_ox) ||
        frag_px.x > (u.win_x + u.win_w + shadow_slack + u.shadow_ox) ||
        frag_px.y < (u.win_y - shadow_slack + u.shadow_oy) ||
@@ -224,7 +248,7 @@ fn fs_shadow(in: VertexOut) -> @location(0) vec4<f32> {
         shadow_coverage = 1.0;
     } else {
         // Approximation: faster falloff than true Gaussian but visually close.
-        let t = d / max(blur_sigma, 0.001);
+        let t = d / max(u.blur_sigma, 0.001);
         shadow_coverage = exp(-t * t * 0.5);
     }
 

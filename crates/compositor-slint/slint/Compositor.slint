@@ -12,6 +12,7 @@
 //   in property <string>        clock-text
 //   in property <image>         wallpaper
 //   in property <[DockItem]>    dock-items
+//   in property <TokenMode>     theme-mode — set from Rust to switch light/dark
 //   Callbacks: close-window, minimize-window, maximize-window,
 //              activate-window, launch-app
 //
@@ -23,7 +24,7 @@
 //   40 — dock
 //   50 — panel
 
-import { Tokens } from "./Tokens.slint";
+import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { Wallpaper } from "./Wallpaper.slint";
 import { Panel } from "./Panel.slint";
 import { Dock, DockItem } from "./Dock.slint";
@@ -63,6 +64,8 @@ export struct LayerItem {
 
 // Re-export DockItem so importers of Compositor.slint can use it directly.
 export { DockItem }
+// Re-export TokenMode for Rust bindings.
+export { TokenMode }
 
 // ── Top-level Compositor component ───────────────────────────────────────────
 export component Compositor inherits Window {
@@ -73,6 +76,8 @@ export component Compositor inherits Window {
     in property <string>        clock-text: "00:00";
     in property <image>         wallpaper;
     in property <[DockItem]>    dock-items;
+    // Theme mode — Rust writes this; Theme global reads it.
+    in property <TokenMode>     theme-mode: TokenMode.Dark;
 
     // ── Callbacks (Slint → Rust) ───────────────────────────────────────────────
     callback close-window(int);
@@ -92,6 +97,14 @@ export component Compositor inherits Window {
     preferred-height: 1080px;
     background: transparent;
     no-frame: true;
+
+    // ── Theme mode binding ────────────────────────────────────────────────────
+    // Rust calls ui.set_theme_mode(TokenMode::Light) which sets this property.
+    // We watch changes to theme-mode and forward them to Theme.mode so all
+    // components that reference Theme.mode pick up the new value and animate.
+    // This uses a property-change reactive binding via the changed pseudoevent.
+    changed theme-mode => { Theme.mode = root.theme-mode; }
+
 
     // ── Layer 0: Wallpaper ────────────────────────────────────────────────────
     Wallpaper {

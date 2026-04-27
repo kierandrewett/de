@@ -1,19 +1,19 @@
 // Panel.slint — Top-of-screen shell panel.
 // Layout: [Focused App]  [——— Clock ———]  [Network | Audio | Power | CC▼]
-// Matches WINDOW_SPEC dark-active chrome colours: #111318 bg, 0.5px bottom border,
-// rgba(255,255,255,0.8) text, Inter Variable 13 px.
+// Colours are drawn from Theme global so they animate on light/dark mode switch.
 // Height: 34 px.  Full-width, flush to top.
+//
+// Animation strategy:
+//   Locally-resolved colour properties watch Theme.mode and carry 200 ms
+//   ease-in-out animate blocks so the panel crossfades on mode change.
 
-import { Tokens } from "./Tokens.slint";
+import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { StatusIcon } from "./widgets/StatusIcon.slint";
 
 export component Panel {
     // ── Inbound properties ───────────────────────────────────────────────────
-    // Name of the currently focused application (Rust feeds this).
     in property <string> focused-app: "";
-    // Clock string — Rust feeds "HH:MM:SS" every second.
     in property <string> clock-text: "00:00";
-    // Optional status icon images (Rust feeds real symbols when available).
     in property <image>  icon-network;
     in property <image>  icon-audio;
     in property <image>  icon-power;
@@ -26,19 +26,32 @@ export component Panel {
     width: 100%;
     height: Tokens.panel-height;
 
-    // Bar background — full-width, flush to top of screen.
+    // ── Locally-resolved colours (animated) ───────────────────────────────────
+    property <color> resolved-bg:           Theme.panel-bg;
+    property <color> resolved-fg:           Theme.panel-fg;
+    property <color> resolved-border:       Theme.panel-border-bottom;
+    property <color> resolved-hover-bg: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.08)
+        : rgba(0, 0, 0, 0.06);
+
+    animate resolved-bg       { duration: 200ms; easing: ease-in-out; }
+    animate resolved-fg       { duration: 200ms; easing: ease-in-out; }
+    animate resolved-border   { duration: 200ms; easing: ease-in-out; }
+    animate resolved-hover-bg { duration: 200ms; easing: ease-in-out; }
+
+    // Bar background.
     bar := Rectangle {
         width: parent.width;
         height: parent.height;
-        background: Tokens.panel-bg;
+        background: root.resolved-bg;
 
-        // 0.5 px bottom border (approximate with 1px at 50% opacity).
+        // 0.5 px bottom border.
         bottom-border := Rectangle {
             x: 0;
             y: parent.height - 1px;
             width: parent.width;
             height: 1px;
-            background: Tokens.panel-border-bottom;
+            background: root.resolved-border;
         }
 
         // ── Left zone: focused application name ──────────────────────────────
@@ -54,10 +67,10 @@ export component Panel {
                 width: parent.width - 14px;
                 height: parent.height;
                 text: root.focused-app;
-                color: Tokens.panel-fg;
+                color: root.resolved-fg;
                 font-family: Tokens.font-family;
                 font-size: Tokens.panel-font-size;
-                font-weight: 500;   // Medium
+                font-weight: 500;
                 vertical-alignment: center;
                 overflow: elide;
             }
@@ -82,7 +95,7 @@ export component Panel {
                 height: parent.height;
                 border-radius: 6px;
                 background: clock-touch.has-hover
-                    ? rgba(255, 255, 255, 0.08)
+                    ? root.resolved-hover-bg
                     : transparent;
                 animate background { duration: 100ms; easing: ease-out; }
             }
@@ -91,7 +104,7 @@ export component Panel {
                 width: parent.width;
                 height: parent.height;
                 text: root.clock-text;
-                color: Tokens.panel-fg;
+                color: root.resolved-fg;
                 font-family: Tokens.font-family;
                 font-size: Tokens.panel-font-size;
                 font-weight: 500;
@@ -119,17 +132,15 @@ export component Panel {
                 height: parent.height;
                 border-radius: 6px;
                 background: cc-touch.has-hover
-                    ? rgba(255, 255, 255, 0.08)
+                    ? root.resolved-hover-bg
                     : transparent;
                 animate background { duration: 100ms; easing: ease-out; }
             }
 
             // Icons row — right-aligned inside the zone.
             icons-row := Rectangle {
-                // Right-align the row with a 14 px margin.
                 x: parent.width - self.width - 14px;
                 y: (parent.height - self.height) / 2;
-                // Width = 3 icons × 16px + 2 gaps × 8px = 64px.
                 width: 3 * 16px + 2 * 8px;
                 height: 16px;
 
@@ -138,7 +149,7 @@ export component Panel {
                     y: 0;
                     icon: root.icon-network;
                     name: "network";
-                    tint: Tokens.panel-fg;
+                    tint: root.resolved-fg;
                 }
 
                 StatusIcon {
@@ -146,7 +157,7 @@ export component Panel {
                     y: 0;
                     icon: root.icon-audio;
                     name: "audio";
-                    tint: Tokens.panel-fg;
+                    tint: root.resolved-fg;
                 }
 
                 StatusIcon {
@@ -154,7 +165,7 @@ export component Panel {
                     y: 0;
                     icon: root.icon-power;
                     name: "power";
-                    tint: Tokens.panel-fg;
+                    tint: root.resolved-fg;
                 }
             }
         }

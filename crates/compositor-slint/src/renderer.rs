@@ -65,9 +65,10 @@ use crate::{
     chrome_shader::{ChromeShader, WindowChromeParams},
     desktop,
     platform::{CalloopPlatform, GpuWindowAdapter},
+    theme::{ThemeMode, ThemeState},
     wallpaper,
     wayland_state::{ClientState, SpikeState},
-    Compositor, DockItem,
+    Compositor, DockItem, TokenMode,
 };
 
 const WIDTH: u32 = 1280;
@@ -194,6 +195,9 @@ struct CompositorApp {
     // Initialised lazily in resumed() once the swapchain format is known.
     chrome_shader: Option<ChromeShader>,
 
+    // Theme state — mode_t / per-window focus_t animations.
+    theme: ThemeState,
+
     pointer_pos: (f64, f64),
     start_time: Instant,
     last_clock_update: Instant,
@@ -201,6 +205,9 @@ struct CompositorApp {
     /// Pending pointer events — queued in window_event(), processed in the main loop.
     pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
     frame_count: u64,
+
+    // Hotkey state — Super key held tracking for Super+T theme toggle.
+    super_held: bool,
 
     // Dock state.
     dock_entries: Vec<ResolvedDockEntry>,
@@ -226,6 +233,8 @@ impl CompositorApp {
             window_ref,
             ui: Some(ui),
             chrome_shader: None,
+            theme: ThemeState::new(),
+            super_held: false,
             pointer_pos: (0.0, 0.0),
             start_time: Instant::now(),
             last_clock_update: Instant::now(),
@@ -402,10 +411,27 @@ impl ApplicationHandler for CompositorApp {
 
             WindowEvent::KeyboardInput { event: key_event, .. } => {
                 let scancode = key_event.physical_key.to_scancode().unwrap_or(0);
+                let pressed = key_event.state == ElementState::Pressed;
+
+                // ── Super+T → toggle light/dark theme ─────────────────────
+                // Scancode 125 = KEY_LEFTMETA (Super/Win key)
+                // Scancode 126 = KEY_RIGHTMETA
+                // Scancode 20  = KEY_T
+                match scancode {
+                    125 | 126 => { self.super_held = pressed; }
+                    20 if pressed && self.super_held => {
+                        // Toggle theme mode and update Slint global.
+                        self.theme.toggle_mode();
+                        self.apply_theme_to_slint();
+                        debug!("Super+T: toggled theme to {:?}", self.theme.current_mode);
+                    }
+                    _ => {}
+                }
+
                 if scancode > 0 {
                     self.pending_keys.lock().unwrap().push_back(PendingKeyEvent {
                         scancode,
-                        pressed: key_event.state == ElementState::Pressed,
+                        pressed,
                     });
                 }
             }
@@ -500,15 +526,19 @@ impl CompositorApp {
                 let chrome_windows: Vec<WindowChromeParams> = if let Some(ui) = self.ui.as_ref() {
                     let model = ui.get_windows();
                     let len = model.row_count();
+                    let mode_t = self.theme.mode_t;
                     (0..len)
                         .map(|i| {
                             let item = model.row_data(i).unwrap();
+                            let focus_t = self.theme.window_focus_t(item.id);
                             WindowChromeParams {
                                 x: item.x as f32,
                                 y: item.y as f32,
                                 w: item.w as f32,
                                 h: item.h as f32,
                                 active: item.focused,
+                                focus_t,
+                                mode_t,
                             }
                         })
                         .collect()
@@ -574,9 +604,13 @@ impl CompositorApp {
             .unwrap_or_else(|| "Window".to_string());
 
             let focused = active_surface.as_ref().map(|s| s == &toplevel.surface).unwrap_or(false);
+            let window_id = (idx + 1) as i32;
+
+            // Update per-window focus animation target.
+            self.theme.set_window_focused(window_id, focused);
 
             items.push(crate::WindowItem {
-                id: (idx + 1) as i32,
+                id: window_id,
                 title: SharedString::from(title),
                 x: toplevel.x,
                 y: toplevel.y,
@@ -775,6 +809,24 @@ impl CompositorApp {
         let model = std::rc::Rc::new(VecModel::from(items));
         ui.set_dock_items(slint::ModelRc::from(model));
         debug!("dock running state updated, focused={:?}", focused_app_id);
+    }
+
+    /// Push the current theme mode to the Slint `Theme` global, so all components
+    /// that reference `Theme.mode` pick up the new value and begin their Slint
+    /// `animate` crossfades simultaneously.
+    ///
+    /// This is called:
+    ///   - On Super+T press (immediate toggle).
+    ///   - Each frame during a theme animation so Slint's animate blocks are kept
+    ///     in sync with the Rust-side mode_t tween.
+    pub fn apply_theme_to_slint(&self) {
+        if let Some(ui) = self.ui.as_ref() {
+            let token_mode = match self.theme.current_mode {
+                ThemeMode::Dark  => TokenMode::Dark,
+                ThemeMode::Light => TokenMode::Light,
+            };
+            ui.set_theme_mode(token_mode);
+        }
     }
 }
 
@@ -1080,6 +1132,18 @@ pub fn run() -> Result<()> {
         slint::platform::update_timers_and_animations();
         app.update_client_texture(&mut state);
         app.update_dock_running(&state);
+
+        // Theme tick — advance mode_t and per-window focus_t animations.
+        // If any animation is running, apply the current mode to Slint so it
+        // also triggers its own animate blocks (redundant but harmless) and
+        // marks the GPU adapter dirty for a new frame.
+        let theme_animating = app.theme.tick();
+        if theme_animating {
+            app.apply_theme_to_slint();
+            if let Some(gpu_window) = app.gpu_window.as_ref() {
+                gpu_window.mark_dirty();
+            }
+        }
 
         // D3 — forward keyboard events.
         {

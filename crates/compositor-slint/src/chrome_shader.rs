@@ -15,12 +15,20 @@
 //!
 //!   **Pass B — Chrome** (`fs_chrome` entry point in `chrome.wgsl`)
 //!     Reads `render_texture` (Slint scene), clips each window to the squircle
-//!     SDF, draws the 0.5 px outer stroke, and draws the 1 px inner highlight
-//!     gradient.  Output replaces the circular-arc corners that Slint drew.
+//!     SDF, draws the 0.5 px outer stroke (alpha lerped via mode_t/focus_t),
+//!     and draws the 1 px inner highlight gradient (same lerp).
+//!     Output replaces the circular-arc corners that Slint drew.
 //!
-//! The final composite order is:
-//!   shadow_texture   (drawn with additive-over into the swapchain destination)
-//!   chrome output    (drawn with src-over into the swapchain destination)
+//! # Theme crossfade uniforms
+//!
+//! `mode_t`  (0=dark, 1=light)  — set by `set_mode_t`, animated by `src/theme.rs`
+//! `focus_t` (0=inactive, 1=active) — per-window, animated by `src/theme.rs`
+//!
+//! The shader lerps between the four state palettes from WINDOW_SPEC:
+//!   dark_active:    outer 0.72 / highlight_top 0.08
+//!   dark_inactive:  outer 0.55 / highlight_top 0.04
+//!   light_active:   outer 0.22 / highlight_top 0.50
+//!   light_inactive: outer 0.15 / highlight_top 0.25
 //!
 //! # Render-texture usage flag contract
 //!
@@ -28,14 +36,6 @@
 //!   `RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`
 //! The extra `TEXTURE_BINDING` flag is added in `renderer.rs` so the chrome
 //! shader can sample the Slint scene.
-//!
-//! # Why not touch `slint/`?
-//!
-//! The Slint `WindowChrome.slint` uses `border-radius: Tokens.window-corner-radius-outer`
-//! (14 px circular arc) as a *hit-testing placeholder* only.  It is still rendered
-//! into `render_texture`, but our shader masks the circular corners with the
-//! squircle SDF, making the window visually correct.  The Slint `background` and
-//! `border-width` in the `.slint` files become invisible below the shader output.
 //!
 //! # Uniform buffer strategy
 //!
@@ -62,42 +62,41 @@ pub struct WindowChromeParams {
     pub h: f32,
     /// True = active/focused window.
     pub active: bool,
+    /// Per-window focus crossfade: 0.0 = inactive, 1.0 = active (animated).
+    pub focus_t: f32,
+    /// Global mode crossfade: 0.0 = dark, 1.0 = light (animated).
+    pub mode_t: f32,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // GPU uniform layout (must match `ChromeUniforms` struct in chrome.wgsl exactly)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// 80-byte uniform block — repr(C), padded to 80 bytes (multiple of 16).
+/// 64-byte uniform block — repr(C), padded to 64 bytes (multiple of 16).
 /// wgpu dynamic-offset alignment is 256 bytes, so we allocate 256 bytes per
-/// draw call in the dynamic buffer but only the first 80 bytes carry data.
+/// draw call in the dynamic buffer but only the first 64 bytes carry data.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ChromeUniforms {
-    win_x: f32,
-    win_y: f32,
-    win_w: f32,
-    win_h: f32,      // 16
+    win_x:      f32,
+    win_y:      f32,
+    win_w:      f32,
+    win_h:      f32,      // 16
 
-    surface_w: f32,
-    surface_h: f32,
-    radius_px: f32,
-    smoothing: f32,  // 32
+    surface_w:  f32,
+    surface_h:  f32,
+    radius_px:  f32,
+    smoothing:  f32,      // 32
 
-    stroke_r: f32,
-    stroke_g: f32,
-    stroke_b: f32,
-    stroke_a: f32,   // 48
+    mode_t:     f32,
+    focus_t:    f32,
+    shadow_a:   f32,
+    shadow_oy:  f32,      // 48
 
-    highlight_a: f32,
-    is_active: f32,
-    shadow_a: f32,
-    shadow_oy: f32,  // 64
-
-    shadow_ox: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,      // 80
+    shadow_ox:  f32,
+    blur_sigma: f32,
+    _pad0:      f32,
+    _pad1:      f32,      // 64
 }
 
 const UNIFORM_STRUCT_SIZE: usize = std::mem::size_of::<ChromeUniforms>();
@@ -353,7 +352,9 @@ impl ChromeShader {
     ///
     /// `render_texture` is the Slint offscreen texture (MUST have TEXTURE_BINDING).
     /// `output_view` is the swapchain frame view to draw into.
-    /// `windows` is the list of windows to process.
+    /// `windows` is the list of windows to process, each carrying:
+    ///   - `focus_t`: animated 0→1 when window is focused, 1→0 when unfocused.
+    ///   - `mode_t`:  animated 0→1 on dark→light switch, 1→0 on light→dark switch.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -383,62 +384,69 @@ impl ChromeShader {
         let mut raw_uniforms: Vec<ChromeUniforms> = Vec::new();
 
         // Shadows: back-to-front per window, widest blur first.
+        // We use focus_t to decide how many shadow layers to draw (lerp between
+        // 2-layer inactive and 3-layer active by always drawing 3 but scaling
+        // the third layer's alpha by focus_t).
         for win in windows.iter().rev() {
-            let layers = if win.active { active_shadow_layers() } else { inactive_shadow_layers() };
-            for layer in layers.iter().rev() {
+            // Always draw 3 layers; layer 3 (wide ambient) has its alpha scaled
+            // by focus_t so it fades in as the window gains focus.
+            let active_layers = active_shadow_layers();
+            let inactive_layers = inactive_shadow_layers();
+
+            // Layer 1 & 2: lerp alpha between inactive and active values.
+            for layer_idx in 0..2 {
+                let a_layer = &active_layers[layer_idx];
+                let i_layer = &inactive_layers[layer_idx];
+                let alpha = i_layer.alpha + win.focus_t * (a_layer.alpha - i_layer.alpha);
+                let blur  = i_layer.blur_sigma + win.focus_t * (a_layer.blur_sigma - i_layer.blur_sigma);
+                let oy    = i_layer.offset_y + win.focus_t * (a_layer.offset_y - i_layer.offset_y);
                 let idx = raw_uniforms.len() as u32;
                 raw_uniforms.push(ChromeUniforms {
-                    win_x: win.x,
-                    win_y: win.y,
-                    win_w: win.w,
-                    win_h: win.h,
-                    surface_w: sw,
-                    surface_h: sh,
-                    radius_px: 14.0,
-                    smoothing: 0.6,
-                    stroke_r: 0.0,
-                    stroke_g: 0.0,
-                    stroke_b: 0.0,
-                    stroke_a: 0.0,
-                    highlight_a: layer.blur_sigma, // repurposed as blur_sigma in fs_shadow
-                    is_active: if win.active { 1.0 } else { 0.0 },
-                    shadow_a: layer.alpha,
-                    shadow_oy: layer.offset_y,
-                    shadow_ox: layer.offset_x,
-                    _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
+                    win_x: win.x, win_y: win.y, win_w: win.w, win_h: win.h,
+                    surface_w: sw, surface_h: sh,
+                    radius_px: 14.0, smoothing: 0.6,
+                    mode_t: win.mode_t, focus_t: win.focus_t,
+                    shadow_a: alpha, shadow_oy: oy,
+                    shadow_ox: a_layer.offset_x,
+                    blur_sigma: blur,
+                    _pad0: 0.0, _pad1: 0.0,
                 });
                 draw_calls.push((false, idx));
+            }
+
+            // Layer 3 (wide ambient): only in active state — scaled by focus_t.
+            {
+                let a_layer = &active_layers[2];
+                let alpha = a_layer.alpha * win.focus_t;
+                if alpha > 0.001 {
+                    let idx = raw_uniforms.len() as u32;
+                    raw_uniforms.push(ChromeUniforms {
+                        win_x: win.x, win_y: win.y, win_w: win.w, win_h: win.h,
+                        surface_w: sw, surface_h: sh,
+                        radius_px: 14.0, smoothing: 0.6,
+                        mode_t: win.mode_t, focus_t: win.focus_t,
+                        shadow_a: alpha, shadow_oy: a_layer.offset_y,
+                        shadow_ox: a_layer.offset_x,
+                        blur_sigma: a_layer.blur_sigma,
+                        _pad0: 0.0, _pad1: 0.0,
+                    });
+                    draw_calls.push((false, idx));
+                }
             }
         }
 
         // Chrome: front-to-back order (on top of shadows).
+        // The shader computes stroke_a and highlight_a from mode_t/focus_t itself.
         for win in windows.iter() {
-            let (stroke_a, highlight_a) = if win.active {
-                (0.72_f32, 0.08_f32) // dark active  (WINDOW_SPEC outer border + inner highlight)
-            } else {
-                (0.55_f32, 0.04_f32) // dark inactive
-            };
-
             let idx = raw_uniforms.len() as u32;
             raw_uniforms.push(ChromeUniforms {
-                win_x: win.x,
-                win_y: win.y,
-                win_w: win.w,
-                win_h: win.h,
-                surface_w: sw,
-                surface_h: sh,
-                radius_px: 14.0,
-                smoothing: 0.6,
-                stroke_r: 0.0,
-                stroke_g: 0.0,
-                stroke_b: 0.0,
-                stroke_a,
-                highlight_a,
-                is_active: if win.active { 1.0 } else { 0.0 },
-                shadow_a: 0.0,
-                shadow_oy: 0.0,
-                shadow_ox: 0.0,
-                _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
+                win_x: win.x, win_y: win.y, win_w: win.w, win_h: win.h,
+                surface_w: sw, surface_h: sh,
+                radius_px: 14.0, smoothing: 0.6,
+                mode_t: win.mode_t, focus_t: win.focus_t,
+                shadow_a: 0.0, shadow_oy: 0.0,
+                shadow_ox: 0.0, blur_sigma: 0.0,
+                _pad0: 0.0, _pad1: 0.0,
             });
             draw_calls.push((true, idx));
         }
