@@ -45,6 +45,7 @@ mod desktop;
 mod cursor;
 mod cursor_render;
 mod resize;
+pub mod wm;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()

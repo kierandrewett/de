@@ -40,6 +40,7 @@ impl XdgShellHandler for SpikeState {
         // Add to toplevels list.
         self.toplevels.push(ToplevelInfo {
             surface: wl_surface.clone(),
+            toplevel: surface.clone(),
             x,
             y,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
@@ -59,10 +60,19 @@ impl XdgShellHandler for SpikeState {
         let wl = surface.wl_surface();
         info!("toplevel destroyed");
 
-        self.toplevels.retain(|t| &t.surface != wl);
+        // Push to destroyed_surfaces so the WM can start a close animation.
+        self.destroyed_surfaces.push(wl.clone());
+
+        // Keep the toplevel in `self.toplevels` until the WM close animation
+        // finishes — update_windows will remove it via sweep_closed.
+        // We do NOT retain-filter here; the pixel buffer stays alive for the animation.
 
         // Update active_surface to the most recent remaining toplevel (if any).
-        self.active_surface = self.toplevels.last().map(|t| t.surface.clone());
+        // The WM will refine this when it processes the close.
+        let still_mapped: Vec<_> = self.toplevels.iter()
+            .filter(|t| &t.surface != wl)
+            .collect();
+        self.active_surface = still_mapped.last().map(|t| t.surface.clone());
 
         // Legacy single-surface pixel buffer: clear if it was the active one.
         if self.active_surface.is_none() {
