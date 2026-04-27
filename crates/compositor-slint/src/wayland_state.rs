@@ -200,6 +200,10 @@ pub struct SpikeState {
     /// Shared pixel buffer (SHM surface → Slint texture) — legacy single-window path.
     pub client_pixels: Arc<Mutex<ClientSurfaceData>>,
 
+    /// Surfaces that were destroyed since the last main-loop iteration.
+    /// The WM processes these to begin close animations.
+    pub destroyed_surfaces: Vec<WlSurface>,
+
     pub should_exit: bool,
     pub pointer_pos: (f64, f64),
 }
@@ -313,6 +317,7 @@ impl SpikeState {
             toplevels: Vec::new(),
             layer_surfaces: Vec::new(),
             client_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            destroyed_surfaces: Vec::new(),
             should_exit: false,
             pointer_pos: (0.0, 0.0),
         };

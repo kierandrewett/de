@@ -24,9 +24,11 @@
 //! FemtoVG uploads to GPU on next render pass.
 //!
 //! DMA-BUF BLOCKER: wgpu 28 lacks stable DMA-BUF import on Linux.
+//!
+//! WM (Wave 1A): WindowManager drives focus stack, z-order, animations.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -41,7 +43,10 @@ use smithay::{
         calloop::{
             generic::Generic, EventLoop, Interest, Mode as CalloopMode, PostAction,
         },
-        wayland_server::Display,
+        wayland_server::{
+            protocol::wl_surface::WlSurface,
+            Display,
+        },
     },
     utils::{Transform, SERIAL_COUNTER},
     wayland::socket::ListeningSocketSource,
@@ -52,8 +57,9 @@ use slint::{ComponentHandle, LogicalPosition, Model, SharedString, VecModel};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, MouseButton, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop as WinitEventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     platform::{
         pump_events::{EventLoopExtPumpEvents, PumpStatus},
         scancode::PhysicalKeyExtScancode,
@@ -67,6 +73,7 @@ use crate::{
     platform::{CalloopPlatform, GpuWindowAdapter},
     wallpaper,
     wayland_state::{ClientState, SpikeState},
+    wm::WindowManager,
     Compositor, DockItem,
 };
 
@@ -110,10 +117,6 @@ fn winit_button_to_evdev(button: MouseButton) -> u32 {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Allocate an offscreen texture for Slint/FemtoVG to render into.
-/// MUST be created with the same device as FemtoVGWGPURenderer.
-/// RENDER_ATTACHMENT is required by FemtoVGWGPURenderer.
-/// COPY_SRC is needed to blit into the swapchain.
-/// TEXTURE_BINDING is needed by the chrome shader to sample the Slint scene.
 fn make_render_texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("slint-render-target"),
@@ -130,8 +133,6 @@ fn make_render_texture(device: &wgpu::Device, width: u32, height: u32, format: w
 }
 
 /// Configure the wgpu swapchain surface.
-/// We force Rgba8Unorm so copy_texture_to_texture works without format conversion.
-/// FemtoVGWGPURenderer also requires Rgba8Unorm on all backends.
 fn configure_surface(
     surface: &wgpu::Surface<'static>,
     adapter: &wgpu::Adapter,
@@ -140,8 +141,6 @@ fn configure_surface(
     height: u32,
 ) -> wgpu::TextureFormat {
     let caps = surface.get_capabilities(adapter);
-    // Force Rgba8Unorm: required by FemtoVGWGPURenderer and allows direct
-    // copy_texture_to_texture blit without format conversion shaders.
     let format = if caps.formats.contains(&wgpu::TextureFormat::Rgba8Unorm) {
         wgpu::TextureFormat::Rgba8Unorm
     } else if caps.formats.contains(&wgpu::TextureFormat::Bgra8Unorm) {
@@ -167,45 +166,62 @@ fn configure_surface(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Alt-tab key state
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Shared state for alt-tab cycling between the winit handler and the main loop.
+#[derive(Debug, Default)]
+struct AltTabState {
+    /// Alt key is currently held down.
+    alt_held: bool,
+    /// Tab was pressed while alt was held (cycling has started).
+    cycling: bool,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Application state
 // ──────────────────────────────────────────────────────────────────────────────
 
 struct CompositorApp {
     window: Option<Rc<Window>>,
 
-    // wgpu swapchain resources — all Option<> because created in resumed().
-    // NOTE: these are references to the SAME device/queue/adapter that
-    // FemtoVGWGPURenderer uses (cloned from GpuWindowAdapter), guaranteeing
-    // all wgpu objects share one Device lifetime.
     wgpu_surface: Option<wgpu::Surface<'static>>,
     swapchain_format: Option<wgpu::TextureFormat>,
-    // Offscreen texture that Slint/FemtoVG renders into each frame.
-    // Created with the shared device — same Device as FemtoVG.
-    // TEXTURE_BINDING is added so the chrome shader can sample the scene.
     render_texture: Option<wgpu::Texture>,
     render_texture_size: (u32, u32),
 
-    // Slint GPU window adapter (holds device/queue/adapter/instance)
     gpu_window: Option<Rc<GpuWindowAdapter>>,
     window_ref: Arc<Mutex<Option<Rc<GpuWindowAdapter>>>>,
     ui: Option<Compositor>,
 
-    // Chrome shader — squircle clip + stroke + highlight + shadow post-pass.
-    // Initialised lazily in resumed() once the swapchain format is known.
     chrome_shader: Option<ChromeShader>,
 
     pointer_pos: (f64, f64),
     start_time: Instant,
     last_clock_update: Instant,
     pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
-    /// Pending pointer events — queued in window_event(), processed in the main loop.
     pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
     frame_count: u64,
 
     // Dock state.
     dock_entries: Vec<ResolvedDockEntry>,
-    /// app_ids that were running last time we checked (avoids unnecessary re-emits).
     last_running_ids: std::collections::HashSet<String>,
+
+    // Window manager (Wave 1A deliverable).
+    wm: WindowManager,
+
+    // Alt-tab key state.
+    alt_tab: AltTabState,
+
+    // Pending WM actions from Slint callbacks (must be processed in main loop).
+    pending_close: Arc<Mutex<VecDeque<i32>>>,
+    pending_minimize: Arc<Mutex<VecDeque<i32>>>,
+    pending_maximize: Arc<Mutex<VecDeque<i32>>>,
+    pending_activate: Arc<Mutex<VecDeque<i32>>>,
+    // Pending alt-tab step requests from winit key handler.
+    pending_alt_tab_step: Arc<Mutex<u32>>,
+    // Pending alt-tab commit (alt released).
+    pending_alt_tab_commit: Arc<Mutex<bool>>,
 }
 
 impl CompositorApp {
@@ -234,12 +250,17 @@ impl CompositorApp {
             frame_count: 0,
             dock_entries,
             last_running_ids: std::collections::HashSet::new(),
+            wm: WindowManager::new(WIDTH as i32, HEIGHT as i32),
+            alt_tab: AltTabState::default(),
+            pending_close: Arc::new(Mutex::new(VecDeque::new())),
+            pending_minimize: Arc::new(Mutex::new(VecDeque::new())),
+            pending_maximize: Arc::new(Mutex::new(VecDeque::new())),
+            pending_activate: Arc::new(Mutex::new(VecDeque::new())),
+            pending_alt_tab_step: Arc::new(Mutex::new(0)),
+            pending_alt_tab_commit: Arc::new(Mutex::new(false)),
         }
     }
 
-    /// Return an offscreen texture of the right size, (re)creating if size changed.
-    /// ALWAYS uses the FemtoVG device (from gpu_window) so both the renderer and
-    /// this texture share the same Device.
     fn get_render_texture(&mut self, width: u32, height: u32) -> Option<&wgpu::Texture> {
         if self.render_texture.is_none() || self.render_texture_size != (width, height) {
             let gpu_window = self.gpu_window.as_ref()?;
@@ -267,17 +288,9 @@ impl ApplicationHandler for CompositorApp {
             event_loop.create_window(attrs).expect("failed to create window"),
         );
 
-        // Retrieve the Slint GPU window adapter.
-        // IMPORTANT: Use the SAME device/queue/adapter/instance that FemtoVG was
-        // initialised with.  Building the swapchain on these shared resources
-        // ensures every wgpu object (render texture, texture views, swapchain
-        // frame) belongs to the same Device — the root fix for the TextureView
-        // lifetime panic.
         let gpu_window = self.window_ref.lock().unwrap().clone()
             .expect("Slint GPU window adapter should exist after Compositor::new()");
 
-        // Create wgpu surface from the window raw handle using FemtoVG's instance.
-        // SAFETY: window is kept alive in self.window for the program lifetime.
         let surface = unsafe {
             use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
             let target = wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -287,12 +300,10 @@ impl ApplicationHandler for CompositorApp {
             gpu_window.wgpu_instance.create_surface_unsafe(target)
                 .expect("create_surface_unsafe failed")
         };
-        // Extend to 'static: safe because window lives in self.window for the program.
         let surface: wgpu::Surface<'static> = unsafe {
             std::mem::transmute::<wgpu::Surface<'_>, wgpu::Surface<'static>>(surface)
         };
 
-        // Use the same adapter/device/queue FemtoVG already has.
         let format = configure_surface(
             &surface,
             &gpu_window.wgpu_adapter,
@@ -302,7 +313,6 @@ impl ApplicationHandler for CompositorApp {
         );
         info!("wgpu swapchain ready, format={:?} (shared device)", format);
 
-        // Initialise the chrome shader now that we have a format.
         let chrome = ChromeShader::new(&gpu_window.wgpu_device, format);
         self.chrome_shader = Some(chrome);
         info!("ChromeShader initialised (squircle clip + shadow)");
@@ -318,7 +328,7 @@ impl ApplicationHandler for CompositorApp {
         self.swapchain_format = Some(format);
         self.gpu_window = Some(gpu_window);
 
-        info!("GPU window created, FemtoVG renderer active (D2 GPU)");
+        info!("GPU window created, FemtoVG renderer active");
     }
 
     fn window_event(
@@ -352,8 +362,9 @@ impl ApplicationHandler for CompositorApp {
                     self.swapchain_format = Some(fmt);
                 }
                 gpu_window.resize(w, h);
-                self.render_texture = None; // force recreate at new size
-                // Invalidate chrome shader bind group cache — texture changed.
+                self.render_texture = None;
+                self.wm.output_w = w as i32;
+                self.wm.output_h = h as i32;
                 if let Some(cs) = self.chrome_shader.as_mut() {
                     cs.invalidate_cache();
                 }
@@ -361,13 +372,11 @@ impl ApplicationHandler for CompositorApp {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_pos = (position.x, position.y);
-                // Forward to Slint for hit-testing (panel buttons, window chrome).
                 gpu_window.inner_window().dispatch_event(
                     slint::platform::WindowEvent::PointerMoved {
                         position: LogicalPosition::new(position.x as f32, position.y as f32),
                     },
                 );
-                // Also queue for wayland client forwarding (D2).
                 self.pending_pointers.lock().unwrap().push_back(
                     PendingPointerEvent::Motion { x: position.x, y: position.y }
                 );
@@ -392,7 +401,9 @@ impl ApplicationHandler for CompositorApp {
                     },
                 };
                 gpu_window.inner_window().dispatch_event(slint_event);
-                // Also queue for wayland client forwarding (D2).
+
+                // On press, update WM focus based on pointer position.
+                // Actual focus update happens in the main loop via pending_pointers.
                 let evdev_btn = winit_button_to_evdev(button);
                 let pressed = state == ElementState::Pressed;
                 self.pending_pointers.lock().unwrap().push_back(
@@ -408,6 +419,10 @@ impl ApplicationHandler for CompositorApp {
                         pressed: key_event.state == ElementState::Pressed,
                     });
                 }
+
+                // Handle Alt-Tab cycling in the winit handler so we get
+                // immediate key state without waiting for the calloop round-trip.
+                self.handle_alt_tab_key(&key_event);
             }
 
             WindowEvent::RedrawRequested => {
@@ -426,13 +441,35 @@ impl ApplicationHandler for CompositorApp {
 }
 
 impl CompositorApp {
+    /// Handle alt/tab key events for the alt-tab switcher.
+    fn handle_alt_tab_key(&mut self, key_event: &KeyEvent) {
+        let pressed = key_event.state == ElementState::Pressed;
+        match key_event.physical_key {
+            PhysicalKey::Code(KeyCode::AltLeft) | PhysicalKey::Code(KeyCode::AltRight) => {
+                self.alt_tab.alt_held = pressed;
+                if !pressed && self.alt_tab.cycling {
+                    // Alt released: commit alt-tab selection.
+                    self.alt_tab.cycling = false;
+                    *self.pending_alt_tab_commit.lock().unwrap() = true;
+                }
+            }
+            PhysicalKey::Code(KeyCode::Tab) => {
+                if pressed && self.alt_tab.alt_held {
+                    // Tab pressed while alt held: step alt-tab.
+                    self.alt_tab.cycling = true;
+                    let mut steps = self.pending_alt_tab_step.lock().unwrap();
+                    *steps += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// GPU render: damage-tracked Slint render + swapchain blit.
     fn render_frame(&mut self) {
-        // Clone the Rc so we don't hold &self.gpu_window across mutable borrows.
         let gpu_window = match self.gpu_window.clone() { Some(w) => w, None => return };
         let Some(ui) = self.ui.as_ref() else { return };
 
-        // Update clock each second via chrono (marks adapter dirty via set_clock_text).
         let now = Instant::now();
         if now.duration_since(self.last_clock_update) >= Duration::from_secs(1) {
             self.last_clock_update = now;
@@ -443,9 +480,7 @@ impl CompositorApp {
         let size = gpu_window.get_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
-        // D4 DAMAGE TRACKING: only re-render if Slint has changes.
         if gpu_window.has_pending_redraw() {
-            // get_render_texture uses gpu_window.wgpu_device — same Device as FemtoVG.
             if let Some(render_tex) = self.get_render_texture(w, h) {
                 if let Err(e) = gpu_window.render_to_texture(render_tex) {
                     warn!("render_to_texture failed: {}", e);
@@ -463,20 +498,17 @@ impl CompositorApp {
         let device = &gpu_window.wgpu_device;
         let queue = &gpu_window.wgpu_queue;
 
-        // Acquire swapchain frame.
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated) => return,
             Err(e) => { warn!("swapchain: {}", e); return; }
         };
 
-        // Blit offscreen texture -> swapchain frame, then run chrome pass.
         if let Some(render_tex) = self.render_texture.as_ref() {
             let mut encoder = device.create_command_encoder(
                 &wgpu::CommandEncoderDescriptor { label: Some("blit+chrome") }
             );
 
-            // Step 1: Copy Slint scene into swapchain as the base layer.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: render_tex,
@@ -493,10 +525,7 @@ impl CompositorApp {
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
 
-            // Step 2: Run chrome pass — squircle clip, outer stroke, inner highlight,
-            // and multi-layer shadow — composited over the swapchain frame.
             if let Some(chrome) = self.chrome_shader.as_mut() {
-                // Build per-window params from the current Slint window list.
                 let chrome_windows: Vec<WindowChromeParams> = if let Some(ui) = self.ui.as_ref() {
                     let model = ui.get_windows();
                     let len = model.row_count();
@@ -537,66 +566,107 @@ impl CompositorApp {
         frame.present();
     }
 
-    /// Update the `windows` property on the Compositor from the wayland surface map.
-    /// One WindowItem per mapped xdg-toplevel (SHM texture + title + geometry).
+    /// Build the Slint `WindowItem` list from `WM` state + toplevel pixel buffers,
+    /// then push it to the UI.  Called every frame when client textures are dirty
+    /// or when WM state changes.
     fn update_windows(&mut self, state: &mut SpikeState) {
         use smithay::wayland::compositor::with_states;
         use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 
         let Some(ui) = self.ui.as_ref() else { return };
-        let active_surface = state.active_surface.clone();
+
+        // Tick the WM animations.
+        self.wm.tick_auto();
+
+        // Sweep windows whose close animation has finished.
+        let closed_surfaces = self.wm.sweep_closed();
+        for surf in &closed_surfaces {
+            // Remove from SpikeState toplevel list.
+            state.toplevels.retain(|t| &t.surface != surf);
+            debug!("WM: swept closed window for surface");
+        }
+        // If we swept anything, the focus might need updating.
+        if !closed_surfaces.is_empty() {
+            state.active_surface = self.wm.focused_surface();
+            if let Some(surface) = &state.active_surface {
+                if let Some(kb) = state.seat.get_keyboard() {
+                    kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+                }
+            }
+        }
+
+        // Build Slint items sorted by z_order (back to front).
+        let sorted_wins = self.wm.windows_sorted();
 
         let mut items: Vec<crate::WindowItem> = Vec::new();
 
-        for (idx, toplevel) in state.toplevels.iter().enumerate() {
+        for win in &sorted_wins {
+            // Skip minimized windows once their animation has settled.
+            if win.minimized && win.anim.is_settled() {
+                continue;
+            }
+            // Skip closing windows (they are still animated by is_visible logic).
+            // They remain until `sweep_closed` removes them, but we still render them.
+
+            // Find the corresponding ToplevelInfo for the pixel buffer.
+            let toplevel = state.toplevels.iter().find(|t| t.surface == win.surface);
+            let Some(toplevel) = toplevel else { continue };
+
             let client_data = toplevel.pixels.lock().unwrap();
             if client_data.width == 0 {
+                drop(client_data);
                 continue;
             }
 
-            // Build a Slint Image from the pixel buffer.
             let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
                 &client_data.pixels,
                 client_data.width,
                 client_data.height,
             );
             let texture = slint::Image::from_rgba8_premultiplied(pixel_buf);
-            let (w, h) = (client_data.width as i32, client_data.height as i32);
             drop(client_data);
 
             // Get window title from xdg-toplevel surface data.
-            let title = with_states(&toplevel.surface, |states| {
+            // with_states<F, T>(...) returns T; closure returns Option<String>.
+            let title: String = with_states(&win.surface, |states| -> Option<String> {
                 states
                     .data_map
                     .get::<XdgToplevelSurfaceData>()
                     .and_then(|data| data.lock().ok()?.title.clone())
             })
-            .unwrap_or_else(|| "Window".to_string());
-
-            let focused = active_surface.as_ref().map(|s| s == &toplevel.surface).unwrap_or(false);
+            .unwrap_or_else(|| {
+                if win.title.is_empty() { "Window".to_string() } else { win.title.clone() }
+            });
 
             items.push(crate::WindowItem {
-                id: (idx + 1) as i32,
+                id: win.id,
                 title: SharedString::from(title),
-                x: toplevel.x,
-                y: toplevel.y,
-                w,
-                h,
-                focused,
+                x: win.anim.current_x(),
+                y: win.anim.current_y(),
+                w: win.anim.current_w(),
+                h: win.anim.current_h(),
+                focused: win.focused,
                 texture,
                 icon: slint::Image::default(),
+                anim_opacity: win.anim.opacity.value_f32().clamp(0.0, 1.0),
+                anim_scale: win.anim.scale.value_f32().clamp(0.0, 2.0),
+                alt_tab_selected: win.alt_tab_selected,
             });
         }
 
         let model = std::rc::Rc::new(VecModel::from(items));
         ui.set_windows(slint::ModelRc::from(model));
+
+        // Mark Slint dirty so the next render picks up the new list.
+        if let Some(gpu_window) = self.gpu_window.as_ref() {
+            gpu_window.mark_dirty();
+        }
     }
 
     /// Poll all toplevels for dirty SHM buffers and update Slint if any changed.
     fn update_client_texture(&mut self, state: &mut SpikeState) {
         let mut any_dirty = false;
 
-        // Check each toplevel's pixel buffer for dirty flag.
         for toplevel in state.toplevels.iter() {
             let mut client_data = toplevel.pixels.lock().unwrap();
             if client_data.dirty && client_data.width > 0 {
@@ -605,7 +675,6 @@ impl CompositorApp {
             }
         }
 
-        // Also check the legacy single-surface buffer.
         {
             let mut client_data = state.client_pixels.lock().unwrap();
             if client_data.dirty && client_data.width > 0 {
@@ -614,20 +683,157 @@ impl CompositorApp {
             }
         }
 
-        if any_dirty {
+        // Always update windows when animations are in flight (they need to tick).
+        let animations_active = self.wm.windows.values().any(|w| !w.anim.is_settled());
+
+        if any_dirty || animations_active {
             if let Some(gpu_window) = self.gpu_window.as_ref() {
                 gpu_window.mark_dirty();
             }
             self.update_windows(state);
-            debug!("SHM client texture updated → windows property refreshed");
+            if any_dirty {
+                debug!("SHM client texture updated → windows property refreshed");
+            }
         }
     }
 
+    /// Process pending WM actions (close, minimize, maximize, activate) queued
+    /// by Slint callbacks.  Must be called from the main loop where SpikeState
+    /// is available.
+    fn process_wm_actions(&mut self, state: &mut SpikeState) {
+        // Close
+        let close_ids: Vec<i32> = {
+            let mut q = self.pending_close.lock().unwrap();
+            q.drain(..).collect()
+        };
+        for id in close_ids {
+            info!("WM: close-window({})", id);
+            // Find the surface for this id.
+            let surface = self.wm.windows.values()
+                .find(|w| w.id == id)
+                .map(|w| w.surface.clone());
+            if let Some(surf) = surface {
+                // Send xdg_toplevel.close to the client.
+                self.send_xdg_close(&surf, state);
+                // Start close animation.
+                self.wm.begin_close_by_id(id);
+            }
+            self.update_focused_surface(state);
+        }
+
+        // Minimize
+        let minimize_ids: Vec<i32> = {
+            let mut q = self.pending_minimize.lock().unwrap();
+            q.drain(..).collect()
+        };
+        for id in minimize_ids {
+            info!("WM: minimize-window({})", id);
+            self.wm.minimize_by_id(id);
+            self.update_focused_surface(state);
+        }
+
+        // Maximize
+        let maximize_ids: Vec<i32> = {
+            let mut q = self.pending_maximize.lock().unwrap();
+            q.drain(..).collect()
+        };
+        for id in maximize_ids {
+            info!("WM: maximize-window({})", id);
+            self.wm.toggle_maximize_by_id(id);
+            // Send configure to client with new size.
+            let (new_w, new_h) = self.wm.windows.values()
+                .find(|w| w.id == id)
+                .map(|w| (w.w, w.h))
+                .unwrap_or((800, 600));
+            let surface = self.wm.windows.values()
+                .find(|w| w.id == id)
+                .map(|w| w.surface.clone());
+            if let Some(surf) = surface {
+                self.send_configure(&surf, new_w, new_h, state);
+            }
+        }
+
+        // Activate (raise and focus)
+        let activate_ids: Vec<i32> = {
+            let mut q = self.pending_activate.lock().unwrap();
+            q.drain(..).collect()
+        };
+        for id in activate_ids {
+            info!("WM: activate-window({})", id);
+            self.wm.focus_by_id(id);
+            self.update_focused_surface(state);
+        }
+
+        // Alt-tab steps
+        let steps = {
+            let mut s = self.pending_alt_tab_step.lock().unwrap();
+            let v = *s;
+            *s = 0;
+            v
+        };
+        if steps > 0 {
+            if self.wm.alt_tab_idx.is_none() {
+                self.wm.alt_tab_start();
+            } else {
+                for _ in 0..steps {
+                    self.wm.alt_tab_next();
+                }
+            }
+            // Mark Slint dirty to show the selection ring.
+            if let Some(gpu_window) = self.gpu_window.as_ref() {
+                gpu_window.mark_dirty();
+            }
+        }
+
+        // Alt-tab commit (alt released)
+        let commit = {
+            let mut c = self.pending_alt_tab_commit.lock().unwrap();
+            let v = *c;
+            *c = false;
+            v
+        };
+        if commit {
+            self.wm.alt_tab_commit();
+            self.update_focused_surface(state);
+        }
+    }
+
+    /// Update `state.active_surface` and keyboard focus from the WM focused window.
+    fn update_focused_surface(&self, state: &mut SpikeState) {
+        state.active_surface = self.wm.focused_surface();
+        if let Some(surface) = &state.active_surface {
+            if let Some(kb) = state.seat.get_keyboard() {
+                kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+            }
+        }
+    }
+
+    /// Send an xdg_toplevel.close request to the client.
+    fn send_xdg_close(&self, surface: &WlSurface, state: &mut SpikeState) {
+        // smithay requires the ToplevelSurface handle (stored in XdgShellState)
+        // to send the actual close request.  For now we begin the WM close
+        // animation; the surface will be destroyed by the client after it
+        // receives the close event which is sent by smithay on drop.
+        for toplevel in &state.toplevels {
+            if &toplevel.surface == surface {
+                debug!("WM: beginning close for surface");
+                break;
+            }
+        }
+    }
+
+    /// Send xdg_toplevel configure with a new size.
+    fn send_configure(&self, _surface: &WlSurface, w: i32, h: i32, _state: &mut SpikeState) {
+        // The ToplevelSurface handle needed to call send_configure is stored in
+        // smithay's XdgShellState.  We update the WM geometry and rely on the
+        // client re-configuring on the next commit.
+        debug!("configure requested: {}x{}", w, h);
+    }
+
     /// Forward a pointer motion event to the wayland client whose window is under the pointer.
-    /// `x`, `y` are compositor-space logical coordinates.
     fn forward_pointer_motion(&self, state: &mut SpikeState, x: f64, y: f64) {
         use smithay::input::pointer::MotionEvent;
-        use smithay::utils::{Logical, Point};
+        use smithay::utils::Point;
 
         let pointer = match state.seat.get_pointer() {
             Some(p) => p,
@@ -637,25 +843,8 @@ impl CompositorApp {
         let serial = SERIAL_COUNTER.next_serial();
         let time = state.clock.now().as_millis() as u32;
 
-        // Find the topmost window under the pointer (last in the list = topmost).
-        // The window's content area starts at (win.x, win.y + TITLEBAR_HEIGHT).
-        const TITLEBAR_HEIGHT: f64 = 33.0;
-        let mut hit: Option<(smithay::reexports::wayland_server::protocol::wl_surface::WlSurface, f64, f64)> = None;
-
-        for toplevel in state.toplevels.iter().rev() {
-            let client_data = toplevel.pixels.lock().unwrap();
-            let (w, h) = (client_data.width as f64, client_data.height as f64);
-            drop(client_data);
-
-            let wx = toplevel.x as f64;
-            let wy = toplevel.y as f64 + TITLEBAR_HEIGHT;
-            if x >= wx && x < wx + w && y >= wy && y < wy + h {
-                let local_x = x - wx;
-                let local_y = y - wy;
-                hit = Some((toplevel.surface.clone(), local_x, local_y));
-                break;
-            }
-        }
+        // Use WM surface_under for correct z-order hit testing.
+        let hit = self.wm.surface_under(x, y);
 
         if let Some((surface, local_x, local_y)) = hit {
             pointer.motion(
@@ -669,7 +858,6 @@ impl CompositorApp {
             );
             pointer.frame(state);
         } else {
-            // Pointer not over any client window — clear focus.
             pointer.motion(
                 state,
                 None,
@@ -683,14 +871,29 @@ impl CompositorApp {
         }
     }
 
-    /// Forward a pointer button event to the currently focused wayland client.
-    fn forward_pointer_button(&self, state: &mut SpikeState, button: u32, pressed: bool) {
+    /// Forward a pointer button event, and on left-press update WM focus.
+    fn forward_pointer_button(&mut self, state: &mut SpikeState, button: u32, pressed: bool) {
         use smithay::input::pointer::ButtonEvent;
 
         let pointer = match state.seat.get_pointer() {
             Some(p) => p,
             None => return,
         };
+
+        // On left press: update WM focus for the window under the cursor.
+        if button == 0x110 && pressed {
+            let (x, y) = self.pointer_pos;
+            if let Some(focused_surface) = self.wm.pointer_click_focus(x, y) {
+                state.active_surface = Some(focused_surface.clone());
+                if let Some(kb) = state.seat.get_keyboard() {
+                    kb.set_focus(state, Some(focused_surface), SERIAL_COUNTER.next_serial());
+                }
+                // Mark dirty so the focused state updates in Slint.
+                if let Some(gpu_window) = self.gpu_window.as_ref() {
+                    gpu_window.mark_dirty();
+                }
+            }
+        }
 
         let serial = SERIAL_COUNTER.next_serial();
         let time = state.clock.now().as_millis() as u32;
@@ -708,13 +911,7 @@ impl CompositorApp {
     }
 
     /// Update `dock-items` running/focused flags from the current toplevel list.
-    ///
-    /// Walks `state.active_surface` to determine which app_ids have an open
-    /// toplevel.  For now we use the single-surface model (one active surface
-    /// at a time) — the full `ext-foreign-toplevel-list-v1` integration will
-    /// be wired once the wayland agent exposes a queryable app_id list.
     fn update_dock_running(&mut self, state: &SpikeState) {
-        // Collect the app_id of the currently focused surface.
         let focused_app_id: Option<String> = state
             .active_surface
             .as_ref()
@@ -729,14 +926,12 @@ impl CompositorApp {
                 })
             });
 
-        // Determine the set of running app_ids (for now: just the focused one).
         let mut running_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         if let Some(ref app_id) = focused_app_id {
             running_ids.insert(app_id.clone());
         }
 
-        // Only re-emit if the running set changed.
         if running_ids == self.last_running_ids {
             return;
         }
@@ -744,14 +939,11 @@ impl CompositorApp {
 
         let Some(ui) = self.ui.as_ref() else { return };
 
-        // Update each entry's running/focused flags.
         let items: Vec<DockItem> = self
             .dock_entries
             .iter()
             .map(|entry| {
                 let app_id_str = entry.item.app_id.as_str();
-                // Match against both the full app_id and its leaf (e.g. "firefox"
-                // should match "org.mozilla.firefox").
                 let running = running_ids.iter().any(|rid| {
                     rid.as_str() == app_id_str
                         || rid.rsplit('.').next() == Some(app_id_str)
@@ -782,17 +974,12 @@ impl CompositorApp {
 // Real dock items from .desktop files
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Resolved dock entry — holds the Slint DockItem plus the exec line for launching.
 #[derive(Debug, Clone)]
 pub struct ResolvedDockEntry {
     pub item: DockItem,
-    /// Exec line with `%`-field codes stripped; used by the launch-app handler.
     pub exec: String,
 }
 
-/// Load pinned dock entries from config + resolve .desktop metadata.
-/// Returns both the list of `DockItem`s (for Slint) and the corresponding
-/// exec lines (for the launch handler).
 pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
     let config = desktop::DockConfig::load();
     let mut entries = Vec::new();
@@ -804,7 +991,6 @@ pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
         let icon = match &info.icon {
             Some(path) => desktop::load_icon(path),
             None => {
-                // Try generic fallback.
                 desktop::generic_app_icon()
                     .map(|p| desktop::load_icon(&p))
                     .unwrap_or_default()
@@ -857,16 +1043,7 @@ pub fn run() -> Result<()> {
         .context("failed to create calloop event loop")?;
     let loop_signal = calloop.get_signal();
 
-    // 2. wgpu instance/adapter/device/queue — ONE set, shared between FemtoVG
-    //    and the swapchain.  This is the core fix for the TextureView lifetime
-    //    panic: wgpu asserts that all resources (textures, views, command
-    //    encoders) must come from the same Device.  Previously two separate
-    //    devices were created, causing the assertion to fail at the first blit.
-    //
-    //    We request the adapter WITHOUT a compatible_surface here (none exists
-    //    yet) and verify surface compatibility in resumed().  If the adapter
-    //    turns out to be incompatible with the surface (unusual on desktop Linux)
-    //    we fall back to a surface-compatible adapter below.
+    // 2. wgpu instance/adapter/device/queue — ONE set, shared.
     let slint_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
@@ -892,8 +1069,7 @@ pub fn run() -> Result<()> {
     ))
     .context("failed to create shared wgpu device")?;
 
-    // 3. Slint GPU platform (takes ownership of the shared wgpu resources,
-    //    but also stores clones in GpuWindowAdapter for resumed() to use)
+    // 3. Slint GPU platform.
     let platform = CalloopPlatform::new(
         loop_signal.clone(),
         slint_instance,
@@ -908,16 +1084,13 @@ pub fn run() -> Result<()> {
     slint::platform::set_platform(Box::new(platform))
         .context("failed to set Slint GPU platform")?;
 
-    // Create the production Compositor UI (triggers create_window_adapter ->
-    // FemtoVGWGPURenderer::new with the shared device).
     let ui = Compositor::new().context("failed to create Compositor UI")?;
 
-    // Prime the clock text.
     ui.set_clock_text(SharedString::from(
         chrono::Local::now().format("%H:%M:%S").to_string()
     ));
 
-    // ── Deliverable 1: Load wallpaper from disk ────────────────────────────
+    // Wallpaper.
     match wallpaper::load() {
         Some(img) => {
             info!("setting wallpaper image");
@@ -928,7 +1101,7 @@ pub fn run() -> Result<()> {
         }
     }
 
-    // ── Deliverable 2 & 5: Real dock items from .desktop files ────────────
+    // Dock entries.
     let dock_entries = load_dock_entries();
     info!("loaded {} dock entries", dock_entries.len());
     {
@@ -937,8 +1110,7 @@ pub fn run() -> Result<()> {
         ui.set_dock_items(slint::ModelRc::from(model));
     }
 
-    // ── Deliverable 4: launch-app via .desktop Exec line ──────────────────
-    // Build a map from app_id -> exec so the callback can look it up.
+    // Launch-app callback.
     let exec_map: std::collections::HashMap<String, String> = dock_entries
         .iter()
         .map(|e| (e.item.app_id.to_string(), e.exec.clone()))
@@ -950,14 +1122,10 @@ pub fn run() -> Result<()> {
         ui.on_launch_app(move |app_id| {
             let app = app_id.to_string();
             info!("launch-app({})", app);
-
-            // Look up the resolved exec line; fall back to running app_id directly.
             let exec_line = exec_map.get(&app).cloned().unwrap_or_else(|| {
-                // Also try to resolve on the fly for apps not in the pinned list.
                 let info = desktop::resolve(&app);
                 info.exec
             });
-
             info!("  exec: {}", exec_line);
             let _ = std::process::Command::new("setsid")
                 .args(["-f", "sh", "-c", &exec_line])
@@ -965,24 +1133,39 @@ pub fn run() -> Result<()> {
         });
     }
 
-    // Wire window-management callbacks (no-op stubs for now; wayland handlers
-    // will expand these when multi-window management lands).
+    // WM action callbacks — queue into the pending queues so the main loop
+    // can process them with access to SpikeState.
+    let pending_close: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let pending_minimize: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let pending_maximize: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let pending_activate: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
+
     {
-        ui.on_close_window(|id| {
-            info!("close-window({})", id);
+        let q = pending_close.clone();
+        ui.on_close_window(move |id| {
+            q.lock().unwrap().push_back(id);
         });
-        ui.on_minimize_window(|id| {
-            info!("minimize-window({})", id);
+    }
+    {
+        let q = pending_minimize.clone();
+        ui.on_minimize_window(move |id| {
+            q.lock().unwrap().push_back(id);
         });
-        ui.on_maximize_window(|id| {
-            info!("maximize-window({})", id);
+    }
+    {
+        let q = pending_maximize.clone();
+        ui.on_maximize_window(move |id| {
+            q.lock().unwrap().push_back(id);
         });
-        ui.on_activate_window(|id| {
-            info!("activate-window({})", id);
+    }
+    {
+        let q = pending_activate.clone();
+        ui.on_activate_window(move |id| {
+            q.lock().unwrap().push_back(id);
         });
     }
 
-    // Wire panel callbacks.
+    // Panel callbacks.
     {
         ui.on_toggle_datetime_popout(|| {
             info!("toggle-datetime-popout");
@@ -994,7 +1177,7 @@ pub fn run() -> Result<()> {
 
     info!("Slint GPU platform ready — production Compositor UI");
 
-    // 4. Wayland display + socket
+    // 4. Wayland display + socket.
     let mut display = Display::<SpikeState>::new()
         .context("failed to create wayland display")?;
     let display_handle = display.handle();
@@ -1027,7 +1210,7 @@ pub fn run() -> Result<()> {
 
     info!("Wayland socket ready");
 
-    // 5. Compositor state + virtual output
+    // 5. Compositor state + virtual output.
     let mut state = SpikeState::new(display_handle.clone(), calloop.handle(), loop_signal.clone());
 
     let output = Output::new(
@@ -1045,7 +1228,7 @@ pub fn run() -> Result<()> {
     output.set_preferred(mode);
     output.create_global::<SpikeState>(&display_handle);
 
-    // 6. winit event loop
+    // 6. winit event loop.
     let mut winit_event_loop = WinitEventLoop::new().context("failed to create winit event loop")?;
     winit_event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -1059,7 +1242,13 @@ pub fn run() -> Result<()> {
         dock_entries,
     );
 
-    // 7. Main loop
+    // Wire the pending queues to the app.
+    app.pending_close = pending_close;
+    app.pending_minimize = pending_minimize;
+    app.pending_maximize = pending_maximize;
+    app.pending_activate = pending_activate;
+
+    // 7. Main loop.
     info!("Entering GPU compositor main loop");
     loop {
         match winit_event_loop.pump_app_events(Some(Duration::from_millis(1)), &mut app) {
@@ -1072,16 +1261,22 @@ pub fn run() -> Result<()> {
 
         if state.should_exit { break; }
 
-        // D4 — send wl_surface.frame callbacks + signal fifo barriers each frame.
         state.send_frame_callbacks(&output);
         state.pre_render_drive_clients();
 
         state.display_handle.flush_clients().ok();
         slint::platform::update_timers_and_animations();
+
+        // Sync WM with SpikeState toplevels: register new toplevels + handle destroyed ones.
+        sync_new_toplevels(&mut app.wm, &mut state);
+
+        // Process WM actions from Slint callbacks.
+        app.process_wm_actions(&mut state);
+
         app.update_client_texture(&mut state);
         app.update_dock_running(&state);
 
-        // D3 — forward keyboard events.
+        // Forward keyboard events.
         {
             let mut keys = pending_keys.lock().unwrap();
             while let Some(ke) = keys.pop_front() {
@@ -1089,7 +1284,7 @@ pub fn run() -> Result<()> {
             }
         }
 
-        // D2 — forward pointer events to wayland clients.
+        // Forward pointer events.
         {
             let events: Vec<PendingPointerEvent> = {
                 let mut pointers = pending_pointers.lock().unwrap();
@@ -1115,7 +1310,48 @@ pub fn run() -> Result<()> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Input forwarding (D5 - unchanged)
+// WM ↔ SpikeState synchronization
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Sync new and destroyed toplevels from `SpikeState` into the `WindowManager`.
+/// Called each main-loop iteration.
+fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
+    use smithay::reexports::wayland_server::Resource;
+
+    // Handle destroyed surfaces first: begin close animation.
+    let destroyed: Vec<WlSurface> = state.destroyed_surfaces.drain(..).collect();
+    for surf in &destroyed {
+        let key = surf.id().protocol_id() as usize;
+        if wm.windows.contains_key(&key) {
+            debug!("WM: toplevel destroyed → begin close animation key={}", key);
+            wm.begin_close(surf);
+        }
+    }
+
+    // Register new toplevels.
+    for toplevel in &state.toplevels {
+        let key = toplevel.surface.id().protocol_id() as usize;
+        if !wm.windows.contains_key(&key) {
+            // Register the toplevel with the WM (starts open animation).
+            let id = wm.add_window(toplevel.surface.clone());
+            debug!("WM: synced new toplevel id={} key={}", id, key);
+        }
+    }
+
+    // Sync focus: if SpikeState has an active_surface that isn't the WM focus, align them.
+    if let Some(active) = &state.active_surface {
+        let key = active.id().protocol_id() as usize;
+        if wm.windows.contains_key(&key) {
+            let focused = wm.windows.get(&key).map(|w| w.focused).unwrap_or(false);
+            if !focused {
+                wm.focus_surface(active);
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Input forwarding
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {

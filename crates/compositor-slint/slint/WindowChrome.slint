@@ -21,11 +21,19 @@ export component WindowChrome {
     in property <bool>   focused: true;
     // The wayland surface texture — fed by Rust each commit.
     in property <image>  content;
+    // Animation values from the Rust spring engine.
+    // 1.0 = fully visible / full size; 0.0 = invisible / shrunk.
+    in property <float>  anim-opacity: 1.0;
+    in property <float>  anim-scale:   1.0;
+    // Alt-tab ring selection highlight.
+    in property <bool>   alt-tab-selected: false;
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     callback close-clicked();
     callback minimize-clicked();
     callback maximize-clicked();
+    // Fired when the user clicks the titlebar (to activate/raise this window).
+    callback title-clicked();
 
     // ── Geometry — caller positions this component absolutely ─────────────────
     // Minimum sensible size; caller will set width/height from WindowItem geometry.
@@ -45,11 +53,26 @@ export component WindowChrome {
     animate resolved-border         { duration: 200ms; easing: ease-in-out; }
     animate resolved-titlebar-bg    { duration: 200ms; easing: ease-in-out; }
 
+    // ── Lifecycle animations (driven by Rust spring engine) ───────────────────
+    // The outer-frame opacity and scale are applied here so the entire chrome
+    // (titlebar + content + shadow) animates as one unit on open/close/min/max.
+    opacity: root.anim-opacity;
+
     // ── Outer frame with border and shadow ────────────────────────────────────
+    // We wrap in a transform Rectangle so the scale spring from the Rust engine
+    // can shrink the whole chrome about its centre without moving its x/y anchor.
+    transform-wrapper := Rectangle {
+        x: root.width * (1.0 - root.anim-scale) / 2;
+        y: root.height * (1.0 - root.anim-scale) / 2;
+        width: root.width * root.anim-scale;
+        height: root.height * root.anim-scale;
+        background: transparent;
+        clip: false;
+
     outer-frame := Rectangle {
         x: 0; y: 0;
-        width: root.width;
-        height: root.height;
+        width: parent.width;
+        height: parent.height;
 
         border-radius: Tokens.window-corner-radius-outer;
         // Approximate 0.5 px border as 1 px at 50% of spec opacity.
@@ -206,5 +229,35 @@ export component WindowChrome {
                     rgba(255, 255, 255, 0.00) 100%);
             }
         }
+
+        // ── Alt-tab selection outline ─────────────────────────────────────────
+        // A bright ring that appears when this window is selected in the
+        // alt-tab switcher. Drawn on top of everything.
+        if root.alt-tab-selected: Rectangle {
+            x: -2px;
+            y: -2px;
+            width: parent.width + 4px;
+            height: parent.height + 4px;
+            border-radius: Tokens.window-corner-radius-outer + 2px;
+            border-width: 2px;
+            border-color: rgba(100, 180, 255, 0.90);
+            background: transparent;
+        }
+    } // end outer-frame
+
+    // ── Titlebar click-to-activate touch area ─────────────────────────────────
+    // An invisible TouchArea layered over the titlebar region so clicking
+    // anywhere in the titlebar (but not on the control buttons) fires
+    // title-clicked → activate-window in Compositor.slint.
+    // The control buttons are rendered on top and will eat their own events.
+    titlebar-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: Tokens.titlebar-height;
+        // Lower z than control buttons so they take precedence.
+        clicked => { root.title-clicked(); }
     }
+
+    } // end transform-wrapper
 }

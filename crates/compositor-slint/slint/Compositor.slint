@@ -46,6 +46,12 @@ export struct WindowItem {
     texture: image,
     // Optional application icon.
     icon:    image,
+    // Animation values driven by the Rust spring engine (0.0–1.0).
+    // The Slint WindowChrome reads these to drive opacity / scale.
+    anim-opacity: float,   // 0.0 = invisible, 1.0 = fully visible
+    anim-scale:   float,   // 0.92 = shrunk, 1.0 = full size
+    // Whether this window is currently selected in the alt-tab ring.
+    alt-tab-selected: bool,
 }
 
 // A layer-shell surface from an external client.
@@ -123,11 +129,15 @@ export component Compositor inherits Window {
         title: win.title;
         focused: win.focused;
         content: win.texture;
+        anim-opacity: win.anim-opacity;
+        anim-scale: win.anim-scale;
+        alt-tab-selected: win.alt-tab-selected;
         z: 10;
 
         close-clicked    => { root.close-window(win.id); }
         minimize-clicked => { root.minimize-window(win.id); }
         maximize-clicked => { root.maximize-window(win.id); }
+        title-clicked    => { root.activate-window(win.id); }
     }
 
     // ── Layer 3: Top / overlay layer-shell surfaces ───────────────────────────

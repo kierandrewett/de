@@ -34,6 +34,7 @@ mod renderer;
 mod chrome_shader;
 mod wallpaper;
 mod desktop;
+pub mod wm;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
