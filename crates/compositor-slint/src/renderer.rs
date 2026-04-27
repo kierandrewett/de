@@ -63,7 +63,9 @@ use winit::{
 
 use crate::{
     chrome_shader::{ChromeShader, WindowChromeParams},
+    desktop,
     platform::{CalloopPlatform, GpuWindowAdapter},
+    wallpaper,
     wayland_state::{ClientState, SpikeState},
     Compositor, DockItem,
 };
@@ -199,6 +201,11 @@ struct CompositorApp {
     /// Pending pointer events — queued in window_event(), processed in the main loop.
     pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
     frame_count: u64,
+
+    // Dock state.
+    dock_entries: Vec<ResolvedDockEntry>,
+    /// app_ids that were running last time we checked (avoids unnecessary re-emits).
+    last_running_ids: std::collections::HashSet<String>,
 }
 
 impl CompositorApp {
@@ -207,6 +214,7 @@ impl CompositorApp {
         ui: Compositor,
         pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
         pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
+        dock_entries: Vec<ResolvedDockEntry>,
     ) -> Self {
         Self {
             window: None,
@@ -224,6 +232,8 @@ impl CompositorApp {
             pending_keys,
             pending_pointers,
             frame_count: 0,
+            dock_entries,
+            last_running_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -696,36 +706,145 @@ impl CompositorApp {
         );
         pointer.frame(state);
     }
+
+    /// Update `dock-items` running/focused flags from the current toplevel list.
+    ///
+    /// Walks `state.active_surface` to determine which app_ids have an open
+    /// toplevel.  For now we use the single-surface model (one active surface
+    /// at a time) — the full `ext-foreign-toplevel-list-v1` integration will
+    /// be wired once the wayland agent exposes a queryable app_id list.
+    fn update_dock_running(&mut self, state: &SpikeState) {
+        // Collect the app_id of the currently focused surface.
+        let focused_app_id: Option<String> = state
+            .active_surface
+            .as_ref()
+            .and_then(|wl_surface| {
+                use smithay::wayland::compositor::with_states;
+                use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+                with_states(wl_surface, |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|data| data.lock().ok()?.app_id.clone())
+                })
+            });
+
+        // Determine the set of running app_ids (for now: just the focused one).
+        let mut running_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(ref app_id) = focused_app_id {
+            running_ids.insert(app_id.clone());
+        }
+
+        // Only re-emit if the running set changed.
+        if running_ids == self.last_running_ids {
+            return;
+        }
+        self.last_running_ids = running_ids.clone();
+
+        let Some(ui) = self.ui.as_ref() else { return };
+
+        // Update each entry's running/focused flags.
+        let items: Vec<DockItem> = self
+            .dock_entries
+            .iter()
+            .map(|entry| {
+                let app_id_str = entry.item.app_id.as_str();
+                // Match against both the full app_id and its leaf (e.g. "firefox"
+                // should match "org.mozilla.firefox").
+                let running = running_ids.iter().any(|rid| {
+                    rid.as_str() == app_id_str
+                        || rid.rsplit('.').next() == Some(app_id_str)
+                        || app_id_str.rsplit('.').next() == Some(rid.as_str())
+                });
+                let focused = focused_app_id.as_deref().map_or(false, |fid| {
+                    fid == app_id_str
+                        || fid.rsplit('.').next() == Some(app_id_str)
+                        || app_id_str.rsplit('.').next() == Some(fid)
+                });
+                DockItem {
+                    icon: entry.item.icon.clone(),
+                    app_id: entry.item.app_id.clone(),
+                    running,
+                    focused,
+                    pinned: entry.item.pinned,
+                }
+            })
+            .collect();
+
+        let model = std::rc::Rc::new(VecModel::from(items));
+        ui.set_dock_items(slint::ModelRc::from(model));
+        debug!("dock running state updated, focused={:?}", focused_app_id);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Hardcoded placeholder dock items
+// Real dock items from .desktop files
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn make_placeholder_dock_items() -> Vec<DockItem> {
-    vec![
-        DockItem {
-            icon: slint::Image::default(),
-            app_id: SharedString::from("firefox"),
-            running: false,
-            focused: false,
-            pinned: true,
-        },
-        DockItem {
-            icon: slint::Image::default(),
-            app_id: SharedString::from("kitty"),
-            running: false,
-            focused: false,
-            pinned: true,
-        },
-        DockItem {
-            icon: slint::Image::default(),
-            app_id: SharedString::from("nautilus"),
-            running: false,
-            focused: false,
-            pinned: true,
-        },
-    ]
+/// Resolved dock entry — holds the Slint DockItem plus the exec line for launching.
+#[derive(Debug, Clone)]
+pub struct ResolvedDockEntry {
+    pub item: DockItem,
+    /// Exec line with `%`-field codes stripped; used by the launch-app handler.
+    pub exec: String,
+}
+
+/// Load pinned dock entries from config + resolve .desktop metadata.
+/// Returns both the list of `DockItem`s (for Slint) and the corresponding
+/// exec lines (for the launch handler).
+pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
+    let config = desktop::DockConfig::load();
+    let mut entries = Vec::new();
+
+    for pinned in &config.pinned {
+        let app_id = &pinned.app_id;
+        let info = desktop::resolve(app_id);
+
+        let icon = match &info.icon {
+            Some(path) => desktop::load_icon(path),
+            None => {
+                // Try generic fallback.
+                desktop::generic_app_icon()
+                    .map(|p| desktop::load_icon(&p))
+                    .unwrap_or_default()
+            }
+        };
+
+        entries.push(ResolvedDockEntry {
+            item: DockItem {
+                icon,
+                app_id: SharedString::from(app_id.as_str()),
+                running: false,
+                focused: false,
+                pinned: true,
+            },
+            exec: info.exec.clone(),
+        });
+    }
+
+    if entries.is_empty() {
+        warn!("dock config produced no entries, using hardcoded fallback");
+        for app_id in ["org.gnome.Nautilus", "org.mozilla.firefox", "kitty", "code"] {
+            let info = desktop::resolve(app_id);
+            let icon = info.icon
+                .as_deref()
+                .map(desktop::load_icon)
+                .unwrap_or_default();
+            entries.push(ResolvedDockEntry {
+                item: DockItem {
+                    icon,
+                    app_id: SharedString::from(app_id),
+                    running: false,
+                    focused: false,
+                    pinned: true,
+                },
+                exec: info.exec,
+            });
+        }
+    }
+
+    entries
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -798,11 +917,52 @@ pub fn run() -> Result<()> {
         chrono::Local::now().format("%H:%M:%S").to_string()
     ));
 
-    // Populate dock with 3 placeholder apps.
+    // ── Deliverable 1: Load wallpaper from disk ────────────────────────────
+    match wallpaper::load() {
+        Some(img) => {
+            info!("setting wallpaper image");
+            ui.set_wallpaper(img);
+        }
+        None => {
+            warn!("no wallpaper found on disk, using default #1e1e2e background");
+        }
+    }
+
+    // ── Deliverable 2 & 5: Real dock items from .desktop files ────────────
+    let dock_entries = load_dock_entries();
+    info!("loaded {} dock entries", dock_entries.len());
     {
-        let items = make_placeholder_dock_items();
+        let items: Vec<DockItem> = dock_entries.iter().map(|e| e.item.clone()).collect();
         let model = std::rc::Rc::new(VecModel::from(items));
         ui.set_dock_items(slint::ModelRc::from(model));
+    }
+
+    // ── Deliverable 4: launch-app via .desktop Exec line ──────────────────
+    // Build a map from app_id -> exec so the callback can look it up.
+    let exec_map: std::collections::HashMap<String, String> = dock_entries
+        .iter()
+        .map(|e| (e.item.app_id.to_string(), e.exec.clone()))
+        .collect();
+    let exec_map = Arc::new(exec_map);
+
+    {
+        let exec_map = exec_map.clone();
+        ui.on_launch_app(move |app_id| {
+            let app = app_id.to_string();
+            info!("launch-app({})", app);
+
+            // Look up the resolved exec line; fall back to running app_id directly.
+            let exec_line = exec_map.get(&app).cloned().unwrap_or_else(|| {
+                // Also try to resolve on the fly for apps not in the pinned list.
+                let info = desktop::resolve(&app);
+                info.exec
+            });
+
+            info!("  exec: {}", exec_line);
+            let _ = std::process::Command::new("setsid")
+                .args(["-f", "sh", "-c", &exec_line])
+                .spawn();
+        });
     }
 
     // Wire window-management callbacks (no-op stubs for now; wayland handlers
@@ -819,17 +979,6 @@ pub fn run() -> Result<()> {
         });
         ui.on_activate_window(|id| {
             info!("activate-window({})", id);
-        });
-    }
-
-    // Wire launch-app: spawn the named app via setsid.
-    {
-        ui.on_launch_app(|app_id| {
-            let app = app_id.to_string();
-            info!("launch-app({})", app);
-            let _ = std::process::Command::new("setsid")
-                .args([&app])
-                .spawn();
         });
     }
 
@@ -902,7 +1051,13 @@ pub fn run() -> Result<()> {
 
     let pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
     let pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let mut app = CompositorApp::new(window_ref, ui, pending_keys.clone(), pending_pointers.clone());
+    let mut app = CompositorApp::new(
+        window_ref,
+        ui,
+        pending_keys.clone(),
+        pending_pointers.clone(),
+        dock_entries,
+    );
 
     // 7. Main loop
     info!("Entering GPU compositor main loop");
@@ -924,6 +1079,7 @@ pub fn run() -> Result<()> {
         state.display_handle.flush_clients().ok();
         slint::platform::update_timers_and_animations();
         app.update_client_texture(&mut state);
+        app.update_dock_running(&state);
 
         // D3 — forward keyboard events.
         {

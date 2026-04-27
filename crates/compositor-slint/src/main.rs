@@ -32,6 +32,8 @@ mod wayland;
 mod platform;
 mod renderer;
 mod chrome_shader;
+mod wallpaper;
+mod desktop;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
