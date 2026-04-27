@@ -735,7 +735,12 @@ impl ChromeShader {
                 // Shadow composite pass: use the blurred shadow texture.
                 // We need a bind group pointing at the blurred texture.
                 // Look up via the bg_key (blurred texture pointer).
-                let tex_ptr = bg_key.unwrap();
+                //
+                // bg_key is None when the shadow cache hasn't been populated
+                // yet for this (size, sigma) combo — happens on the first
+                // frame after a window maps, before the blur pipeline has
+                // run. Skip the draw; the cache will populate next frame.
+                let Some(tex_ptr) = *bg_key else { continue };
                 // Build a temporary bind group for the blurred texture.
                 // We can't cache this generically without more bookkeeping, so we
                 // rebuild it each frame (cheap — no GPU allocation, just a CPU table lookup).
