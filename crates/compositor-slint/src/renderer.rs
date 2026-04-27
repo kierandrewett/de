@@ -28,7 +28,7 @@
 //! WM (Wave 1A): WindowManager drives focus stack, z-order, animations.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
