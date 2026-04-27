@@ -124,6 +124,7 @@ export component WindowChrome {
                     bg: rgba(255, 255, 255, 0.08);
                     bg-hover: rgba(255, 255, 255, 0.20);
                     bg-pressed: rgba(255, 255, 255, 0.30);
+                    icon: @image-url("assets/minimize.svg");
                     icon-tint: rgba(255, 255, 255, 0.80);
                     clicked => { root.minimize-clicked(); }
                 }
@@ -136,6 +137,7 @@ export component WindowChrome {
                     bg: rgba(255, 255, 255, 0.08);
                     bg-hover: rgba(255, 255, 255, 0.20);
                     bg-pressed: rgba(255, 255, 255, 0.30);
+                    icon: @image-url("assets/maximize.svg");
                     icon-tint: rgba(255, 255, 255, 0.80);
                     clicked => { root.maximize-clicked(); }
                 }
@@ -148,6 +150,7 @@ export component WindowChrome {
                     bg: rgba(255, 255, 255, 0.08);
                     bg-hover: rgba(200, 60, 60, 0.80);
                     bg-pressed: rgba(180, 40, 40, 0.90);
+                    icon: @image-url("assets/close.svg");
                     icon-tint: rgba(255, 255, 255, 0.80);
                     clicked => { root.close-clicked(); }
                 }

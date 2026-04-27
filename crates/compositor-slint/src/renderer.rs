@@ -63,8 +63,11 @@ use winit::{
 
 use crate::{
     chrome_shader::{ChromeShader, WindowChromeParams},
+    cursor::{self, CursorKind, HitZone, WindowRect, TITLEBAR_HEIGHT},
+    cursor_render::CursorRenderer,
     desktop,
     platform::{CalloopPlatform, GpuWindowAdapter},
+    resize::{self, ActiveDrag, ResizeEdge, WindowGeomSnapshot},
     wallpaper,
     wayland_state::{ClientState, SpikeState},
     Compositor, DockItem,
@@ -206,6 +209,18 @@ struct CompositorApp {
     dock_entries: Vec<ResolvedDockEntry>,
     /// app_ids that were running last time we checked (avoids unnecessary re-emits).
     last_running_ids: std::collections::HashSet<String>,
+
+    // ── Cursor system ─────────────────────────────────────────────────────────
+    /// SVG cursor rasteriser + cache.
+    cursor_renderer: CursorRenderer,
+    /// Current cursor kind (updated each pointer motion).
+    current_cursor: CursorKind,
+
+    // ── Drag state ────────────────────────────────────────────────────────────
+    /// Active window drag (resize or move), if any.
+    active_drag: Option<ActiveDrag>,
+    /// True while the left mouse button is held down.
+    left_button_down: bool,
 }
 
 impl CompositorApp {
@@ -234,6 +249,10 @@ impl CompositorApp {
             frame_count: 0,
             dock_entries,
             last_running_ids: std::collections::HashSet::new(),
+            cursor_renderer: CursorRenderer::new(),
+            current_cursor: CursorKind::Arrow,
+            active_drag: None,
+            left_button_down: false,
         }
     }
 
@@ -361,6 +380,8 @@ impl ApplicationHandler for CompositorApp {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_pos = (position.x, position.y);
+                // Update cursor overlay position in Slint immediately.
+                self.update_cursor_position(position.x, position.y);
                 // Forward to Slint for hit-testing (panel buttons, window chrome).
                 gpu_window.inner_window().dispatch_event(
                     slint::platform::WindowEvent::PointerMoved {
@@ -383,6 +404,17 @@ impl ApplicationHandler for CompositorApp {
                 let pos = LogicalPosition::new(
                     self.pointer_pos.0 as f32, self.pointer_pos.1 as f32,
                 );
+                let pressed = state == ElementState::Pressed;
+
+                // Track left button state for drag detection.
+                if button == MouseButton::Left {
+                    self.left_button_down = pressed;
+                    if !pressed {
+                        // Release any active drag.
+                        self.active_drag = None;
+                    }
+                }
+
                 let slint_event = match state {
                     ElementState::Pressed => slint::platform::WindowEvent::PointerPressed {
                         position: pos, button: slint_btn,
@@ -394,7 +426,6 @@ impl ApplicationHandler for CompositorApp {
                 gpu_window.inner_window().dispatch_event(slint_event);
                 // Also queue for wayland client forwarding (D2).
                 let evdev_btn = winit_button_to_evdev(button);
-                let pressed = state == ElementState::Pressed;
                 self.pending_pointers.lock().unwrap().push_back(
                     PendingPointerEvent::Button { button: evdev_btn, pressed }
                 );
@@ -627,7 +658,7 @@ impl CompositorApp {
     /// `x`, `y` are compositor-space logical coordinates.
     fn forward_pointer_motion(&self, state: &mut SpikeState, x: f64, y: f64) {
         use smithay::input::pointer::MotionEvent;
-        use smithay::utils::{Logical, Point};
+        use smithay::utils::Point;
 
         let pointer = match state.seat.get_pointer() {
             Some(p) => p,
@@ -775,6 +806,165 @@ impl CompositorApp {
         let model = std::rc::Rc::new(VecModel::from(items));
         ui.set_dock_items(slint::ModelRc::from(model));
         debug!("dock running state updated, focused={:?}", focused_app_id);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Cursor + drag system
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Build window rects from current state for hit-testing.
+    fn window_rects(state: &SpikeState) -> Vec<WindowRect> {
+        // Topmost window = last in list; iterate in reverse for front-to-back.
+        state.toplevels.iter().rev().map(|t| {
+            let pix = t.pixels.lock().unwrap();
+            let (w, h) = (pix.width as f64, pix.height as f64);
+            drop(pix);
+            WindowRect {
+                id: (&*t as *const _ as usize) as i32, // use ptr as id — fine for hit-test
+                x: t.x as f64,
+                y: t.y as f64,
+                w,
+                h: h + TITLEBAR_HEIGHT,
+            }
+        }).collect()
+    }
+
+    /// Hit-test a window from state using toplevel index.
+    fn find_toplevel_idx(state: &SpikeState, ptr_x: f64, ptr_y: f64) -> Option<usize> {
+        // Topmost = last in list.
+        for (idx, t) in state.toplevels.iter().enumerate().rev() {
+            let pix = t.pixels.lock().unwrap();
+            let (w, h) = (pix.width as f64, pix.height as f64);
+            drop(pix);
+            let full_h = h + TITLEBAR_HEIGHT;
+            if ptr_x >= t.x as f64 - cursor::EDGE_ZONE
+                && ptr_x < t.x as f64 + w + cursor::EDGE_ZONE
+                && ptr_y >= t.y as f64 - cursor::EDGE_ZONE
+                && ptr_y < t.y as f64 + full_h + cursor::EDGE_ZONE
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Called each pointer-motion event (after `pointer_pos` is updated).
+    /// Updates cursor shape, starts drags, continues active drags.
+    pub fn handle_pointer_update(&mut self, state: &mut SpikeState, x: f64, y: f64) {
+        // Build window rects for hit-testing (topmost-first).
+        let win_rects = Self::window_rects(state);
+
+        // If there's an active drag, handle it.
+        if let Some(drag) = self.active_drag.clone() {
+            match &drag {
+                ActiveDrag::Resize { toplevel_idx, .. } => {
+                    if let Some((nx, ny, nw, nh)) = resize::compute_resize(&drag, x, y) {
+                        if let Some(tl) = state.toplevels.get_mut(*toplevel_idx) {
+                            tl.x = nx;
+                            tl.y = ny;
+                            // Send configure to client with new content size.
+                            let surface = tl.surface.clone();
+                            // Find the ToplevelSurface for this WlSurface.
+                            let maybe_ts = state.xdg_shell_state
+                                .toplevel_surfaces()
+                                .iter()
+                                .find(|ts| ts.wl_surface() == &surface)
+                                .cloned();
+                            if let Some(toplevel) = maybe_ts {
+                                let cw = nw.max(resize::MIN_WINDOW_SIZE);
+                                let ch = nh.max(resize::MIN_WINDOW_SIZE);
+                                toplevel.with_pending_state(|s: &mut smithay::wayland::shell::xdg::ToplevelState| {
+                                    s.size = Some((cw, ch).into());
+                                });
+                                toplevel.send_configure();
+                                debug!("resize configure: {}×{} at ({},{})", cw, ch, nx, ny);
+                            }
+                        }
+                    }
+                    return; // Don't update cursor during resize drag.
+                }
+                ActiveDrag::Move { toplevel_idx, offset_x, offset_y } => {
+                    let (ox, oy) = (*offset_x, *offset_y);
+                    if let Some(tl) = state.toplevels.get_mut(*toplevel_idx) {
+                        tl.x = (x - ox) as i32;
+                        tl.y = (y - oy) as i32;
+                        debug!("move: window #{} to ({},{})", toplevel_idx, tl.x, tl.y);
+                    }
+                    return; // Don't update cursor during move drag.
+                }
+            }
+        }
+
+        // No active drag — run hit test to determine cursor and start drag on press.
+        let hit = cursor::hit_test(x, y, &win_rects);
+        let zone = hit.map(|h| h.zone).unwrap_or(HitZone::None);
+        let new_cursor = cursor::zone_to_cursor(zone);
+
+        if new_cursor != self.current_cursor {
+            self.current_cursor = new_cursor;
+            self.update_cursor_overlay();
+        }
+
+        // Start a drag if left button is down and we just detected it (drag init).
+        if self.left_button_down && self.active_drag.is_none() {
+            if let Some(ref hit_result) = hit {
+                let idx_opt = Self::find_toplevel_idx(state, x, y);
+                if let Some(idx) = idx_opt {
+                    if let Some(edge) = ResizeEdge::from_zone(zone) {
+                        // Start resize drag.
+                        let t = &state.toplevels[idx];
+                        let pix = t.pixels.lock().unwrap();
+                        let (w, h) = (pix.width as i32, pix.height as i32);
+                        drop(pix);
+                        self.active_drag = Some(ActiveDrag::Resize {
+                            toplevel_idx: idx,
+                            edge,
+                            start_ptr_x: x,
+                            start_ptr_y: y,
+                            start_geom: WindowGeomSnapshot {
+                                x: t.x, y: t.y, w, h,
+                            },
+                        });
+                        debug!("resize drag started: {:?} on window #{}", edge, idx);
+                    } else if zone == HitZone::TitleBar {
+                        // Start move drag.
+                        let t = &state.toplevels[idx];
+                        self.active_drag = Some(ActiveDrag::Move {
+                            toplevel_idx: idx,
+                            offset_x: x - t.x as f64,
+                            offset_y: y - t.y as f64,
+                        });
+                        debug!("move drag started on window #{}", idx);
+                    }
+                }
+                let _ = hit_result; // suppress unused warning
+            }
+        }
+    }
+
+    /// Push the current cursor image to the Slint UI.
+    fn update_cursor_overlay(&mut self) {
+        let Some(ui) = self.ui.as_ref() else { return };
+        let kind = self.current_cursor;
+        let img = self.cursor_renderer.get(kind);
+        let (hx, hy) = CursorRenderer::hotspot(kind);
+        let size = CursorRenderer::size();
+
+        ui.set_cursor_image(img);
+        ui.set_cursor_hotspot_x(hx);
+        ui.set_cursor_hotspot_y(hy);
+        ui.set_cursor_size(size);
+
+        if let Some(gpu_window) = self.gpu_window.as_ref() {
+            gpu_window.mark_dirty();
+        }
+    }
+
+    /// Update the cursor position in the Slint UI (called every pointer motion).
+    fn update_cursor_position(&mut self, x: f64, y: f64) {
+        let Some(ui) = self.ui.as_ref() else { return };
+        ui.set_cursor_x(x as f32);
+        ui.set_cursor_y(y as f32);
     }
 }
 
@@ -992,6 +1182,9 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // ── Cursor: prime initial cursor image so overlay is visible on first frame.
+    // We call this after the main loop starts via the CompositorApp init path.
+    // The actual first render happens in resumed() → render_frame().
     info!("Slint GPU platform ready — production Compositor UI");
 
     // 4. Wayland display + socket
@@ -1059,6 +1252,9 @@ pub fn run() -> Result<()> {
         dock_entries,
     );
 
+    // Initialise cursor overlay with the default arrow cursor.
+    app.update_cursor_overlay();
+
     // 7. Main loop
     info!("Entering GPU compositor main loop");
     loop {
@@ -1089,7 +1285,7 @@ pub fn run() -> Result<()> {
             }
         }
 
-        // D2 — forward pointer events to wayland clients.
+        // D2 — forward pointer events to wayland clients + cursor/drag handling.
         {
             let events: Vec<PendingPointerEvent> = {
                 let mut pointers = pending_pointers.lock().unwrap();
@@ -1098,9 +1294,17 @@ pub fn run() -> Result<()> {
             for pe in events {
                 match pe {
                     PendingPointerEvent::Motion { x, y } => {
+                        // Run cursor hit-test + drag update.
+                        app.handle_pointer_update(&mut state, x, y);
+                        // Forward to wayland client (only if not in a drag over chrome).
                         app.forward_pointer_motion(&mut state, x, y);
                     }
                     PendingPointerEvent::Button { button, pressed } => {
+                        // Trigger drag start on press (left button).
+                        if button == 0x110 && pressed {
+                            let (x, y) = app.pointer_pos;
+                            app.handle_pointer_update(&mut state, x, y);
+                        }
                         app.forward_pointer_button(&mut state, button, pressed);
                     }
                 }

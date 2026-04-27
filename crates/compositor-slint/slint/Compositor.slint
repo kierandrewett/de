@@ -30,6 +30,11 @@ import { Dock, DockItem } from "./Dock.slint";
 import { WindowChrome } from "./WindowChrome.slint";
 import { LayerSurface } from "./LayerSurface.slint";
 
+// ── Cursor overlay ────────────────────────────────────────────────────────────
+// The cursor image is rendered as a Slint Image at the top of the z-stack.
+// Rust feeds the rasterised cursor icon (already the right shape+rotation) and
+// the current pointer position.  We hide the OS cursor so ours is the only one.
+
 // ── Shared data structures ────────────────────────────────────────────────────
 
 // A single toplevel window fed by the Rust compositor state.
@@ -73,6 +78,18 @@ export component Compositor inherits Window {
     in property <string>        clock-text: "00:00";
     in property <image>         wallpaper;
     in property <[DockItem]>    dock-items;
+
+    // ── Cursor overlay (Rust → Slint) ─────────────────────────────────────────
+    // The rasterised cursor icon (correct shape, rotation already baked in).
+    in property <image>         cursor-image;
+    // Current pointer position in compositor logical pixels.
+    in property <float>         cursor-x: 0.0;
+    in property <float>         cursor-y: 0.0;
+    // Hotspot offset within the cursor image (pixels from top-left of icon).
+    in property <float>         cursor-hotspot-x: 4.0;
+    in property <float>         cursor-hotspot-y: 2.0;
+    // Cursor icon size (square).
+    in property <float>         cursor-size: 32.0;
 
     // ── Callbacks (Slint → Rust) ───────────────────────────────────────────────
     callback close-window(int);
@@ -161,5 +178,18 @@ export component Compositor inherits Window {
         clock-text: root.clock-text;
         toggle-datetime-popout => { root.toggle-datetime-popout(); }
         toggle-control-centre  => { root.toggle-control-centre(); }
+    }
+
+    // ── Layer 99: Custom cursor overlay ──────────────────────────────────────
+    // Painted at the highest z-order so it's always on top of everything.
+    // The image is positioned such that cursor-hotspot-{x,y} is at the pointer.
+    Image {
+        z: 99;
+        x: (root.cursor-x - root.cursor-hotspot-x) * 1px;
+        y: (root.cursor-y - root.cursor-hotspot-y) * 1px;
+        width: root.cursor-size * 1px;
+        height: root.cursor-size * 1px;
+        source: root.cursor-image;
+        image-fit: fill;
     }
 }

@@ -34,6 +34,9 @@ mod renderer;
 mod chrome_shader;
 mod wallpaper;
 mod desktop;
+mod cursor;
+mod cursor_render;
+mod resize;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
