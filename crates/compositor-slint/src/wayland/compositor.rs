@@ -46,6 +46,20 @@ impl CompositorHandler for SpikeState {
             }
         }
 
+        // If this commit is for the current cursor surface (a client set a
+        // wl_surface as its cursor via `wl_pointer.set_cursor`), import the
+        // pixels into the dedicated cursor buffer. update_windows pushes
+        // them to Slint's cursor-image each frame so animated cursors and
+        // dynamic in-app cursors render correctly.
+        use smithay::input::pointer::CursorImageStatus;
+        if let CursorImageStatus::Surface(cursor_surf) = &self.cursor_status {
+            if cursor_surf == surface || *cursor_surf == root {
+                let pixels = self.cursor_surface_pixels.clone();
+                let _ = import_shm_buffer(cursor_surf, &pixels);
+                return;
+            }
+        }
+
         // If `root` is a popup surface (or `surface` itself is a popup that
         // has no wl_subsurface parent), import for the popup's pixel buffer
         // and bail before falling through to toplevel handling.

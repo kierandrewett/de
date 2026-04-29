@@ -1153,10 +1153,40 @@ impl CompositorApp {
                         ui.set_cursor_hotspot_y(hy);
                     }
                 }
-                CursorImageStatus::Named(_) | CursorImageStatus::Surface(_) => {
-                    // Default named or surface cursor → leave our own
-                    // hit-zone-driven cursor in place.
+                CursorImageStatus::Named(_) => {
+                    // Default named → leave our own hit-zone cursor in place.
                     ui.set_cursor_visible(true);
+                }
+                CursorImageStatus::Surface(surf) => {
+                    // Client supplied a wl_surface as its cursor (drawing
+                    // apps, custom carets, animated cursors). The commit
+                    // handler imported the pixels into
+                    // `state.cursor_surface_pixels`; we just need to
+                    // push them to Slint's cursor-image plus the hotspot
+                    // from CursorImageSurfaceData.
+                    ui.set_cursor_visible(true);
+                    let p = state.cursor_surface_pixels.lock().unwrap();
+                    if p.width > 0 && p.height > 0 {
+                        let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                            &p.pixels, p.width, p.height,
+                        );
+                        let img = slint::Image::from_rgba8_premultiplied(pixel_buf);
+                        let (cw, ch) = (p.width as f32, p.height as f32);
+                        drop(p);
+                        // Read hotspot from the surface's cached state.
+                        use smithay::input::pointer::CursorImageSurfaceData;
+                        use smithay::wayland::compositor::with_states;
+                        let (hx, hy) = with_states(surf, |states| {
+                            states.data_map.get::<CursorImageSurfaceData>()
+                                .and_then(|d| d.lock().ok().map(|attrs|
+                                    (attrs.hotspot.x as f32, attrs.hotspot.y as f32)))
+                                .unwrap_or((0.0, 0.0))
+                        });
+                        ui.set_cursor_image(img);
+                        ui.set_cursor_hotspot_x(hx);
+                        ui.set_cursor_hotspot_y(hy);
+                        ui.set_cursor_size(cw.max(ch));
+                    }
                 }
             }
         }

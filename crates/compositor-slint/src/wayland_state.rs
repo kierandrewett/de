@@ -274,8 +274,14 @@ pub struct SpikeState {
     /// Latest cursor-image request from the focused client. `Default` keeps
     /// our compositor-supplied xcursor; `Hidden` hides the cursor entirely
     /// while the pointer is over that client; `Surface(_)` is a client-
-    /// supplied cursor surface (not yet honoured — falls back to default).
+    /// supplied cursor surface (drawing apps, custom carets) — pixels are
+    /// imported in the commit handler into `cursor_surface_pixels`.
     pub cursor_status: CursorImageStatus,
+    /// Composited pixel buffer for the current `Surface(_)` cursor. Updated
+    /// in the commit handler each time the cursor surface commits a new
+    /// frame (animated cursors). `update_windows` forwards this to the
+    /// Slint `cursor-image` along with the surface's hotspot.
+    pub cursor_surface_pixels: Arc<Mutex<ClientSurfaceData>>,
     pub egl_display: Option<EGLDisplay>,
     /// Surfaceless GLES renderer — initialised from `egl_display`.
     /// Used for: `ImportDma::import_dmabuf` → GL texture,
@@ -402,6 +408,7 @@ impl SpikeState {
             should_exit: false,
             pointer_pos: (0.0, 0.0),
             cursor_status: CursorImageStatus::default_named(),
+            cursor_surface_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             egl_display: None,
             gles_renderer: None,
             egl_init_tried: false,
