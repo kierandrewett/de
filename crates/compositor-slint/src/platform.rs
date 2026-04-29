@@ -78,16 +78,29 @@ impl GpuWindowAdapter {
         })
     }
 
-    /// Update stored size and dispatch a Slint resize event.
-    pub fn resize(&self, width: u32, height: u32) {
-        let new_size = PhysicalSize::new(width, height);
+    /// Update stored size + dispatch slint resize. `(physical_w, physical_h)`
+    /// is the host's actual pixel size (matches the swapchain texture); the
+    /// slint window is set to logical = physical / scale, so HiDPI scale
+    /// flows through cleanly: cursor positions, hit-test coords, pointer
+    /// events, and wayland forwarding all share the same logical-pixel
+    /// space, while the GPU still rasterises at native physical resolution.
+    pub fn resize(&self, physical_w: u32, physical_h: u32, scale: f32) {
+        let new_size = PhysicalSize::new(physical_w, physical_h);
         self.size.set(new_size);
-        // Slint works in logical pixels — with scale_factor=1 they are the same.
-        let logical = LogicalSize::new(width as f32, height as f32);
+        let s = scale.max(0.0001);
+        let logical = LogicalSize::new(
+            physical_w as f32 / s,
+            physical_h as f32 / s,
+        );
+        self.slint_window
+            .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: s });
         self.slint_window
             .dispatch_event(WindowEvent::Resized { size: logical });
         self.needs_redraw.set(true);
-        debug!("GpuWindowAdapter resized to {}x{}", width, height);
+        debug!(
+            "GpuWindowAdapter resized: physical={}x{} logical={}x{} scale={}",
+            physical_w, physical_h, logical.width, logical.height, s,
+        );
     }
 
     /// Render the Slint scene to the given wgpu texture (GPU path).

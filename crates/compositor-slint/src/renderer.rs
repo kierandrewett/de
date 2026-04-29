@@ -204,6 +204,11 @@ struct CompositorApp {
     /// render_texture, which reads as flicker / progressively-darkening.
     final_texture: Option<wgpu::Texture>,
     render_texture_size: (u32, u32),
+    /// Host display scale_factor (1.0 on standard, 2.0 on HiDPI). Used to
+    /// translate WM/slint LOGICAL coords → swapchain PHYSICAL coords for
+    /// the chrome shader passes + per-window re-blits, which operate on
+    /// the physical-sized render textures.
+    scale_factor: f32,
 
     gpu_window: Option<Rc<GpuWindowAdapter>>,
     window_ref: Arc<Mutex<Option<Rc<GpuWindowAdapter>>>>,
@@ -302,6 +307,7 @@ impl CompositorApp {
             render_texture: None,
             final_texture: None,
             render_texture_size: (0, 0),
+            scale_factor: 1.0,
             gpu_window: None,
             window_ref,
             ui: Some(ui),
@@ -401,7 +407,16 @@ impl ApplicationHandler for CompositorApp {
         self.chrome = Some(chrome);
         info!("ChromeRenderer initialised (shadow + border + highlight passes)");
 
-        gpu_window.resize(WIDTH, HEIGHT);
+        // Initial resize: physical = logical at startup (winit hasn't
+        // delivered a Resized yet) — scale_factor is queried from the
+        // winit window itself, which already knows the host's HiDPI
+        // factor at this point. The first WindowEvent::Resized that
+        // arrives shortly after will fix this up if the host disagrees.
+        let initial_scale = window.scale_factor() as f32;
+        let initial_phys_w = (WIDTH  as f32 * initial_scale).round() as u32;
+        let initial_phys_h = (HEIGHT as f32 * initial_scale).round() as u32;
+        self.scale_factor = initial_scale;
+        gpu_window.resize(initial_phys_w, initial_phys_h, initial_scale);
 
         if let Some(ui) = &self.ui {
             // Bind the persistent windows model exactly once. From now on
@@ -439,41 +454,65 @@ impl ApplicationHandler for CompositorApp {
             }
 
             WindowEvent::Resized(size) => {
-                let w = size.width.max(1);
-                let h = size.height.max(1);
+                // winit `size` is PHYSICAL pixels. Slint, our WM, our cursor
+                // overlay, and wayland clients all work in LOGICAL pixels —
+                // so when the host has scale_factor > 1 (HiDPI), feeding raw
+                // physical sizes everywhere makes the cursor visual end up
+                // at scale × the real pointer position and pointer events
+                // forwarded to clients land at the wrong spot. Divide by
+                // the host's scale_factor here so the WM, slint, and the
+                // wayland boundary all share one coord system.
+                let scale = self.window.as_ref()
+                    .map(|w| w.scale_factor())
+                    .unwrap_or(1.0)
+                    .max(0.0001);
+                self.scale_factor = scale as f32;
+                let logical_w = ((size.width  as f64 / scale).round() as u32).max(1);
+                let logical_h = ((size.height as f64 / scale).round() as u32).max(1);
                 if let Some(surface) = self.wgpu_surface.as_ref() {
+                    // wgpu surface is in physical pixels (raw size).
                     let fmt = configure_surface(
                         surface,
                         &gpu_window.wgpu_adapter,
                         &gpu_window.wgpu_device,
-                        w,
-                        h,
+                        size.width.max(1),
+                        size.height.max(1),
                     );
                     self.swapchain_format = Some(fmt);
                 }
-                gpu_window.resize(w, h);
+                // Tell slint + WM we're at logical size (matches the wayland
+                // output's advertised logical-pixel size). The render texture
+                // is allocated at PHYSICAL size below (matches swapchain).
+                gpu_window.resize(size.width.max(1), size.height.max(1), scale as f32);
                 self.render_texture = None;
                 self.final_texture  = None;
-                self.wm.output_w = w as i32;
-                self.wm.output_h = h as i32;
-                self.backdrop.set_output_size(w, h);
+                self.wm.output_w = logical_w as i32;
+                self.wm.output_h = logical_h as i32;
+                self.backdrop.set_output_size(logical_w, logical_h);
                 if let Some(c) = self.chrome.as_mut() {
                     c.invalidate();
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer_pos = (position.x, position.y);
-                // Update cursor overlay position in Slint immediately.
-                self.update_cursor_position(position.x, position.y);
-                // Forward to Slint for hit-testing (panel buttons, window chrome).
+                // winit `position` is PHYSICAL pixels. Convert to LOGICAL so
+                // the cursor visual, slint hit testing, and wayland client
+                // events all share the compositor's logical-pixel space.
+                let scale = self.window.as_ref()
+                    .map(|w| w.scale_factor())
+                    .unwrap_or(1.0)
+                    .max(0.0001);
+                let lx = position.x / scale;
+                let ly = position.y / scale;
+                self.pointer_pos = (lx, ly);
+                self.update_cursor_position(lx, ly);
                 gpu_window.inner_window().dispatch_event(
                     slint::platform::WindowEvent::PointerMoved {
-                        position: LogicalPosition::new(position.x as f32, position.y as f32),
+                        position: LogicalPosition::new(lx as f32, ly as f32),
                     },
                 );
                 self.pending_pointers.lock().unwrap().push_back(
-                    PendingPointerEvent::Motion { x: position.x, y: position.y }
+                    PendingPointerEvent::Motion { x: lx, y: ly }
                 );
             }
 
@@ -754,6 +793,12 @@ impl CompositorApp {
             // render_tex (only the squircle clip pass samples it; off by
             // default). target_view is final_tex.
             if let Some(chrome) = self.chrome.as_mut() {
+                // WM coords are LOGICAL pixels; the chrome shader operates on
+                // the PHYSICAL render texture. Multiply by scale_factor here
+                // so a window at logical (200, 100) on a 2× HiDPI screen
+                // maps to physical (400, 200), matching what slint actually
+                // rendered into the texture.
+                let s = self.scale_factor;
                 let chrome_windows: Vec<WindowChromeParams> = if let Some(ui) = self.ui.as_ref() {
                     let model = ui.get_windows();
                     let len = model.row_count();
@@ -761,21 +806,14 @@ impl CompositorApp {
                     (0..len).map(|i| {
                         let item = model.row_data(i).unwrap();
                         let focus_t = self.theme.window_focus_t(item.id);
-                        // GPU chrome (shadow + border + highlight) is drawn
-                        // around the VISIBLE chrome rect — for CSD apps that's
-                        // the cropped geom rect, for SSD it's geom + 33 px
-                        // titlebar. Using item.geom-w/h here (instead of
-                        // item.w/h, which is the configure size = full buffer
-                        // for CSD) keeps the shadow flush around what the
-                        // user actually sees.
                         let titlebar = if item.csd { 0.0 } else { 33.0 };
                         let chrome_w = item.geom_w.max(1) as f32;
                         let chrome_h = item.geom_h.max(1) as f32 + titlebar;
                         WindowChromeParams {
-                            x: item.x as f32,
-                            y: item.y as f32,
-                            w: chrome_w,
-                            h: chrome_h,
+                            x: item.x as f32 * s,
+                            y: item.y as f32 * s,
+                            w: chrome_w * s,
+                            h: chrome_h * s,
                             active: item.focused,
                             focus_t,
                             mode_t,
@@ -856,11 +894,18 @@ impl CompositorApp {
                 //              is clamped to the swapchain so an overlay
                 //              positioned partly off-screen doesn't crash
                 //              copy_texture_to_texture.
+                // reblit takes LOGICAL coords and converts internally to
+                // physical (matches the swapchain texture's pixel grid).
+                let s = self.scale_factor;
                 let mut reblit = |x: i32, y: i32, rw: i32, rh: i32| {
-                    let cx0 = x.max(0);
-                    let cy0 = y.max(0);
-                    let cx1 = (x + rw).min(w as i32).max(cx0);
-                    let cy1 = (y + rh).min(h as i32).max(cy0);
+                    let px  = (x  as f32 * s).round() as i32;
+                    let py  = (y  as f32 * s).round() as i32;
+                    let prw = (rw as f32 * s).round() as i32;
+                    let prh = (rh as f32 * s).round() as i32;
+                    let cx0 = px.max(0);
+                    let cy0 = py.max(0);
+                    let cx1 = (px + prw).min(w as i32).max(cx0);
+                    let cy1 = (py + prh).min(h as i32).max(cy0);
                     let cw = (cx1 - cx0) as u32;
                     let ch = (cy1 - cy0) as u32;
                     if cw == 0 || ch == 0 { return; }
@@ -881,8 +926,9 @@ impl CompositorApp {
 
                 let panel_h = crate::wm::PANEL_HEIGHT.max(0);
                 let dock_h  = crate::wm::DOCK_HEIGHT.max(0);
-                let iw = w as i32;
-                let ih = h as i32;
+                // reblit takes LOGICAL coords; iw/ih are LOGICAL screen size.
+                let iw = self.wm.output_w;
+                let ih = self.wm.output_h;
                 // Always-visible bands.
                 reblit(0, 0, iw, panel_h);
                 reblit(0, ih - dock_h, iw, dock_h);
