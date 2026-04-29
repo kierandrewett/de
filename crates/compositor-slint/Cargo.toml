@@ -87,6 +87,12 @@ ipc = { path = "../ipc" }
 # from smithay's renderer_gl + backend_egl features (already enabled above).
 # drm-fourcc is re-exported by smithay's allocator module so no direct dep needed.
 
+# Status-notifier (AppIndicator) support — DBus on the session bus. zbus's
+# default feature uses tokio; we keep that and run an async runtime on a
+# dedicated thread so the Wayland event loop stays sync.
+zbus = { workspace = true }
+tokio = { workspace = true }
+
 [[bin]]
 name = "compositor-slint"
 path = "src/main.rs"

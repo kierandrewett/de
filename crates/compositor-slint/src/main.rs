@@ -50,6 +50,7 @@ mod resize;
 mod snap;
 mod backdrop;
 mod ipc_server;
+mod tray;
 mod render;
 pub mod wm;
 

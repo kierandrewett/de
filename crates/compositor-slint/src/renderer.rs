@@ -251,6 +251,9 @@ struct CompositorApp {
     pending_close:    Arc<Mutex<VecDeque<i32>>>,
     /// Dock-menu deferred actions: `(app_id, action_id)` — 2=Show All, 5=Quit.
     pending_dock_action: Arc<Mutex<VecDeque<(String, i32)>>>,
+    /// Currently-registered StatusNotifierItems. Updated each frame by
+    /// draining tray-host events; rendered as panel tray icons.
+    tray_items: Vec<crate::tray::TrayItem>,
     pending_minimize: Arc<Mutex<VecDeque<i32>>>,
     pending_maximize: Arc<Mutex<VecDeque<i32>>>,
     pending_activate: Arc<Mutex<VecDeque<i32>>>,
@@ -321,6 +324,7 @@ impl CompositorApp {
             alt_tab: AltTabState::default(),
             pending_close:    Arc::new(Mutex::new(VecDeque::new())),
             pending_dock_action: Arc::new(Mutex::new(VecDeque::new())),
+            tray_items:        Vec::new(),
             pending_minimize: Arc::new(Mutex::new(VecDeque::new())),
             pending_maximize: Arc::new(Mutex::new(VecDeque::new())),
             pending_activate: Arc::new(Mutex::new(VecDeque::new())),
@@ -3066,6 +3070,12 @@ pub fn run() -> Result<()> {
     // screenshots, list windows, etc. via $XDG_RUNTIME_DIR/myDE.sock.
     ipc_server::spawn(None, app.pending_ipc.clone());
 
+    // StatusNotifierWatcher (AppIndicator host) — spawns a worker thread
+    // running tokio. Apps that integrate appindicator-style tray icons
+    // (Slack, Discord, Steam, network managers, …) register here and we
+    // surface them on the panel.
+    let mut tray_events = crate::tray::spawn_tray_host();
+
     // Initialise cursor overlay with the default arrow cursor.
     app.update_cursor_overlay();
 
@@ -3086,6 +3096,22 @@ pub fn run() -> Result<()> {
 
         calloop.dispatch(Some(Duration::ZERO), &mut state)
             .context("calloop dispatch error")?;
+
+        // Drain any tray-host events accumulated since last tick; the
+        // worker thread sends Added/Removed when apps register through
+        // the StatusNotifierWatcher.
+        while let Ok(ev) = tray_events.try_recv() {
+            match ev {
+                crate::tray::TrayEvent::Added(item) => {
+                    info!("tray: + {} ({})", item.title, item.service);
+                    app.tray_items.push(item);
+                }
+                crate::tray::TrayEvent::Removed(id) => {
+                    info!("tray: - id={}", id);
+                    app.tray_items.retain(|it| it.id != id);
+                }
+            }
+        }
 
         if state.should_exit { break; }
 
