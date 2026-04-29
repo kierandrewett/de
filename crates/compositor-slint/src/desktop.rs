@@ -119,12 +119,21 @@ pub struct DockConfig {
 
 impl Default for DockConfig {
     fn default() -> Self {
+        // Default pin set, ordered macOS-style: file manager, browser, mail,
+        // calendar, terminal, editor, music, settings — and a few extras
+        // for visual testing of the dock with a richer line-up.
         Self {
             pinned: vec![
                 PinnedApp { app_id: "org.gnome.Nautilus".into() },
                 PinnedApp { app_id: "org.mozilla.firefox".into() },
+                PinnedApp { app_id: "org.gnome.Geary".into() },
+                PinnedApp { app_id: "org.gnome.Calendar".into() },
                 PinnedApp { app_id: "kitty".into() },
                 PinnedApp { app_id: "code".into() },
+                PinnedApp { app_id: "org.gnome.Music".into() },
+                PinnedApp { app_id: "org.gnome.Settings".into() },
+                PinnedApp { app_id: "org.gnome.Calculator".into() },
+                PinnedApp { app_id: "org.gnome.TextEditor".into() },
             ],
         }
     }

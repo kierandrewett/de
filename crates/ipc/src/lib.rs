@@ -276,6 +276,50 @@ pub enum ShellRequest {
         /// Either `"light"` or `"dark"` (case-insensitive).
         mode: String,
     },
+
+    // ── Test / automation injection ──────────────────────────────────────────
+    // These let an out-of-process driver script exercise the compositor as a
+    // user would — useful for screenshots, smoke tests, and debugging.
+
+    /// Move the synthetic pointer to `(x, y)` in compositor logical pixels.
+    /// The compositor processes this exactly like a real winit cursor-moved
+    /// event (cursor overlay updates, hit-tests run, drags advance).
+    MovePointer {
+        /// X position in compositor logical pixels.
+        x: f64,
+        /// Y position in compositor logical pixels.
+        y: f64,
+    },
+
+    /// Press or release a mouse button at the current pointer position.
+    /// `button` is one of `"left"`, `"right"`, `"middle"`.
+    ClickPointer {
+        /// Button name.
+        button: String,
+        /// True = press, false = release.
+        pressed: bool,
+    },
+
+    /// Type a UTF-8 string by synthesising press/release events for each char.
+    TypeText {
+        /// The text to type.
+        text: String,
+    },
+
+    /// Press or release a single key by Linux evdev scancode.
+    KeyPress {
+        /// Linux evdev scancode (e.g. 28 = ENTER, 1 = ESC).
+        scancode: u32,
+        /// True = press, false = release.
+        pressed: bool,
+    },
+
+    /// Capture a screenshot of the compositor scene and write it as a PNG to
+    /// the given absolute filesystem path. Used by the playground / agents.
+    Screenshot {
+        /// Absolute path to write the PNG to.
+        save_path: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

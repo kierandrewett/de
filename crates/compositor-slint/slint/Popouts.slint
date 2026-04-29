@@ -1,0 +1,299 @@
+// Popouts.slint — Two small floating panels triggered from the top bar.
+//   DatetimePopout    — clock click → date / day / time card
+//   ControlCentrePopout — system icons click → quick toggles card
+//
+// Both are styled like the dock pill: rounded rectangle, theme-aware bg,
+// soft drop-shadow. They animate in/out via opacity + translate-y; Rust
+// drives the "open" boolean on Compositor.slint.
+
+import { Tokens, Theme, TokenMode } from "./Tokens.slint";
+
+// ── Datetime popout ──────────────────────────────────────────────────────────
+export component DatetimePopout {
+    in property <bool>   open;
+    in property <string> date-text: "";       // e.g. "Sunday, 27 April"
+    in property <string> clock-text: "00:00:00";
+    in property <string> day-text: "Today";
+
+    // Sized + positioned by the parent.
+    width: 280px;
+    height: 160px;
+
+    // Theme-aware bg (animated).
+    property <color> resolved-bg: Theme.mode == TokenMode.Dark
+        ? rgba(20, 22, 28, 0.92)
+        : rgba(255, 255, 255, 0.94);
+    property <color> resolved-fg: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.90)
+        : rgba(0, 0, 0, 0.85);
+    property <color> resolved-fg-secondary: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.55)
+        : rgba(0, 0, 0, 0.55);
+    property <color> resolved-border: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.10)
+        : rgba(0, 0, 0, 0.08);
+
+    animate resolved-bg            { duration: 200ms; easing: ease-in-out; }
+    animate resolved-fg            { duration: 200ms; easing: ease-in-out; }
+    animate resolved-fg-secondary  { duration: 200ms; easing: ease-in-out; }
+    animate resolved-border        { duration: 200ms; easing: ease-in-out; }
+
+    // Open/close transition. We drive a single `vis` property and bind
+    // both opacity and y-offset to it so a single `animate` block carries
+    // the whole transition. Slint will play the animation reliably this way
+    // (binding `opacity: open ? 1 : 0` + `visible:` together can race).
+    property <float> vis: open ? 1.0 : 0.0;
+    animate vis { duration: 200ms; easing: ease-out; }
+
+    opacity: vis;
+    // Slide down 8px as it fades in.
+    property <length> y-offset: -8px * (1.0 - vis);
+
+    Rectangle {
+        x: 0;
+        y: parent.y-offset;
+        width: parent.width;
+        height: parent.height;
+
+        background: root.resolved-bg;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: root.resolved-border;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: rgba(0, 0, 0, 0.45);
+        clip: true;
+
+        // Day label (top).
+        Text {
+            x: 16px;
+            y: 16px;
+            width: parent.width - 32px;
+            height: 18px;
+            text: root.day-text;
+            color: root.resolved-fg-secondary;
+            font-family: Tokens.font-family;
+            font-size: 12px;
+            font-weight: 500;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+        }
+
+        // Big clock.
+        Text {
+            x: 16px;
+            y: 34px;
+            width: parent.width - 32px;
+            height: 56px;
+            text: root.clock-text;
+            color: root.resolved-fg;
+            font-family: Tokens.font-family;
+            font-size: 44px;
+            font-weight: 600;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+        }
+
+        // Date row.
+        Text {
+            x: 16px;
+            y: parent.height - 36px;
+            width: parent.width - 32px;
+            height: 20px;
+            text: root.date-text;
+            color: root.resolved-fg;
+            font-family: Tokens.font-family;
+            font-size: 14px;
+            font-weight: 500;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── Control-centre popout ────────────────────────────────────────────────────
+export component ControlCentrePopout {
+    in property <bool> open;
+
+    callback theme-toggle-clicked();
+
+    width: 300px;
+    height: 220px;
+
+    property <color> resolved-bg: Theme.mode == TokenMode.Dark
+        ? rgba(20, 22, 28, 0.92)
+        : rgba(255, 255, 255, 0.94);
+    property <color> resolved-fg: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.90)
+        : rgba(0, 0, 0, 0.85);
+    property <color> resolved-fg-secondary: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.55)
+        : rgba(0, 0, 0, 0.55);
+    property <color> resolved-border: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.10)
+        : rgba(0, 0, 0, 0.08);
+    property <color> resolved-tile-bg: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.08)
+        : rgba(0, 0, 0, 0.05);
+    property <color> resolved-tile-bg-hover: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.14)
+        : rgba(0, 0, 0, 0.09);
+
+    animate resolved-bg            { duration: 200ms; easing: ease-in-out; }
+    animate resolved-fg            { duration: 200ms; easing: ease-in-out; }
+    animate resolved-fg-secondary  { duration: 200ms; easing: ease-in-out; }
+    animate resolved-border        { duration: 200ms; easing: ease-in-out; }
+    animate resolved-tile-bg       { duration: 200ms; easing: ease-in-out; }
+    animate resolved-tile-bg-hover { duration: 200ms; easing: ease-in-out; }
+
+    property <float> vis: open ? 1.0 : 0.0;
+    animate vis { duration: 200ms; easing: ease-out; }
+
+    opacity: vis;
+    property <length> y-offset: -8px * (1.0 - vis);
+
+    Rectangle {
+        x: 0;
+        y: parent.y-offset;
+        width: parent.width;
+        height: parent.height;
+
+        background: root.resolved-bg;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: root.resolved-border;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: rgba(0, 0, 0, 0.45);
+        clip: true;
+
+        Text {
+            x: 16px;
+            y: 14px;
+            width: parent.width - 32px;
+            height: 18px;
+            text: "Control Centre";
+            color: root.resolved-fg-secondary;
+            font-family: Tokens.font-family;
+            font-size: 12px;
+            font-weight: 500;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+        }
+
+        // 2×2 grid of placeholder tiles.
+        property <length> grid-x: 14px;
+        property <length> grid-y: 40px;
+        property <length> tile-w: (parent.width - 14px * 2 - 10px) / 2;
+        property <length> tile-h: 64px;
+        property <length> gap: 10px;
+
+        // Wifi tile (top-left).
+        wifi-ta := TouchArea {
+            x: parent.grid-x;
+            y: parent.grid-y;
+            width: parent.tile-w;
+            height: parent.tile-h;
+        }
+        Rectangle {
+            x: wifi-ta.x; y: wifi-ta.y; width: wifi-ta.width; height: wifi-ta.height;
+            background: wifi-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
+            border-radius: 10px;
+            animate background { duration: 100ms; easing: ease-out; }
+            Image {
+                x: 12px; y: (parent.height - self.height) / 2;
+                width: 22px; height: 22px;
+                source: @image-url("../assets/icons/wifi.svg");
+                colorize: root.resolved-fg;
+            }
+            Text {
+                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
+                text: "Wi-Fi"; color: root.resolved-fg;
+                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
+                horizontal-alignment: left; vertical-alignment: center;
+            }
+        }
+
+        // Bluetooth tile (top-right).
+        bt-ta := TouchArea {
+            x: parent.grid-x + parent.tile-w + parent.gap;
+            y: parent.grid-y;
+            width: parent.tile-w;
+            height: parent.tile-h;
+        }
+        Rectangle {
+            x: bt-ta.x; y: bt-ta.y; width: bt-ta.width; height: bt-ta.height;
+            background: bt-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
+            border-radius: 10px;
+            animate background { duration: 100ms; easing: ease-out; }
+            Image {
+                x: 12px; y: (parent.height - self.height) / 2;
+                width: 22px; height: 22px;
+                source: @image-url("../assets/icons/bluetooth.svg");
+                colorize: root.resolved-fg;
+            }
+            Text {
+                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
+                text: "Bluetooth"; color: root.resolved-fg;
+                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
+                horizontal-alignment: left; vertical-alignment: center;
+            }
+        }
+
+        // Display / theme toggle (bottom-left).
+        theme-ta := TouchArea {
+            x: parent.grid-x;
+            y: parent.grid-y + parent.tile-h + parent.gap;
+            width: parent.tile-w;
+            height: parent.tile-h;
+            clicked => { root.theme-toggle-clicked(); }
+        }
+        Rectangle {
+            x: theme-ta.x; y: theme-ta.y; width: theme-ta.width; height: theme-ta.height;
+            background: theme-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
+            border-radius: 10px;
+            animate background { duration: 100ms; easing: ease-out; }
+            Image {
+                x: 12px; y: (parent.height - self.height) / 2;
+                width: 22px; height: 22px;
+                source: Theme.mode == TokenMode.Dark
+                    ? @image-url("../assets/icons/sun.svg")
+                    : @image-url("../assets/icons/moon.svg");
+                colorize: root.resolved-fg;
+            }
+            Text {
+                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
+                text: Theme.mode == TokenMode.Dark ? "Light Mode" : "Dark Mode";
+                color: root.resolved-fg;
+                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
+                horizontal-alignment: left; vertical-alignment: center;
+            }
+        }
+
+        // Sound tile (bottom-right).
+        sound-ta := TouchArea {
+            x: parent.grid-x + parent.tile-w + parent.gap;
+            y: parent.grid-y + parent.tile-h + parent.gap;
+            width: parent.tile-w;
+            height: parent.tile-h;
+        }
+        Rectangle {
+            x: sound-ta.x; y: sound-ta.y; width: sound-ta.width; height: sound-ta.height;
+            background: sound-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
+            border-radius: 10px;
+            animate background { duration: 100ms; easing: ease-out; }
+            Image {
+                x: 12px; y: (parent.height - self.height) / 2;
+                width: 22px; height: 22px;
+                source: @image-url("../assets/icons/audio.svg");
+                colorize: root.resolved-fg;
+            }
+            Text {
+                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
+                text: "Sound"; color: root.resolved-fg;
+                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
+                horizontal-alignment: left; vertical-alignment: center;
+            }
+        }
+    }
+}

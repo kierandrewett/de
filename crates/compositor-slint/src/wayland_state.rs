@@ -150,6 +150,29 @@ pub struct ToplevelInfo {
     pub y: i32,
     /// Pixel buffer — updated by import_shm_buffer on each commit.
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
+    /// Client requested ClientSide decorations (CSD). False = SSD; we draw
+    /// our own titlebar above the client surface.
+    pub csd: bool,
+}
+
+/// A mapped xdg_popup — context menus, dropdowns, autocomplete, etc.
+/// Position is computed at `new_popup` time from the positioner, but the
+/// final compositor-space placement is resolved per-frame in `update_windows`
+/// (parent toplevel may have moved). Pixels are imported on each commit
+/// via the surface-tree composite (popups can have their own subsurfaces).
+#[derive(Debug, Clone)]
+pub struct PopupInfo {
+    pub surface: WlSurface,
+    pub popup: smithay::wayland::shell::xdg::PopupSurface,
+    /// Parent surface (toplevel OR another popup) — pop-up tree origin.
+    pub parent: WlSurface,
+    /// Popup geometry rect relative to the parent surface (positioner output).
+    pub rel_x: i32,
+    pub rel_y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// Composited pixel buffer from the popup's surface tree.
+    pub pixels: Arc<Mutex<ClientSurfaceData>>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -227,6 +250,10 @@ pub struct SpikeState {
 
     /// All mapped toplevels (multi-window support, insertion-ordered).
     pub toplevels: Vec<ToplevelInfo>,
+
+    /// Mapped xdg_popups — context menus, dropdowns, autocomplete lists.
+    /// Cleared per-popup in `popup_destroyed`.
+    pub popups: Vec<PopupInfo>,
 
     /// All mapped layer-shell surfaces (populated by WlrLayerShellHandler).
     pub layer_surfaces: Vec<LayerInfo>,
@@ -363,6 +390,7 @@ impl SpikeState {
             xdg_toplevel_tag_manager,
             active_surface: None,
             toplevels: Vec::new(),
+            popups: Vec::new(),
             layer_surfaces: Vec::new(),
             client_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             destroyed_surfaces: Vec::new(),
@@ -432,66 +460,283 @@ impl SpikeState {
 // SHM buffer import helper (called from wayland/compositor.rs)
 // ──────────────────────────────────────────────────────────────────────────────
 
-pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfaceData>>) {
+/// Composite the surface tree rooted at `surface` into a single premultiplied
+/// RGBA8 buffer. Walks parent + every subsurface, blitting each's pixels at
+/// the right offset. Critical for clients like Firefox whose xdg_toplevel
+/// commits an empty buffer and ships actual content via subsurfaces.
+///
+/// Strategy:
+///   1. First walk: read each surface's buffer dims + cumulative offset
+///      relative to the root, plus the maximum extent.
+///   2. Allocate an RGBA buffer sized to fit the union of all surfaces.
+///   3. Second walk: in z-order (parent → children, declared order), blit
+///      each surface's pixels into the composite.
+/// Scan a premultiplied-RGBA buffer for the bounding box of opaque content.
+/// Used to detect the visible-window rect inside a buffer that has CSD
+/// shadow/border padding (Firefox, GTK header-bar apps).
+///
+/// Samples 7 evenly-spaced columns and 7 evenly-spaced rows (rather than a
+/// single centerline) so a single transparent column / row in the buffer
+/// can't bias the result. We take min(top) / max(bottom) across columns and
+/// min(left) / max(right) across rows so the bbox encloses the *union* of
+/// opaque pixels seen on those scanlines — that's why the bottom edge no
+/// longer drops off when the centerline happens to land on a blank gutter.
+pub fn detect_visible_bbox(pixels: &[u8], width: u32, height: u32) -> Option<(i32, i32, i32, i32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let needed = (width as usize) * (height as usize) * 4;
+    if pixels.len() < needed {
+        return None;
+    }
+    // Threshold sized to stay above shadow-gradient peaks (~60–100) and
+    // catch anti-aliased border edges (~150+).
+    const ALPHA_THRESHOLD: u8 = 100;
+    let alpha_at = |x: u32, y: u32| -> u8 {
+        let i = (y as usize * width as usize + x as usize) * 4 + 3;
+        pixels[i]
+    };
+    let mut top = u32::MAX;
+    let mut bottom = 0u32;
+    let mut found_v = false;
+    for i in 1u32..=7 {
+        let cx = (width.saturating_mul(i)) / 8;
+        if let Some(t) = (0..height).find(|&y| alpha_at(cx, y) > ALPHA_THRESHOLD) {
+            top = top.min(t);
+            found_v = true;
+        }
+        if let Some(b) = (0..height).rev().find(|&y| alpha_at(cx, y) > ALPHA_THRESHOLD) {
+            bottom = bottom.max(b);
+        }
+    }
+    let mut left = u32::MAX;
+    let mut right = 0u32;
+    let mut found_h = false;
+    for i in 1u32..=7 {
+        let cy = (height.saturating_mul(i)) / 8;
+        if let Some(l) = (0..width).find(|&x| alpha_at(x, cy) > ALPHA_THRESHOLD) {
+            left = left.min(l);
+            found_h = true;
+        }
+        if let Some(r) = (0..width).rev().find(|&x| alpha_at(x, cy) > ALPHA_THRESHOLD) {
+            right = right.max(r);
+        }
+    }
+    if !found_v || !found_h || bottom < top || right < left {
+        return None;
+    }
+    Some((
+        left as i32, top as i32,
+        (right - left + 1) as i32,
+        (bottom - top + 1) as i32,
+    ))
+}
+
+/// Imports/composites the surface tree. Returns the count of surfaces that
+/// were composited — callers use `> 1` as a heuristic CSD signal (apps with
+/// subsurfaces nearly always paint their own chrome and shouldn't get our
+/// SSD titlebar on top).
+pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfaceData>>) -> usize {
     use smithay::backend::renderer::utils::with_renderer_surface_state;
+    use smithay::reexports::wayland_server::protocol::wl_shm;
+    use smithay::wayland::compositor::{
+        with_surface_tree_downward, SubsurfaceCachedState, TraversalAction,
+    };
     use smithay::wayland::shm::with_buffer_contents;
 
-    let buffer = match with_renderer_surface_state(surface, |s| s.buffer().cloned()) {
-        Some(Some(b)) => b,
-        _ => return,
-    };
-
-    let result = with_buffer_contents(&*buffer, |ptr: *const u8, len: usize, spec| {
-        use smithay::reexports::wayland_server::protocol::wl_shm;
-
-        let width = spec.width as u32;
-        let height = spec.height as u32;
-        let stride = spec.stride as usize;
-
-        // Both ARGB8888 and XRGB8888 store bytes in LE as [B, G, R, A/X].
-        // For XRGB8888 the X byte is always 0 — treat as fully opaque (alpha=255)
-        // so pixels are not zeroed out by the premultiply step below.
-        let has_alpha = matches!(spec.format, wl_shm::Format::Argb8888);
-
-        let data = unsafe { std::slice::from_raw_parts(ptr, len) };
-
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
-
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let src = y * stride + x * 4;
-                let dst = (y * width as usize + x) * 4;
-                if src + 4 > data.len() {
-                    break;
-                }
-                // wl_shm ARGB8888/XRGB8888 in LE: [B, G, R, A/X]
-                let b = data[src];
-                let g = data[src + 1];
-                let r = data[src + 2];
-                let a = if has_alpha { data[src + 3] } else { 255u8 };
-                // Premultiply for slint::Image::from_rgba8_premultiplied().
-                let af = a as f32 / 255.0;
-                rgba[dst] = (r as f32 * af) as u8;
-                rgba[dst + 1] = (g as f32 * af) as u8;
-                rgba[dst + 2] = (b as f32 * af) as u8;
-                rgba[dst + 3] = a;
-            }
-        }
-
-        info!("client surface imported, {}x{} SHM buffer (fmt={:?})", width, height, spec.format);
-
-        ClientSurfaceData {
-            pixels: rgba,
-            width,
-            height,
-            dirty: true,
-        }
-    });
-
-    match result {
-        Ok(data) => *pixels_out.lock().unwrap() = data,
-        Err(e) => warn!("SHM read failed: {:?}", e),
+    // ── Pass 1 — walk the tree to collect (surface, offset). DON'T call
+    //              with_renderer_surface_state from inside the walk: smithay's
+    //              tree traversal already holds surface-state locks and a
+    //              nested borrow deadlocks the wayland thread. We read each
+    //              surface's buffer dims later in a separate pass.
+    #[derive(Clone, Copy)]
+    struct Node {
+        offset_x: i32,
+        offset_y: i32,
+        width:    i32,
+        height:   i32,
     }
+    let mut surfaces_and_offsets: Vec<(WlSurface, (i32, i32))> = Vec::new();
+
+    with_surface_tree_downward(
+        surface,
+        (0i32, 0i32),
+        |sub, states, parent_offset| {
+            let mut my_offset = *parent_offset;
+            if sub != surface {
+                let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
+                let loc = sub_state.current().location;
+                my_offset.0 += loc.x;
+                my_offset.1 += loc.y;
+            }
+            surfaces_and_offsets.push((sub.clone(), my_offset));
+            TraversalAction::DoChildren(my_offset)
+        },
+        |_, _, _| {},
+        |_, _, _| true,
+    );
+
+    // Resolve buffer dims now that we're out of the surface-tree closure.
+    let nodes: Vec<(WlSurface, Node)> = surfaces_and_offsets.into_iter()
+        .map(|(s, off)| {
+            let (w, h) = with_renderer_surface_state(&s, |st| {
+                st.buffer_size().map(|sz| (sz.w, sz.h)).unwrap_or((0, 0))
+            }).unwrap_or((0, 0));
+            (s, Node { offset_x: off.0, offset_y: off.1, width: w, height: h })
+        })
+        .collect();
+
+    // ── Compute union bounds. If the root has its own buffer, its dims
+    //     anchor (0,0,W,H); otherwise we use the union of children.
+    let root_dims = nodes.first().map(|(_, n)| *n).unwrap_or(Node {
+        offset_x: 0, offset_y: 0, width: 0, height: 0,
+    });
+    let mut min_x = 0i32;
+    let mut min_y = 0i32;
+    let mut max_x = root_dims.width.max(0);
+    let mut max_y = root_dims.height.max(0);
+    for (_, n) in &nodes {
+        if n.width <= 0 || n.height <= 0 { continue }
+        min_x = min_x.min(n.offset_x);
+        min_y = min_y.min(n.offset_y);
+        max_x = max_x.max(n.offset_x + n.width);
+        max_y = max_y.max(n.offset_y + n.height);
+    }
+    let comp_w = (max_x - min_x).max(1) as u32;
+    let comp_h = (max_y - min_y).max(1) as u32;
+    let comp_len = (comp_w as usize) * (comp_h as usize) * 4;
+    let n_subs = nodes.len();
+
+    // ── Reuse the destination Vec instead of allocating fresh each commit.
+    //     Firefox at 1224×824 reallocates ~4 MB per commit at 60 Hz which
+    //     was the main allocator/cache-miss source of the slow refresh.
+    let mut out_guard = pixels_out.lock().unwrap();
+    let composite: &mut Vec<u8> = &mut out_guard.pixels;
+    if composite.len() != comp_len {
+        composite.clear();
+        composite.resize(comp_len, 0);
+    } else {
+        // Same size — just clear in-place (one memset, no realloc).
+        for b in composite.iter_mut() { *b = 0; }
+    }
+
+    // ── Pass 2 — blit each surface's buffer into the composite.
+    let mut any_pixels = false;
+    let single_surface = n_subs == 1;
+    for (sub, node) in &nodes {
+        if node.width <= 0 || node.height <= 0 { continue }
+
+        let buf = match with_renderer_surface_state(sub, |s| s.buffer().cloned()) {
+            Some(Some(b)) => b,
+            _ => continue,
+        };
+
+        let _ = with_buffer_contents(&*buf, |ptr: *const u8, len: usize, spec| {
+            let src_w = spec.width  as i32;
+            let src_h = spec.height as i32;
+            let stride = spec.stride as usize;
+            let has_alpha = matches!(spec.format, wl_shm::Format::Argb8888);
+            let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+            let ox = node.offset_x - min_x;
+            let oy = node.offset_y - min_y;
+
+            // ── Compute the per-row clipped X range once, outside the loop.
+            let dst_x_start = (ox.max(0)) as usize;
+            let dst_x_end   = ((ox + src_w).min(comp_w as i32)) as usize;
+            if dst_x_end <= dst_x_start { return; }
+            let src_x_start = (dst_x_start as i32 - ox) as usize;
+            let row_pixels  = dst_x_end - dst_x_start;
+            let comp_row    = comp_w as usize * 4;
+
+            // ── Fast path: single-surface tree with no horizontal/vertical
+            //     padding and an opaque XRGB8888 buffer → bulk row memcpy
+            //     with B↔R swap. This is the common case for SSD apps like
+            //     kitty/foot and skips the per-pixel float math entirely.
+            if single_surface && !has_alpha && ox == 0 && oy == 0
+                && row_pixels == comp_w as usize
+            {
+                for y in 0..src_h {
+                    if y >= comp_h as i32 { break; }
+                    let s_row = (y as usize) * stride;
+                    let d_row = (y as usize) * comp_row;
+                    if s_row + row_pixels * 4 > data.len() { break; }
+                    let src = &data[s_row .. s_row + row_pixels * 4];
+                    let dst = &mut composite[d_row .. d_row + row_pixels * 4];
+                    // BGRA → premultiplied RGBA (alpha=255 → no premul math).
+                    for px in 0..row_pixels {
+                        let i = px * 4;
+                        dst[i]     = src[i + 2];
+                        dst[i + 1] = src[i + 1];
+                        dst[i + 2] = src[i];
+                        dst[i + 3] = 255;
+                    }
+                }
+                any_pixels = true;
+                return;
+            }
+
+            // ── General path: per-row source-over compositing.
+            for y in 0..src_h {
+                let dy = oy + y;
+                if dy < 0 || dy >= comp_h as i32 { continue; }
+                let s_row = (y as usize) * stride + src_x_start * 4;
+                let d_row = (dy as usize) * comp_row + dst_x_start * 4;
+                if s_row + row_pixels * 4 > data.len() { continue; }
+                let src = &data[s_row .. s_row + row_pixels * 4];
+                let dst = &mut composite[d_row .. d_row + row_pixels * 4];
+                for px in 0..row_pixels {
+                    let si = px * 4;
+                    let b = src[si];
+                    let g = src[si + 1];
+                    let r = src[si + 2];
+                    let a = if has_alpha { src[si + 3] } else { 255u8 };
+                    if a == 0 { continue; }
+                    let di = px * 4;
+                    if a == 255 {
+                        // Fully opaque — direct overwrite, no float math.
+                        dst[di]     = r;
+                        dst[di + 1] = g;
+                        dst[di + 2] = b;
+                        dst[di + 3] = 255;
+                    } else {
+                        let af = a as f32 * (1.0 / 255.0);
+                        let inv = 1.0 - af;
+                        let pr = (r as f32 * af) as u8;
+                        let pg = (g as f32 * af) as u8;
+                        let pb = (b as f32 * af) as u8;
+                        dst[di]     = pr.saturating_add((dst[di]     as f32 * inv) as u8);
+                        dst[di + 1] = pg.saturating_add((dst[di + 1] as f32 * inv) as u8);
+                        dst[di + 2] = pb.saturating_add((dst[di + 2] as f32 * inv) as u8);
+                        dst[di + 3] = a.saturating_add((dst[di + 3] as f32 * inv) as u8);
+                    }
+                    any_pixels = true;
+                }
+            }
+        });
+    }
+
+    if !any_pixels && n_subs <= 1 {
+        // Single-surface tree with no pixels — nothing to do; leave the old
+        // buffer alone instead of overwriting with a blank one.
+        // (The Vec clear above touched it, so refill from old metadata? No —
+        // the caller relies on width staying 0 for "nothing committed yet"
+        // detection. Since we only get here with no opaque pixels at all,
+        // mark the buffer as zero-sized.)
+        out_guard.width = 0;
+        out_guard.height = 0;
+        return n_subs;
+    }
+
+    if n_subs > 1 {
+        // Quieter than info! at the per-frame rate Firefox hits.
+        debug!("composited surface tree: {} surfaces, {}×{}", n_subs, comp_w, comp_h);
+    }
+
+    out_guard.width  = comp_w;
+    out_guard.height = comp_h;
+    out_guard.dirty  = true;
+    n_subs
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

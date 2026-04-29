@@ -1,32 +1,41 @@
 // Panel.slint — Top-of-screen shell panel.
-// Layout: [Focused App]  [——— Clock ———]  [Network | Audio | Power | CC▼]
-// Colours are drawn from Theme global so they animate on light/dark mode switch.
-// Height: 34 px.  Full-width, flush to top.
+// Layout: [Focused App]  [— Clock —]  [Network | Audio | Power]
 //
-// Animation strategy:
-//   Locally-resolved colour properties watch Theme.mode and carry 200 ms
-//   ease-in-out animate blocks so the panel crossfades on mode change.
+// Backdrop: takes a `backdrop` image (pre-blurred wallpaper) which it
+// stretches to the full screen size and clips to its own rect, giving the
+// bar a glass look without a per-frame GPU pass.
 
 import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { StatusIcon } from "./widgets/StatusIcon.slint";
 
 export component Panel {
-    // ── Inbound properties ───────────────────────────────────────────────────
     in property <string> focused-app: "";
     in property <string> clock-text: "00:00";
-    in property <image>  icon-network;
-    in property <image>  icon-audio;
-    in property <image>  icon-power;
+    /// Short date string shown next to the time (e.g. "Wed 29 Apr").
+    in property <string> date-text: "";
+    // Status icons default to phosphor. Filled variants are used where the
+    // glyph is small + symbolic (audio, bluetooth, search); outline for the
+    // power button (filled was too heavy in the bar) and the wifi/network
+    // strength indicators. Rust may override per-state.
+    in property <image>  icon-network:   @image-url("../assets/icons/network.svg");
+    in property <image>  icon-wifi:      @image-url("../assets/icons/wifi-high.svg");
+    in property <image>  icon-audio:     @image-url("../assets/icons/audio.svg");
+    in property <image>  icon-power:     @image-url("../assets/icons/power.svg");
+    in property <image>  icon-search:    @image-url("../assets/icons/search.svg");
+    in property <image>  icon-bluetooth: @image-url("../assets/icons/bluetooth.svg");
 
-    // ── Callbacks ─────────────────────────────────────────────────────────────
+    // Glass backdrop — pre-blurred wallpaper stretched to screen size,
+    // clipped to bar rect.
+    in property <image>  backdrop;
+    in property <length> backdrop-screen-w: 1px;
+    in property <length> backdrop-screen-h: 1px;
+
     callback toggle-datetime-popout();
     callback toggle-control-centre();
 
-    // ── Geometry ─────────────────────────────────────────────────────────────
     width: 100%;
     height: Tokens.panel-height;
 
-    // ── Locally-resolved colours (animated) ───────────────────────────────────
     property <color> resolved-bg:           Theme.panel-bg;
     property <color> resolved-fg:           Theme.panel-fg;
     property <color> resolved-border:       Theme.panel-border-bottom;
@@ -39,13 +48,29 @@ export component Panel {
     animate resolved-border   { duration: 200ms; easing: ease-in-out; }
     animate resolved-hover-bg { duration: 200ms; easing: ease-in-out; }
 
-    // Bar background.
     bar := Rectangle {
         width: parent.width;
         height: parent.height;
-        background: root.resolved-bg;
+        background: transparent;
+        clip: true;
 
-        // 0.5 px bottom border.
+        // Backdrop layer.
+        Image {
+            x: 0;
+            y: 0;
+            width: root.backdrop-screen-w;
+            height: root.backdrop-screen-h;
+            source: root.backdrop;
+            image-fit: fill;
+        }
+
+        // Theme tint over the backdrop.
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: root.resolved-bg;
+        }
+
         bottom-border := Rectangle {
             x: 0;
             y: parent.height - 1px;
@@ -54,16 +79,14 @@ export component Panel {
             background: root.resolved-border;
         }
 
-        // ── Left zone: focused application name ──────────────────────────────
+        // Focused-app text (left).
         left-zone := Rectangle {
-            x: 0;
-            y: 0;
+            x: 0; y: 0;
             width: parent.width / 3;
             height: parent.height;
 
             Text {
-                x: 14px;
-                y: 0;
+                x: 14px; y: 0;
                 width: parent.width - 14px;
                 height: parent.height;
                 text: root.focused-app;
@@ -76,12 +99,13 @@ export component Panel {
             }
         }
 
-        // ── Centre zone: clock ───────────────────────────────────────────────
+        // Clock — centre, button-sized hover. Renders date + time side by
+        // side with the date in a slightly muted weight, like macOS.
         clock-zone := Rectangle {
             x: (parent.width - self.width) / 2;
-            y: 0;
-            width: parent.width / 3;
-            height: parent.height;
+            y: (parent.height - self.height) / 2;
+            width: row-l.preferred-width + 24px;
+            height: parent.height - 8px;
 
             clock-touch := TouchArea {
                 width: parent.width;
@@ -89,7 +113,6 @@ export component Panel {
                 clicked => { root.toggle-datetime-popout(); }
             }
 
-            // Hover highlight.
             Rectangle {
                 width: parent.width;
                 height: parent.height;
@@ -100,25 +123,41 @@ export component Panel {
                 animate background { duration: 100ms; easing: ease-out; }
             }
 
-            Text {
-                width: parent.width;
+            row-l := HorizontalLayout {
+                x: (parent.width - self.preferred-width) / 2;
+                y: 0;
                 height: parent.height;
-                text: root.clock-text;
-                color: root.resolved-fg;
-                font-family: Tokens.font-family;
-                font-size: Tokens.panel-font-size;
-                font-weight: 500;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+                spacing: 10px;
+                alignment: center;
+
+                if root.date-text != "": Text {
+                    text: root.date-text;
+                    color: root.resolved-fg;
+                    font-family: Tokens.font-family;
+                    font-size: Tokens.panel-font-size;
+                    font-weight: 500;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.clock-text;
+                    color: root.resolved-fg;
+                    font-family: Tokens.font-family;
+                    font-size: Tokens.panel-font-size;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
             }
         }
 
-        // ── Right zone: status icons + control-centre button ─────────────────
+        // Status icons — right, sized to the icon row.
         right-zone := Rectangle {
-            x: parent.width - self.width;
-            y: 0;
-            width: parent.width / 3;
-            height: parent.height;
+            property <length> icons-w: 3 * 16px + 2 * 8px;
+            property <length> zone-padding: 8px;
+
+            x: parent.width - self.width - 8px;
+            y: (parent.height - self.height) / 2;
+            width: icons-w + zone-padding * 2;
+            height: parent.height - 8px;
 
             cc-touch := TouchArea {
                 width: parent.width;
@@ -126,7 +165,6 @@ export component Panel {
                 clicked => { root.toggle-control-centre(); }
             }
 
-            // Hover highlight.
             Rectangle {
                 width: parent.width;
                 height: parent.height;
@@ -137,32 +175,26 @@ export component Panel {
                 animate background { duration: 100ms; easing: ease-out; }
             }
 
-            // Icons row — right-aligned inside the zone.
             icons-row := Rectangle {
-                x: parent.width - self.width - 14px;
+                x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
-                width: 3 * 16px + 2 * 8px;
+                width: parent.icons-w;
                 height: 16px;
 
                 StatusIcon {
-                    x: 0;
-                    y: 0;
+                    x: 0; y: 0;
                     icon: root.icon-network;
                     name: "network";
                     tint: root.resolved-fg;
                 }
-
                 StatusIcon {
-                    x: 16px + 8px;
-                    y: 0;
+                    x: 16px + 8px; y: 0;
                     icon: root.icon-audio;
                     name: "audio";
                     tint: root.resolved-fg;
                 }
-
                 StatusIcon {
-                    x: (16px + 8px) * 2;
-                    y: 0;
+                    x: (16px + 8px) * 2; y: 0;
                     icon: root.icon-power;
                     name: "power";
                     tint: root.resolved-fg;

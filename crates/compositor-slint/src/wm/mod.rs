@@ -14,9 +14,9 @@ use tracing::{debug, info};
 
 /// Panel height (reserved at top of screen).
 pub const PANEL_HEIGHT: i32 = 34;
-/// Dock height (reserved at bottom of screen).  Approximate — full dock
-/// metrics come from the Slint Dock component but we use this for placement.
-pub const DOCK_HEIGHT: i32 = 72;
+/// Dock height (reserved at bottom of screen). Matches Dock.slint:
+/// `64 px (icons) + 2 * dock-padding + 2 * dock-outer-gap` with both = 8 px.
+pub const DOCK_HEIGHT: i32 = 96;
 /// Titlebar height that the SSD chrome adds above the client content.
 pub const TITLEBAR_HEIGHT: f64 = 33.0;
 
@@ -31,11 +31,19 @@ pub const DEFAULT_WINDOW_W: i32 = 800;
 pub const DEFAULT_WINDOW_H: i32 = 600;
 
 /// Spring stiffness for open/close/min/max animations.
-pub const SPRING_STIFFNESS: f64 = 400.0;
-/// Spring damping ratio for open/close/min/max animations (0.7 = slightly underdamped).
-pub const SPRING_DAMPING: f64 = 0.7;
+/// Tuned for a macOS-feel: ~250 ms total animation with no overshoot.
+pub const SPRING_STIFFNESS: f64 = 200.0;
+/// Damping ratio. 1.0 = critically damped (no bounce, smooth ease-out feel).
+pub const SPRING_DAMPING: f64 = 1.0;
 /// Spring settle epsilon.
 pub const SPRING_EPSILON: f64 = 0.001;
+
+/// Open animation start scale (window scales from this to 1.0 as it opens).
+pub const OPEN_SCALE_FROM: f64 = 0.85;
+/// Close animation end scale.
+pub const CLOSE_SCALE_TO: f64 = 0.85;
+/// Minimize animation end scale.
+pub const MINIMIZE_SCALE_TO: f64 = 0.40;
 
 /// Close animation settle threshold: when opacity falls below this, remove the window.
 pub const CLOSE_OPACITY_THRESHOLD: f32 = 0.01;
@@ -166,7 +174,7 @@ impl WindowAnimState {
         opacity.set_target(1.0);
 
         let mut scale = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
-        scale.set_instant(0.92);
+        scale.set_instant(OPEN_SCALE_FROM);
         scale.set_target(1.0);
 
         let mut geo_x = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
@@ -240,6 +248,11 @@ pub struct WindowState {
     pub pre_maximize: Option<(i32, i32, i32, i32)>,
     /// Geometry before minimize (for restore).
     pub pre_minimize: Option<(i32, i32, i32, i32)>,
+    /// Geometry before the most recent snap (left/right half, quarter,
+    /// maximize-via-edge-snap). When the user starts a Move drag on a
+    /// window with this set, we restore to that pre-snap rect so dragging
+    /// out of a snap feels like macOS/Windows.
+    pub pre_snap: Option<(i32, i32, i32, i32)>,
     /// Whether this window currently has keyboard focus.
     pub focused: bool,
     pub minimized: bool,
@@ -258,11 +271,48 @@ pub struct WindowState {
     pub title: String,
     /// When true, the alt-tab ring is currently selecting this window.
     pub alt_tab_selected: bool,
+    /// True until the client commits its first buffer. The open spring stays
+    /// parked while this is true; we kick it off in the renderer when the
+    /// first buffer arrives so the open animation is actually visible.
+    pub awaiting_first_render: bool,
+    /// Mirror of `ToplevelInfo.csd`. When true the client paints its own
+    /// titlebar/border, so hit-test should not add `TITLEBAR_HEIGHT`.
+    pub csd: bool,
+    /// Visible-rect dims from `xdg_surface.set_window_geometry` (or our
+    /// pixel-driven auto-detect), in logical pixels. CSD clients pad their
+    /// buffer with shadow + corner pixels; the geom rect is what we actually
+    /// display, and is therefore the size hit-tests / chrome layout should
+    /// use. Falls back to `(w, h)` when the client never set a
+    /// window-geometry and the buffer is fully opaque.
+    pub geom_w: i32,
+    pub geom_h: i32,
+    /// Visible-rect offset within the buffer. Non-zero for CSD apps whose
+    /// shadow/border padding we cropped out — pointer events need to add
+    /// `(geom_x, geom_y)` to chrome-space coords to address the right pixel
+    /// in the buffer (and therefore the right subsurface).
+    pub geom_x: i32,
+    pub geom_y: i32,
 }
 
 impl WindowState {
     pub fn new(id: i32, surface: WlSurface, x: i32, y: i32, w: i32, h: i32, z_order: usize) -> Self {
-        let anim = WindowAnimState::new_opening(x, y, w, h);
+        // Spring at PARKED start values (target = current, done = true).
+        // start_open() is fired from the renderer when the first buffer
+        // commits so the user sees the animation play.
+        let mut opacity = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        opacity.set_instant(0.0);
+        let mut scale = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        scale.set_instant(OPEN_SCALE_FROM);
+        let mut geo_x = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        geo_x.set_instant(x as f64);
+        let mut geo_y = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        geo_y.set_instant(y as f64);
+        let mut geo_w = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        geo_w.set_instant(w as f64);
+        let mut geo_h = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        geo_h.set_instant(h as f64);
+        let anim = WindowAnimState { opacity, scale, geo_x, geo_y, geo_w, geo_h };
+
         Self {
             id,
             surface,
@@ -272,6 +322,7 @@ impl WindowState {
             h,
             pre_maximize: None,
             pre_minimize: None,
+            pre_snap: None,
             focused: false,
             minimized: false,
             maximized: false,
@@ -282,33 +333,37 @@ impl WindowState {
             app_id: String::new(),
             title: String::new(),
             alt_tab_selected: false,
+            awaiting_first_render: true,
+            csd: false,
+            geom_w: w,
+            geom_h: h,
+            geom_x: 0,
+            geom_y: 0,
         }
     }
 
-    /// Start the open animation (opacity 0→1, scale 0.92→1.0).
+    /// Start the open animation (opacity 0→1, scale OPEN_SCALE_FROM→1.0).
     pub fn start_open(&mut self) {
         self.anim.opacity.set_instant(0.0);
         self.anim.opacity.set_target(1.0);
-        self.anim.scale.set_instant(0.92);
+        self.anim.scale.set_instant(OPEN_SCALE_FROM);
         self.anim.scale.set_target(1.0);
         self.phase = AnimPhase::Opening;
     }
 
-    /// Start the close animation (opacity 1→0, scale 1.0→0.92).
+    /// Start the close animation.
     pub fn start_close(&mut self) {
         self.closing = true;
         self.anim.opacity.set_target(0.0);
-        self.anim.scale.set_target(0.92);
+        self.anim.scale.set_target(CLOSE_SCALE_TO);
         self.phase = AnimPhase::Closing;
     }
 
     /// Start the minimize animation: fade + shrink toward dock area.
     pub fn start_minimize(&mut self, dock_target_y: i32) {
-        // Save current geometry for restore.
         self.pre_minimize = Some((self.x, self.y, self.w, self.h));
         self.anim.opacity.set_target(0.0);
-        self.anim.scale.set_target(0.5);
-        // Move toward bottom of screen (dock area).
+        self.anim.scale.set_target(MINIMIZE_SCALE_TO);
         self.anim.set_geometry_target(self.x + self.w / 4, dock_target_y, self.w / 2, self.h / 2);
         self.minimized = true;
         self.phase = AnimPhase::Minimized;
@@ -445,8 +500,9 @@ impl WindowManager {
         let (x, y) = self.smart_cascade_position();
 
         let key = Self::key(&surface);
-        let mut win = WindowState::new(id, surface.clone(), x, y, DEFAULT_WINDOW_W, DEFAULT_WINDOW_H, z);
-        win.start_open();
+        // Spring stays parked until the renderer sees the first buffer commit
+        // and calls start_open() — keeps the open animation visible.
+        let win = WindowState::new(id, surface.clone(), x, y, DEFAULT_WINDOW_W, DEFAULT_WINDOW_H, z);
 
         info!("WM: add window id={} key={} at ({},{}) z={}", id, key, x, y, z);
         self.windows.insert(key, win);
@@ -599,6 +655,20 @@ impl WindowManager {
         self.focus_stack.last().and_then(|k| self.windows.get(k)).map(|w| w.surface.clone())
     }
 
+    /// Drop focus from every window (e.g. after a click on the desktop).
+    /// Returns true if at least one window changed focus state.
+    pub fn unfocus_all(&mut self) -> bool {
+        let mut changed = false;
+        for win in self.windows.values_mut() {
+            if win.focused {
+                win.focused = false;
+                changed = true;
+            }
+        }
+        self.focus_stack.clear();
+        changed
+    }
+
     /// Handle pointer click at compositor-space (x, y): focus the topmost window under cursor.
     /// Returns the surface that was focused (if any).
     pub fn pointer_click_focus(&mut self, x: f64, y: f64) -> Option<WlSurface> {
@@ -610,9 +680,11 @@ impl WindowManager {
             }
             let wx = win.anim.current_x() as f64;
             let wy = win.anim.current_y() as f64;
-            // Total chrome height = titlebar + content.
-            let total_h = win.anim.current_h() as f64 + TITLEBAR_HEIGHT;
-            let total_w = win.anim.current_w() as f64;
+            // Visual chrome footprint = client's geom rect (excludes CSD
+            // shadow padding) + our titlebar for SSD.
+            let total_w = win.geom_w.max(1) as f64;
+            let total_h = win.geom_h.max(1) as f64
+                + if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
             if x >= wx && x < wx + total_w && y >= wy && y < wy + total_h {
                 if best.map_or(true, |(_, z)| win.z_order > z) {
                     best = Some((key, win.z_order));
@@ -693,6 +765,41 @@ impl WindowManager {
         }
     }
 
+    /// Snap a window's position to (x, y) immediately (no animation).
+    /// Called during a title-bar drag so the visual follows the pointer 1:1.
+    pub fn set_position_by_id(&mut self, id: i32, x: i32, y: i32) {
+        let key = self.windows.iter().find(|(_, w)| w.id == id).map(|(&k, _)| k);
+        if let Some(key) = key {
+            if let Some(win) = self.windows.get_mut(&key) {
+                win.x = x;
+                win.y = y;
+                win.anim.geo_x.set_instant(x as f64);
+                win.anim.geo_y.set_instant(y as f64);
+            }
+        }
+    }
+
+    /// Snap a window's full geometry to (x, y, w, h) immediately. Used during
+    /// edge/corner resize drags.
+    pub fn set_geometry_by_id(&mut self, id: i32, x: i32, y: i32, w: i32, h: i32) {
+        let key = self.windows.iter().find(|(_, w)| w.id == id).map(|(&k, _)| k);
+        if let Some(key) = key {
+            if let Some(win) = self.windows.get_mut(&key) {
+                win.x = x;
+                win.y = y;
+                win.w = w;
+                win.h = h;
+                win.anim.set_geometry_instant(x, y, w, h);
+            }
+        }
+    }
+
+    /// Look up the WM window id from a wayland surface.
+    pub fn id_for_surface(&self, surface: &WlSurface) -> Option<i32> {
+        let key = Self::key(surface);
+        self.windows.get(&key).map(|w| w.id)
+    }
+
     /// Update committed geometry for a surface (called when client commits with
     /// a new buffer size, or after configure is acked).
     pub fn update_geometry(&mut self, surface: &WlSurface, w: i32, h: i32) {
@@ -701,10 +808,15 @@ impl WindowManager {
             if !win.maximized {
                 win.w = w;
                 win.h = h;
-                // Also update the geometry springs to the new committed size if
-                // open animation has settled, otherwise just let the client content
-                // resize freely (springs handle the visual).
-                if win.phase == AnimPhase::Open {
+                // Snap geometry springs to the committed size ONLY when the
+                // springs have already settled. If they're mid-flight (e.g.
+                // an unmaximize geometry animation in progress), snapping
+                // here would cut the animation short — we let the spring run
+                // and trust the next commit to land at the same target.
+                if win.phase == AnimPhase::Open
+                    && win.anim.geo_w.is_done()
+                    && win.anim.geo_h.is_done()
+                {
                     win.anim.geo_w.set_instant(w as f64);
                     win.anim.geo_h.set_instant(h as f64);
                 }
@@ -734,8 +846,14 @@ impl WindowManager {
 
     /// Find the topmost surface under (x, y) for pointer routing.
     /// Returns (surface, local_x, local_y) where local is relative to the
-    /// client content area (not the titlebar).
+    /// surface under the pointer. For CSD clients with subsurfaces (Firefox,
+    /// GTK header-bar apps) the topmost subsurface under the pointer is
+    /// returned so wl_pointer events route to the right surface; the
+    /// toplevel itself only wins when nothing else covers the point.
     pub fn surface_under(&self, x: f64, y: f64) -> Option<(WlSurface, f64, f64)> {
+        use smithay::wayland::compositor::{with_surface_tree_downward, SubsurfaceCachedState, TraversalAction};
+        use smithay::backend::renderer::utils::with_renderer_surface_state;
+
         let mut best: Option<(usize, usize)> = None;
         for (&key, win) in &self.windows {
             if win.closing || (win.minimized && win.anim.is_settled()) {
@@ -743,27 +861,36 @@ impl WindowManager {
             }
             let wx = win.anim.current_x() as f64;
             let wy = win.anim.current_y() as f64;
-            let ww = win.anim.current_w() as f64;
-            let wh = win.anim.current_h() as f64 + TITLEBAR_HEIGHT;
+            let ww = win.geom_w.max(1) as f64;
+            let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let wh = win.geom_h.max(1) as f64 + titlebar;
             if x >= wx && x < wx + ww && y >= wy && y < wy + wh {
                 if best.map_or(true, |(_, z)| win.z_order > z) {
                     best = Some((key, win.z_order));
                 }
             }
         }
-        best.and_then(|(key, _)| {
-            let win = self.windows.get(&key)?;
-            let wx = win.anim.current_x() as f64;
-            let wy = win.anim.current_y() as f64 + TITLEBAR_HEIGHT;
-            let local_x = x - wx;
-            let local_y = y - wy;
-            // Only forward if pointer is in the content area (not the titlebar).
-            if local_y >= 0.0 {
-                Some((win.surface.clone(), local_x, local_y))
-            } else {
-                None
-            }
-        })
+        let (key, _) = best?;
+        let win = self.windows.get(&key)?;
+        let wx = win.anim.current_x() as f64;
+        let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+        let wy = win.anim.current_y() as f64 + titlebar;
+        let chrome_local_x = x - wx;
+        let chrome_local_y = y - wy;
+        // Pointer is in the SSD titlebar zone — handled by the chrome, not
+        // forwarded to the client.
+        if chrome_local_y < 0.0 {
+            return None;
+        }
+        // Always return the TOPLEVEL surface as the pointer-focus target,
+        // with coords shifted into buffer-space (chrome (0,0) maps to buffer
+        // (geom_x, geom_y) because we cropped the client's shadow/border
+        // padding). Firefox / GTK clients route subsurface events themselves
+        // — sending wl_pointer.motion to a subsurface that's only visible as
+        // a popup confuses them and clicks get dropped on the floor.
+        let local_x = chrome_local_x + win.geom_x as f64;
+        let local_y = chrome_local_y + win.geom_y as f64;
+        Some((win.surface.clone(), local_x, local_y))
     }
 
     /// Return windows sorted by z_order (ascending = back to front) for rendering.

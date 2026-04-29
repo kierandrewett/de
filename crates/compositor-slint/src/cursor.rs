@@ -28,8 +28,10 @@ use std::f64::consts::PI;
 /// Height of the server-side title bar in logical pixels.
 pub const TITLEBAR_HEIGHT: f64 = 33.0;
 
-/// Resize edge/corner grab zone width in logical pixels.
-pub const EDGE_ZONE: f64 = 6.0;
+/// Resize edge/corner grab zone width in logical pixels. Sized so the user
+/// can grab the edge from the visible drop-shadow band (≈24 px blur) rather
+/// than having to land within the 1 px stroke — matches macOS/GNOME feel.
+pub const EDGE_ZONE: f64 = 12.0;
 
 /// Corner grab zone extends this many pixels from the corner along each axis.
 pub const CORNER_ZONE: f64 = 14.0;

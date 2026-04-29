@@ -1,0 +1,130 @@
+// ContextMenu.slint — generic, reusable popup menu used by the desktop
+// right-click handler, app-indicator clicks, and (later) appindicator menu
+// items. Visual style mirrors macOS / GNOME context menus: rounded rect,
+// thin border, drop-shadow, ~6 px row padding, ~28 px row height, separator
+// rows render as 1 px hairlines. The menu is positioned by the caller (via
+// `x`/`y`); it sizes itself to fit `items`.
+
+import { Tokens, Theme, TokenMode } from "../Tokens.slint";
+
+export struct MenuItem {
+    /// Stable id passed back through `item-clicked` so callers don't have to
+    /// match on label text. -1 reserves the value for separators.
+    id:          int,
+    label:       string,
+    /// Optional accelerator hint shown right-aligned (e.g. "⌘C", "Del").
+    accelerator: string,
+    /// True for non-clickable separator rows.
+    separator:   bool,
+    /// Disabled rows render at reduced opacity and don't fire `item-clicked`.
+    enabled:     bool,
+}
+
+export component ContextMenu {
+    in property <[MenuItem]> items;
+    /// Whether the menu is open. Caller flips to `false` on item click or
+    /// outside-click; the menu fades out via the animate block.
+    in property <bool>       open: false;
+
+    callback item-clicked(int);
+    /// Fired when the user clicks outside the menu (caller closes it).
+    callback dismiss();
+
+    width: 220px;
+    height: items-col.preferred-height + 12px;
+
+    visible: root.open;
+    opacity: root.open ? 1.0 : 0.0;
+    animate opacity { duration: 90ms; easing: ease-out; }
+
+    bg := Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Theme.mode == TokenMode.Dark
+            ? rgba(28, 30, 36, 0.97)
+            : rgba(252, 252, 252, 0.97);
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.mode == TokenMode.Dark
+            ? rgba(255, 255, 255, 0.10)
+            : rgba(0, 0, 0, 0.10);
+        drop-shadow-blur: 22px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: rgba(0, 0, 0, 0.45);
+        clip: true;
+
+        items-col := VerticalLayout {
+            x: 0; y: 6px;
+            width: parent.width;
+            spacing: 0px;
+            padding-left: 4px;
+            padding-right: 4px;
+
+            for it[i] in root.items: Rectangle {
+                height: it.separator ? 7px : 28px;
+                width: parent.width - 8px;
+                background: (!it.separator && row-touch.has-hover)
+                    ? (Theme.mode == TokenMode.Dark
+                        ? rgba(96, 165, 250, 0.18)
+                        : rgba(96, 165, 250, 0.16))
+                    : transparent;
+                border-radius: 5px;
+                animate background { duration: 80ms; easing: ease-out; }
+
+                // Separator hairline — only visible when `it.separator`.
+                Rectangle {
+                    x: 4px; y: 3px;
+                    width: parent.width - 8px;
+                    height: 1px;
+                    background: Theme.mode == TokenMode.Dark
+                        ? rgba(255, 255, 255, 0.08)
+                        : rgba(0, 0, 0, 0.08);
+                    visible: it.separator;
+                }
+
+                // TouchArea is always present (id stable) but disabled for
+                // separators / disabled rows. Slint doesn't let us access an
+                // id declared inside an `if` from sibling expressions, so
+                // we keep it unconditional and rely on `enabled`.
+                row-touch := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    enabled: !it.separator && it.enabled;
+                    clicked => { root.item-clicked(it.id); }
+                }
+
+                // Accelerator label (right-aligned). 0px width when empty so
+                // it contributes nothing to layout.
+                acc := Text {
+                    x: parent.width - self.width - 10px;
+                    y: 0;
+                    width: it.accelerator == "" ? 0px : self.preferred-width;
+                    height: parent.height;
+                    text: it.accelerator;
+                    color: Theme.mode == TokenMode.Dark
+                        ? rgba(255, 255, 255, 0.45)
+                        : rgba(0, 0, 0, 0.42);
+                    font-family: Tokens.font-family;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    visible: !it.separator;
+                }
+
+                Text {
+                    x: 10px; y: 0;
+                    width: parent.width - 20px - acc.width;
+                    height: parent.height;
+                    text: it.label;
+                    color: Theme.mode == TokenMode.Dark
+                        ? rgba(255, 255, 255, it.enabled ? 0.92 : 0.40)
+                        : rgba(0, 0, 0, it.enabled ? 0.86 : 0.36);
+                    font-family: Tokens.font-family;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    visible: !it.separator;
+                }
+            }
+        }
+    }
+}

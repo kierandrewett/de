@@ -774,6 +774,7 @@ dependencies = [
  "calloop 0.13.0",
  "chrono",
  "image",
+ "ipc",
  "pollster",
  "raw-window-handle",
  "resvg 0.44.0",
@@ -793,6 +794,7 @@ dependencies = [
  "wayland-server",
  "wgpu",
  "winit",
+ "xcursor",
 ]
 
 [[package]]

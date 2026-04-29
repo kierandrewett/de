@@ -20,7 +20,11 @@ use crate::wayland_state::SpikeState;
 
 impl XdgDecorationHandler for SpikeState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        // Prefer SSD: we draw our own chrome.
+        // Default to ServerSide — we draw our own titlebar. Clients that
+        // genuinely want CSD (and respect the negotiation) will request it
+        // via `request_mode(ClientSide)`. Apps like Firefox always paint
+        // their own header bar internally regardless, but our SSD chrome
+        // still wraps the window so the user gets consistent decorations.
         toplevel.with_pending_state(|s| {
             s.decoration_mode = Some(Mode::ServerSide);
         });
@@ -28,14 +32,16 @@ impl XdgDecorationHandler for SpikeState {
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Mode) {
-        // Honour CSD requests (GTK/libadwaita insist); otherwise keep SSD.
+        let csd = matches!(mode, Mode::ClientSide);
         toplevel.with_pending_state(|s| {
-            s.decoration_mode = Some(match mode {
-                Mode::ClientSide => Mode::ClientSide,
-                _ => Mode::ServerSide,
-            });
+            s.decoration_mode = Some(if csd { Mode::ClientSide } else { Mode::ServerSide });
         });
         toplevel.send_configure();
+
+        let wl = toplevel.wl_surface();
+        if let Some(tl) = self.toplevels.iter_mut().find(|t| &t.surface == wl) {
+            tl.csd = csd;
+        }
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
@@ -43,6 +49,10 @@ impl XdgDecorationHandler for SpikeState {
             s.decoration_mode = Some(Mode::ServerSide);
         });
         toplevel.send_configure();
+        let wl = toplevel.wl_surface();
+        if let Some(tl) = self.toplevels.iter_mut().find(|t| &t.surface == wl) {
+            tl.csd = false;
+        }
     }
 }
 

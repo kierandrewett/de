@@ -80,6 +80,16 @@ pub enum ActiveDrag {
         start_ptr_x: f64,
         start_ptr_y: f64,
         start_geom: WindowGeomSnapshot,
+        /// Throttle gate for `xdg_toplevel.configure` emissions during the
+        /// drag. Without it we'd flood the client at the pointer event rate
+        /// and the buffer/configure handshake would visibly lag behind.
+        last_configure_at: Option<std::time::Instant>,
+        /// `Some(pointer_y)` while the bottom edge is snapped to the dock
+        /// top-line. Holding this records the pointer-y at the moment the
+        /// snap engaged; once the pointer travels more than
+        /// `DOCK_SNAP_BREAK_THRESHOLD` (in either direction) from that
+        /// reference, the snap releases and resize resumes free motion.
+        dock_snap_engaged_at: Option<f64>,
     },
     /// Moving a window via title-bar drag.
     Move {
@@ -87,8 +97,24 @@ pub enum ActiveDrag {
         /// Pointer offset from window's top-left corner at drag-start.
         offset_x: f64,
         offset_y: f64,
+        /// If `Some((start_x, start_y))`, the window is currently maximized
+        /// and the drag is gated on a movement threshold before unmaximizing.
+        /// While set, motion events are absorbed (window does NOT move) until
+        /// the cumulative pointer delta from the drag-start exceeds
+        /// `MAXIMIZED_DRAG_THRESHOLD`. Once exceeded, the window is
+        /// unmaximized in-place and this field is cleared so subsequent
+        /// motion drives a normal Move drag.
+        pending_unmaximize: Option<(f64, f64)>,
     },
 }
+
+/// Minimum pointer travel (logical pixels) before a titlebar drag on a
+/// maximized window pulls the window out of maximize. Matches macOS feel.
+pub const MAXIMIZED_DRAG_THRESHOLD: f64 = 8.0;
+
+/// Pointer travel (logical pixels) from the dock-top snap line required
+/// before a south-edge resize breaks through and stops sticking to the dock.
+pub const DOCK_SNAP_BREAK_THRESHOLD: f64 = 32.0;
 
 /// Compute the new window geometry after a resize drag.
 ///
@@ -169,6 +195,8 @@ mod tests {
             start_ptr_x: 100.0,
             start_ptr_y: 100.0,
             start_geom: WindowGeomSnapshot { x: 50, y: 50, w: 400, h: 300 },
+            last_configure_at: None,
+            dock_snap_engaged_at: None,
         }
     }
 
@@ -199,7 +227,9 @@ mod tests {
 
     #[test]
     fn test_move() {
-        let drag = ActiveDrag::Move { toplevel_idx: 0, offset_x: 10.0, offset_y: 15.0 };
+        let drag = ActiveDrag::Move {
+            toplevel_idx: 0, offset_x: 10.0, offset_y: 15.0, pending_unmaximize: None,
+        };
         let (nx, ny) = compute_move(&drag, 210.0, 215.0).unwrap();
         assert_eq!(nx, 200); assert_eq!(ny, 200);
     }

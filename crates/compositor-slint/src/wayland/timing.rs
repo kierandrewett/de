@@ -30,9 +30,11 @@ delegate_commit_timing!(SpikeState);
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl SpikeState {
-    /// Send wl_surface.frame callbacks to all currently-active surfaces so
-    /// clients (kitty, etc.) know the compositor is ready for the next frame.
-    /// Must be called once per rendered frame.
+    /// Send wl_surface.frame callbacks to ALL mapped toplevels + layer
+    /// surfaces. Must be called once per rendered frame. Unfocused windows
+    /// also need callbacks — clients like simple-shm gate their next commit
+    /// on the previous frame callback, so skipping them freezes their
+    /// rendering the moment focus moves elsewhere.
     pub fn send_frame_callbacks(&self, output: &Output) {
         use smithay::desktop::utils::send_frames_surface_tree;
         use std::time::Duration;
@@ -40,8 +42,8 @@ impl SpikeState {
         let time: Duration = self.clock.now().into();
 
         let mut surfaces: Vec<WlSurface> = Vec::new();
-        if let Some(s) = &self.active_surface {
-            surfaces.push(s.clone());
+        for tl in &self.toplevels {
+            surfaces.push(tl.surface.clone());
         }
         for li in &self.layer_surfaces {
             surfaces.push(li.surface.wl_surface().clone());
@@ -71,10 +73,12 @@ impl SpikeState {
         use smithay::reexports::wayland_server::Resource;
         use smithay::wayland::compositor::CompositorHandler;
 
-        // Collect surfaces we know about.
+        // Collect surfaces we know about — every mapped toplevel plus every
+        // layer surface. Drive ALL clients each frame; unfocused windows
+        // still need their fifo barriers signalled and transactions drained.
         let mut surfaces: Vec<WlSurface> = Vec::new();
-        if let Some(s) = &self.active_surface {
-            surfaces.push(s.clone());
+        for tl in &self.toplevels {
+            surfaces.push(tl.surface.clone());
         }
         // Include any layer surfaces.
         for li in &self.layer_surfaces {

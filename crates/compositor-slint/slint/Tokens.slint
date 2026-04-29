@@ -17,23 +17,25 @@ export global Theme {
     in-out property <TokenMode> mode: TokenMode.Dark;
 
     // ── Panel colours ─────────────────────────────────────────────────────────
+    // Heavily translucent — the wallpaper-blurred backdrop image renders
+    // beneath this tint so the panel reads as glass.
     out property <color> panel-bg: mode == TokenMode.Dark
-        ? #111318
-        : #f0f0f0;
+        ? rgba(17, 19, 24, 0.65)
+        : rgba(245, 245, 247, 0.70);
     out property <color> panel-fg: mode == TokenMode.Dark
-        ? rgba(255, 255, 255, 0.80)
-        : rgba(0, 0, 0, 0.75);
+        ? rgba(255, 255, 255, 0.88)
+        : rgba(0, 0, 0, 0.80);
     out property <color> panel-border-bottom: mode == TokenMode.Dark
-        ? rgba(0, 0, 0, 0.80)
-        : rgba(0, 0, 0, 0.20);
+        ? rgba(0, 0, 0, 0.50)
+        : rgba(0, 0, 0, 0.10);
 
     // ── Dock colours ──────────────────────────────────────────────────────────
     out property <color> dock-bg: mode == TokenMode.Dark
-        ? #b5000000
-        : rgba(240, 240, 240, 0.80);
+        ? rgba(20, 22, 28, 0.65)
+        : rgba(245, 245, 247, 0.70);
     out property <color> dock-border: mode == TokenMode.Dark
-        ? rgba(255, 255, 255, 0.15)
-        : rgba(0, 0, 0, 0.12);
+        ? rgba(255, 255, 255, 0.12)
+        : rgba(0, 0, 0, 0.10);
 
     // ── Title bar colours — per mode ──────────────────────────────────────────
     out property <color> titlebar-bg-dark-active:    #111318;
@@ -100,6 +102,9 @@ export global Tokens {
     out property <length>  panel-font-size: 13px;
 
     // ── Dock ─────────────────────────────────────────────────────────────────
+    // Match `wm::DOCK_HEIGHT` in Rust (96 px). Used by the windows-clip
+    // wrapper in Compositor.slint to keep windows above the dock band.
+    out property <length>  dock-height: 96px;
     out property <color>   dock-bg: Theme.dock-bg;
     out property <color>   dock-border: Theme.dock-border;
     out property <length>  dock-padding: 8px;

@@ -69,8 +69,9 @@ const RESIZE_NESW_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 
 // ── Cursor size ──────────────────────────────────────────────────────────────
 
-/// Physical size (pixels) of rendered cursor icons.
-const CURSOR_SIZE: u32 = 32;
+/// Physical size (pixels) of rendered cursor icons. 24 px is the freedesktop
+/// default and matches the host system's cursor size.
+const CURSOR_SIZE: u32 = 24;
 
 // ── Rasterisation helpers ────────────────────────────────────────────────────
 
@@ -129,6 +130,92 @@ fn pixels_to_slint(pixels: Vec<u8>, size: u32) -> slint::Image {
     slint::Image::from_rgba8_premultiplied(buf)
 }
 
+// ── Adwaita / Xcursor loader ─────────────────────────────────────────────────
+//
+// We try the system's cursor theme first. If a matching cursor file exists
+// we use the rasterised image at the size closest to CURSOR_SIZE; otherwise
+// we fall back to the embedded SVG.
+
+const ADWAITA_DIR: &str = "/usr/share/icons/Adwaita/cursors";
+const FALLBACK_DIRS: &[&str] = &[
+    "/usr/share/icons/default/cursors",
+    "/usr/share/icons/breeze_cursors/cursors",
+    "/usr/share/icons/DMZ-White/cursors",
+];
+
+fn load_xcursor(name: &str, target_size: u32)
+    -> Option<(Vec<u8>, u32, u32, u32, u32)>
+{
+    for dir in std::iter::once(ADWAITA_DIR).chain(FALLBACK_DIRS.iter().copied()) {
+        let path = std::path::Path::new(dir).join(name);
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Some(images) = xcursor::parser::parse_xcursor(&bytes) else { continue };
+        if images.is_empty() { continue }
+
+        let img = images.iter()
+            .min_by_key(|i| (i.size as i64 - target_size as i64).abs())
+            .unwrap();
+
+        debug!("xcursor: {} from {:?} ({}×{}, hot={},{})",
+            name, dir, img.width, img.height, img.xhot, img.yhot);
+        return Some((img.pixels_rgba.clone(), img.width, img.height, img.xhot, img.yhot));
+    }
+    None
+}
+
+fn scale_pixels_to(
+    pixels: &[u8], src_w: u32, src_h: u32,
+    src_hot_x: u32, src_hot_y: u32,
+    target: u32,
+) -> Option<(Vec<u8>, f32, f32)> {
+    if src_w == 0 || src_h == 0 || target == 0 { return None }
+    let mut src = tiny_skia::Pixmap::new(src_w, src_h)?;
+    src.data_mut().copy_from_slice(pixels);
+
+    let mut dst = tiny_skia::Pixmap::new(target, target)?;
+    let scale = (target as f32 / src_w as f32).min(target as f32 / src_h as f32);
+    let off_x = (target as f32 - src_w as f32 * scale) / 2.0;
+    let off_y = (target as f32 - src_h as f32 * scale) / 2.0;
+
+    let transform = tiny_skia::Transform::from_translate(off_x, off_y)
+        .post_concat(tiny_skia::Transform::from_scale(scale, scale));
+
+    dst.draw_pixmap(0, 0, src.as_ref(), &tiny_skia::PixmapPaint::default(),
+                    transform, None);
+
+    let hot_x = off_x + src_hot_x as f32 * scale;
+    let hot_y = off_y + src_hot_y as f32 * scale;
+    Some((dst.data().to_vec(), hot_x, hot_y))
+}
+
+struct AdwaitaImage {
+    image: slint::Image,
+    hotspot: (f32, f32),
+}
+
+fn try_load_adwaita(name: &str, target: u32) -> Option<AdwaitaImage> {
+    let (pixels, w, h, hx, hy) = load_xcursor(name, target)?;
+    let (scaled, sx, sy) = scale_pixels_to(&pixels, w, h, hx, hy, target)?;
+    Some(AdwaitaImage {
+        image: pixels_to_slint(scaled, target),
+        hotspot: (sx, sy),
+    })
+}
+
+fn adwaita_name(kind: CursorKind) -> &'static str {
+    match kind {
+        CursorKind::Arrow              => "default",
+        CursorKind::Move               => "move",
+        CursorKind::Hand               => "pointer",
+        CursorKind::ResizeN            => "n-resize",
+        CursorKind::ResizeS            => "s-resize",
+        CursorKind::ResizeE            => "e-resize",
+        CursorKind::ResizeW            => "w-resize",
+        CursorKind::ResizeNWSE { .. }  => "nw-resize",
+        CursorKind::ResizeNESW { .. }  => "ne-resize",
+    }
+}
+
 // ── Cursor cache ─────────────────────────────────────────────────────────────
 
 /// A rotated-angle bucket — we cache at 1° granularity for corner cursors.
@@ -144,6 +231,8 @@ pub struct CursorRenderer {
     nwse_cache: HashMap<i32, slint::Image>,
     /// Cached rotated NESW variants keyed by degree bucket.
     nesw_cache: HashMap<i32, slint::Image>,
+    /// Cached Adwaita cursors keyed by name. None = tried + failed.
+    adwaita_cache: HashMap<&'static str, Option<AdwaitaImage>>,
 }
 
 impl CursorRenderer {
@@ -152,35 +241,67 @@ impl CursorRenderer {
             static_cache: HashMap::new(),
             nwse_cache: HashMap::new(),
             nesw_cache: HashMap::new(),
+            adwaita_cache: HashMap::new(),
         }
     }
 
-    /// Return a `slint::Image` for the given `CursorKind`.
-    ///
-    /// Results are cached.  The returned image is `CURSOR_SIZE × CURSOR_SIZE`.
+    /// Lazily load + cache an Adwaita cursor by name.
+    fn ensure_adwaita(&mut self, name: &'static str) -> Option<&AdwaitaImage> {
+        if !self.adwaita_cache.contains_key(name) {
+            let loaded = try_load_adwaita(name, CURSOR_SIZE);
+            self.adwaita_cache.insert(name, loaded);
+        }
+        self.adwaita_cache.get(name).and_then(|o| o.as_ref())
+    }
+
+    /// Return a `slint::Image` for the given `CursorKind`. Prefers the
+    /// system Xcursor theme; falls back to the embedded SVG if it isn't
+    /// installed or the file isn't found.
     pub fn get(&mut self, kind: CursorKind) -> slint::Image {
+        // Rotated diagonals never use Adwaita (Slint doesn't expose pixmap
+        // bytes for re-rasterisation), so they go straight to SVG.
         match kind {
-            CursorKind::Arrow  => self.get_static("arrow", ARROW_SVG),
-            CursorKind::Move   => self.get_static("move", MOVE_SVG),
-            CursorKind::Hand   => self.get_static("hand", HAND_SVG),
+            CursorKind::ResizeNWSE { angle_offset } => {
+                if angle_offset.abs() < 0.5_f64.to_radians() {
+                    if let Some(a) = self.ensure_adwaita("nw-resize") {
+                        return a.image.clone();
+                    }
+                }
+                return self.get_rotated_nwse(angle_offset);
+            }
+            CursorKind::ResizeNESW { angle_offset } => {
+                if angle_offset.abs() < 0.5_f64.to_radians() {
+                    if let Some(a) = self.ensure_adwaita("ne-resize") {
+                        return a.image.clone();
+                    }
+                }
+                return self.get_rotated_nesw(angle_offset);
+            }
+            _ => {}
+        }
+        let name = adwaita_name(kind);
+        if let Some(a) = self.ensure_adwaita(name) {
+            return a.image.clone();
+        }
+        match kind {
+            CursorKind::Arrow  => self.get_static("arrow",   ARROW_SVG),
+            CursorKind::Move   => self.get_static("move",    MOVE_SVG),
+            CursorKind::Hand   => self.get_static("hand",    HAND_SVG),
             CursorKind::ResizeN => self.get_static("resize_n", RESIZE_NS_SVG),
             CursorKind::ResizeS => self.get_static("resize_s", RESIZE_NS_SVG),
             CursorKind::ResizeE => self.get_static("resize_e", RESIZE_EW_SVG),
             CursorKind::ResizeW => self.get_static("resize_w", RESIZE_EW_SVG),
-            CursorKind::ResizeNWSE { angle_offset } => {
-                self.get_rotated_nwse(angle_offset)
-            }
-            CursorKind::ResizeNESW { angle_offset } => {
-                self.get_rotated_nesw(angle_offset)
-            }
+            _                   => slint::Image::default(),
         }
     }
 
-    /// Hotspot position (x, y) within the cursor image for the given kind.
-    ///
-    /// For most cursors the hotspot is near the tip; for resize cursors it is
-    /// centred.
-    pub fn hotspot(kind: CursorKind) -> (f32, f32) {
+    /// Hotspot position (x, y) within the cursor image. Adwaita hotspots are
+    /// read from the Xcursor file; SVG fallbacks use sensible defaults.
+    pub fn hotspot(&mut self, kind: CursorKind) -> (f32, f32) {
+        let name = adwaita_name(kind);
+        if let Some(a) = self.ensure_adwaita(name) {
+            return a.hotspot;
+        }
         let s = CURSOR_SIZE as f32;
         match kind {
             CursorKind::Arrow => (4.0, 2.0),

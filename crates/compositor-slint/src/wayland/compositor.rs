@@ -34,12 +34,51 @@ impl CompositorHandler for SpikeState {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        let toplevel_idx = self.toplevels.iter().position(|t| &t.surface == surface);
+        // Walk up the wl_subsurface parent chain. Bounded depth so a
+        // malformed parent chain (would-be cycle) can't hang the wayland
+        // thread.
+        use smithay::wayland::compositor::get_parent;
+        let mut root: WlSurface = surface.clone();
+        for _ in 0..32 {
+            match get_parent(&root) {
+                Some(p) => root = p,
+                None => break,
+            }
+        }
+
+        // If `root` is a popup surface (or `surface` itself is a popup that
+        // has no wl_subsurface parent), import for the popup's pixel buffer
+        // and bail before falling through to toplevel handling.
+        let popup_idx = self.popups.iter()
+            .position(|p| p.surface == root || p.surface == *surface);
+        if let Some(pidx) = popup_idx {
+            let popup_surf = self.popups[pidx].surface.clone();
+            let pixels_arc = self.popups[pidx].pixels.clone();
+            let _ = import_shm_buffer(&popup_surf, &pixels_arc);
+            return;
+        }
+
+        let toplevel_idx = self.toplevels.iter().position(|t| t.surface == root);
+        debug!("commit: surface_is_toplevel={} root_in_toplevels={}",
+            surface == &root, toplevel_idx.is_some());
+        let surface = &root;
         if let Some(idx) = toplevel_idx {
             let pixels_arc = self.toplevels[idx].pixels.clone();
 
-            // Try SHM import first (most clients).
-            import_shm_buffer(surface, &pixels_arc);
+            // Composite the surface tree (toplevel + subsurfaces) into a
+            // single RGBA buffer. > 1 surface is our heuristic for "this app
+            // draws its own chrome" (Firefox, GTK header-bar apps).
+            //
+            // We DON'T re-configure CSD clients to a larger size — instead
+            // we'll crop the composited buffer to the client's
+            // `xdg_surface.set_window_geometry` rect on the Slint side.
+            // That rect already excludes the client's own shadow / corner
+            // padding, so cropping there gives us the visible window at 1:1
+            // and our chrome is sized to match (no stretching, no blur).
+            let n_surfaces = import_shm_buffer(surface, &pixels_arc);
+            if n_surfaces > 1 {
+                self.toplevels[idx].csd = true;
+            }
 
             // If SHM import produced nothing (width == 0), check DMA-BUF pending.
             // `dmabuf_imported` stores pixel data keyed by "WxH" — we look up the
@@ -58,7 +97,7 @@ impl CompositorHandler for SpikeState {
             // Also update legacy single-surface buffer if this is the active surface.
             let is_active = self.active_surface.as_ref().map(|s| s == surface).unwrap_or(false);
             if is_active {
-                import_shm_buffer(surface, &self.client_pixels.clone());
+                let _ = import_shm_buffer(surface, &self.client_pixels.clone());
                 // Sync DMA-BUF data to legacy buffer too.
                 let current = pixels_arc.lock().unwrap().clone();
                 if current.width > 0 {

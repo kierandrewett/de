@@ -9,7 +9,7 @@
 //   ease-in-out animate blocks.  The DockIconSlot carries animate blocks on its
 //   running-dot colour so it crossfades independently.
 
-import { Tokens, Theme } from "./Tokens.slint";
+import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 
 // ── Data type shared with Rust ────────────────────────────────────────────────
 export struct DockItem {
@@ -21,14 +21,44 @@ export struct DockItem {
 }
 
 // ── Internal single icon slot ─────────────────────────────────────────────────
+//
+// Each app icon sits inside its own dark squircle "button" container — a
+// rounded-rect with a subtle dark fill + thin top-edge highlight, separate
+// from the dock pill itself. Mirrors the screenshot the user shared.
 component DockIconSlot {
     in property <DockItem> item;
     in property <bool>     show-separator: false;
 
     callback icon-clicked(string);
 
-    width: 56px;
+    // Slot is just slightly larger than the button so neighbouring buttons
+    // pack tight (6 px gap between them) — closer to the user's reference
+    // dock screenshot.
+    width: 60px;
     height: 64px;
+
+    // ── Button-container colours (animated on mode switch / hover) ───────
+    property <color> button-bg: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.08)
+        : rgba(255, 255, 255, 0.55);
+    property <color> button-bg-hover: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.14)
+        : rgba(255, 255, 255, 0.75);
+    property <color> button-bg-pressed: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.20)
+        : rgba(255, 255, 255, 0.90);
+    property <color> button-border: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.10)
+        : rgba(0, 0, 0, 0.06);
+    property <color> button-highlight-top: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.10)
+        : rgba(255, 255, 255, 0.60);
+
+    animate button-bg            { duration: 200ms; easing: ease-in-out; }
+    animate button-bg-hover      { duration: 200ms; easing: ease-in-out; }
+    animate button-bg-pressed    { duration: 200ms; easing: ease-in-out; }
+    animate button-border        { duration: 200ms; easing: ease-in-out; }
+    animate button-highlight-top { duration: 200ms; easing: ease-in-out; }
 
     // Running-dot colours (locally-resolved for animation).
     property <color> dot-color: item.focused
@@ -36,34 +66,57 @@ component DockIconSlot {
         : Theme.dock-dot-running;
     animate dot-color { duration: 200ms; easing: ease-in-out; }
 
-    // Icon touch area.
+    // Touch area covers the full slot.
     ta := TouchArea {
         width: parent.width;
         height: parent.height;
         clicked => { root.icon-clicked(root.item.app-id); }
     }
 
-    // Scale multiplier driven by hover.
-    property <float> icon-scale: ta.has-hover ? 1.15 : 1.0;
-
-    // Icon image.
-    icon-img := Image {
-        width:  Tokens.dock-icon-size * root.icon-scale;
-        height: Tokens.dock-icon-size * root.icon-scale;
+    // ── Button container ────────────────────────────────────────────────
+    // Bigger button (54×54), tighter 3 px icon inset so the glyph fills
+    // the button — matches the user's reference dock screenshot more closely.
+    button := Rectangle {
+        property <length> button-size: 54px;
         x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2 - (ta.has-hover ? 4px : 0px);
-        source: root.item.icon;
-        image-fit: contain;
+        y: 4px - (ta.has-hover ? 3px : 0px);
+        width: button-size;
+        height: button-size;
+        border-radius: 13px;
+        background: ta.pressed
+            ? root.button-bg-pressed
+            : (ta.has-hover ? root.button-bg-hover : root.button-bg);
+        border-width: 1px;
+        border-color: root.button-border;
+        clip: true;
 
-        animate width  { duration: 180ms; easing: ease-out; }
-        animate height { duration: 180ms; easing: ease-out; }
-        animate y      { duration: 180ms; easing: ease-out; }
+        animate background { duration: 120ms; easing: ease-out; }
+        animate y          { duration: 180ms; easing: ease-out; }
+
+        // Top-edge gloss highlight.
+        Rectangle {
+            x: 0; y: 0;
+            width: parent.width;
+            height: 1px;
+            background: root.button-highlight-top;
+            opacity: 0.85;
+        }
+
+        // Icon image, fills the button with only a 3 px inset.
+        icon-img := Image {
+            x: 3px;
+            y: 3px;
+            width:  parent.width - 6px;
+            height: parent.height - 6px;
+            source: root.item.icon;
+            image-fit: contain;
+        }
     }
 
-    // Active dot — centred below icon for running apps.
+    // Active dot — centred below the button for running apps.
     if item.running: dot := Rectangle {
         x: (parent.width - 4px) / 2;
-        y: parent.height - 8px;
+        y: parent.height - 6px;
         width: 4px;
         height: 4px;
         border-radius: 2px;
@@ -92,6 +145,10 @@ component DockSeparator {
 // ── Public Dock component ─────────────────────────────────────────────────────
 export component Dock {
     in property <[DockItem]> items;
+    in property <image>      backdrop;
+    in property <length>     backdrop-screen-w: 1px;
+    in property <length>     backdrop-screen-h: 1px;
+    in property <length>     backdrop-offset-y: 0px;
     callback icon-clicked(string);
 
     height: 64px + 2 * Tokens.dock-padding + 2 * Tokens.dock-outer-gap;
@@ -117,14 +174,43 @@ export component Dock {
             width: items-row.preferred-width + 2 * Tokens.dock-padding;
             height: parent.height;
 
-            background: root.resolved-bg;
+            background: transparent;
             border-radius: Tokens.dock-corner-radius;
             border-width: 1px;
             border-color: root.resolved-border;
+            clip: true;
 
             drop-shadow-blur: 24px;
             drop-shadow-offset-y: 8px;
             drop-shadow-color: rgba(0, 0, 0, 0.45);
+
+            // Backdrop layer — anchored so the bottom strip of the wallpaper
+            // appears under the pill.
+            Image {
+                x: -((root.backdrop-screen-w - parent.width) / 2 + parent.x);
+                y: root.backdrop-offset-y;
+                width: root.backdrop-screen-w;
+                height: root.backdrop-screen-h;
+                source: root.backdrop;
+                image-fit: fill;
+            }
+
+            // Subtle top-edge gloss highlight (macOS-style).
+            Rectangle {
+                x: 0; y: 0;
+                width: parent.width;
+                height: 1px;
+                background: Theme.mode == TokenMode.Dark
+                    ? rgba(255, 255, 255, 0.12)
+                    : rgba(255, 255, 255, 0.65);
+            }
+
+            // Theme tint over the backdrop.
+            Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: root.resolved-bg;
+            }
 
             items-row := HorizontalLayout {
                 padding-left: Tokens.dock-padding;

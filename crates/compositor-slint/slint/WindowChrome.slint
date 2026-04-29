@@ -34,6 +34,20 @@ export component WindowChrome {
     in property <float>  anim-scale:   1.0;
     // Alt-tab ring selection highlight.
     in property <bool>   alt-tab-selected: false;
+    // Source-clip rect on the client surface, in buffer pixel coords.
+    // CSD clients render their own shadow/border/corners into the buffer;
+    // xdg_surface.set_window_geometry tells us the visible inner rect, and we
+    // clip the Image to that so only the bare client content shows. SSD
+    // clients pass full buffer dims and the clip is a no-op.
+    in property <int>    content-clip-x: 0;
+    in property <int>    content-clip-y: 0;
+    in property <int>    content-clip-w: 0;
+    in property <int>    content-clip-h: 0;
+    // ClientSide-decoration mode (Firefox / GTK header-bar apps). When true,
+    // the client paints its own titlebar / border / shadow into the buffer,
+    // so we hide our SSD titlebar + Slint border + drop-shadow and let the
+    // client surface fill the entire window rect.
+    in property <bool>   csd: false;
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     callback close-clicked();
@@ -57,6 +71,13 @@ export component WindowChrome {
     property <color> resolved-titlebar-bg: Theme.mode == TokenMode.Dark
         ? (focused ? Tokens.titlebar-bg-dark-active   : Tokens.titlebar-bg-dark-inactive)
         : (focused ? Tokens.titlebar-bg-light-active  : Tokens.titlebar-bg-light-inactive);
+
+    // Opaque backing colour for the titlebar — the translucent
+    // `resolved-titlebar-bg` overlays this so transparency never reveals the
+    // wallpaper. Mode-only (no focus dependency) so animations stay stable.
+    property <color> resolved-titlebar-solid-bg: Theme.mode == TokenMode.Dark
+        ? Tokens.titlebar-bg-dark-active
+        : Tokens.titlebar-bg-light-active;
 
     property <color> resolved-titlebar-fg: Theme.mode == TokenMode.Dark
         ? Tokens.titlebar-fg-dark
@@ -84,6 +105,7 @@ export component WindowChrome {
     // ── Animation blocks — 200 ms ease-in-out on all colour transitions ───────
     animate resolved-border              { duration: 200ms; easing: ease-in-out; }
     animate resolved-titlebar-bg         { duration: 200ms; easing: ease-in-out; }
+    animate resolved-titlebar-solid-bg   { duration: 200ms; easing: ease-in-out; }
     animate resolved-titlebar-fg         { duration: 200ms; easing: ease-in-out; }
     animate resolved-titlebar-border     { duration: 200ms; easing: ease-in-out; }
     animate resolved-highlight-top       { duration: 200ms; easing: ease-in-out; }
@@ -93,39 +115,57 @@ export component WindowChrome {
     animate resolved-control-bg-pressed  { duration: 200ms; easing: ease-in-out; }
     animate resolved-control-icon-tint   { duration: 200ms; easing: ease-in-out; }
 
-    // ── Lifecycle animations (driven by Rust spring engine) ───────────────────
-    // The outer-frame opacity and scale are applied here so the entire chrome
-    // (titlebar + content + shadow) animates as one unit on open/close/min/max.
+    // ── Lifecycle animations ──────────────────────────────────────────────────
+    // Opacity fade comes from the spring; scale comes from `anim-scale`
+    // applied to outer-frame's width/height with x/y centring offsets so the
+    // chrome shrinks/grows around its centre. The drop-shadow stays attached
+    // to outer-frame so it scales with the chrome rather than ghosting.
     opacity: root.anim-opacity;
 
     // ── Outer frame with border and shadow ────────────────────────────────────
-    // We wrap in a transform Rectangle so the scale spring from the Rust engine
-    // can shrink the whole chrome about its centre without moving its x/y anchor.
-    transform-wrapper := Rectangle {
-        x: root.width * (1.0 - root.anim-scale) / 2;
-        y: root.height * (1.0 - root.anim-scale) / 2;
-        width: root.width * root.anim-scale;
-        height: root.height * root.anim-scale;
-        background: transparent;
-        clip: false;
-
+    // For CSD clients (Firefox / GTK header-bar apps), the border, drop-
+    // shadow, and titlebar collapse out and the client surface paints over
+    // the chrome. The chrome STILL has an opaque content bg so transparent
+    // pixels in the buffer (and the brief moment before the first commit)
+    // never reveal the wallpaper through the window.
     outer-frame := Rectangle {
-        x: 0; y: 0;
-        width: parent.width;
-        height: parent.height;
+        x: (parent.width  - self.width)  / 2;
+        y: (parent.height - self.height) / 2;
+        width:  parent.width  * root.anim-scale;
+        height: parent.height * root.anim-scale;
 
+        // Squircle radius applies in BOTH SSD and CSD modes — the rounded
+        // corners are part of our chrome aesthetic and clip the (cropped)
+        // client surface to the squircle on CSD apps too. The 1 px border
+        // is SSD-only; CSD apps draw their own internal border (or none).
         border-radius: Tokens.window-corner-radius-outer;
-        // Approximate 0.5 px border as 1 px at 50% of spec opacity.
-        border-width: 1px;
-        border-color: root.resolved-border;
-        background: transparent;
+        border-width:  root.csd ? 0px : 1px;
+        border-color:  root.resolved-border;
+        background:    root.resolved-content-bg;
+        clip:          true;
 
-        // Drop shadow — strongest single layer (GPU agent adds layers 1 and 3).
-        drop-shadow-blur: 24px;
-        drop-shadow-offset-y: 8px;
-        drop-shadow-color: rgba(0, 0, 0, 0.45);
+        // Drop shadow — single Slint layer (skipped for CSD).
+        drop-shadow-blur:     root.csd ? 0px : 24px;
+        drop-shadow-offset-y: root.csd ? 0px : 8px;
+        drop-shadow-color:    root.csd ? rgba(0, 0, 0, 0.0) : rgba(0, 0, 0, 0.45);
 
-        // ── Title bar ────────────────────────────────────────────────────────
+        // ── Solid titlebar backing (drawn always; in CSD mode the client
+        //     surface paints over it, so it only ever surfaces if the buffer
+        //     leaves transparent pixels at the titlebar region — i.e. when
+        //     the app is unresponsive or genuinely wants the SSD chrome to
+        //     show through). ──────────────────────────────────────────────
+        titlebar-backing := Rectangle {
+            x: 0; y: 0;
+            width: parent.width;
+            height: Tokens.titlebar-height;
+            background: root.resolved-titlebar-solid-bg;
+            border-top-left-radius: Tokens.window-corner-radius-outer;
+            border-top-right-radius: Tokens.window-corner-radius-outer;
+            border-bottom-left-radius: 0px;
+            border-bottom-right-radius: 0px;
+        }
+
+        // ── Title bar (drawn always; covered by the client surface in CSD)
         titlebar := Rectangle {
             x: 0; y: 0;
             width: parent.width;
@@ -135,6 +175,17 @@ export component WindowChrome {
             border-top-right-radius: Tokens.window-corner-radius-outer;
             border-bottom-left-radius: 0px;
             border-bottom-right-radius: 0px;
+
+            // Titlebar click-to-activate / double-click-to-maximise touch
+            // area. Declared FIRST inside titlebar so the controls (declared
+            // last → highest z) intercept events before this fires.
+            titlebar-touch := TouchArea {
+                x: 0; y: 0;
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.title-clicked(); }
+                double-clicked => { root.maximize-clicked(); }
+            }
 
             // 0.5 px bottom divider (1 px at reduced alpha).
             Rectangle {
@@ -146,13 +197,17 @@ export component WindowChrome {
                 opacity: 0.80;
             }
 
-            // Title text.
+            // Title text — reserved bbox is symmetric around the titlebar's
+            // horizontal centre. Width is parent minus 2× the right-side
+            // controls block (so the same padding sits on each side); the
+            // text element's `horizontal-alignment: center` then puts the
+            // glyphs at the titlebar's true centre.
+            property <length> reserve: Tokens.control-size * 3 + Tokens.control-gap * 2
+                                     + Tokens.control-inset + 4px;
             Text {
-                x: Tokens.titlebar-padding;
+                x: parent.reserve;
                 y: 0;
-                width: parent.width
-                    - Tokens.titlebar-padding
-                    - (Tokens.control-size * 3 + Tokens.control-gap * 2 + Tokens.control-inset + 4px);
+                width: parent.width - parent.reserve * 2;
                 height: parent.height;
                 text: root.title;
                 color: root.resolved-titlebar-fg;
@@ -216,13 +271,30 @@ export component WindowChrome {
         }
 
         // ── Client content area ───────────────────────────────────────────────
+        // No background colour: the only thing visible here is the client
+        // surface texture. Filling with `Theme.window-content-bg` showed a
+        // theme-coloured rectangle behind the buffer wherever the client
+        // committed transparent pixels (e.g. terminal apps that don't fill
+        // every cell), which read as "the chrome is wider than the canvas".
+        // Transparent background lets the wallpaper show through unused
+        // buffer regions, matching how transparent terminals render on most
+        // compositors.
         content-area := Rectangle {
             x: 0;
-            y: Tokens.titlebar-height;
+            // CSD clients fill the full chrome rect; SSD clients sit below
+            // our titlebar so the chrome's titlebar stays visible above.
+            y: root.csd ? 0px : Tokens.titlebar-height;
             width: parent.width;
-            height: parent.height - Tokens.titlebar-height;
-            background: root.resolved-content-bg;
-            border-bottom-left-radius: Tokens.window-corner-radius-outer;
+            height: root.csd ? parent.height : parent.height - Tokens.titlebar-height;
+            background: transparent;
+            // For CSD the content-area covers the FULL window (including
+            // where the titlebar would render), so it needs all four
+            // corners rounded to match outer-frame's squircle. For SSD
+            // only the bottom corners — the titlebar above carries the top
+            // corners.
+            border-top-left-radius:     root.csd ? Tokens.window-corner-radius-outer : 0px;
+            border-top-right-radius:    root.csd ? Tokens.window-corner-radius-outer : 0px;
+            border-bottom-left-radius:  Tokens.window-corner-radius-outer;
             border-bottom-right-radius: Tokens.window-corner-radius-outer;
             clip: true;
 
@@ -230,7 +302,20 @@ export component WindowChrome {
                 width: parent.width;
                 height: parent.height;
                 source: root.content;
+                // Always crop to the visible-content rect Rust passes us
+                // (xdg_surface.set_window_geometry → auto-detected alpha
+                // bbox → full buffer). The chrome's content-area is sized
+                // to the same rect, so image-fit:fill is 1:1 and text stays
+                // crisp; it also strips out any client-painted shadow /
+                // border padding on CSD apps.
+                source-clip-x: root.content-clip-w > 0 ? root.content-clip-x : 0;
+                source-clip-y: root.content-clip-h > 0 ? root.content-clip-y : 0;
+                source-clip-width:  root.content-clip-w > 0
+                    ? root.content-clip-w : root.content.width;
+                source-clip-height: root.content-clip-h > 0
+                    ? root.content-clip-h : root.content.height;
                 image-fit: fill;
+                image-rendering: pixelated;
             }
         }
 
@@ -274,20 +359,4 @@ export component WindowChrome {
             background: transparent;
         }
     } // end outer-frame
-
-    // ── Titlebar click-to-activate touch area ─────────────────────────────────
-    // An invisible TouchArea layered over the titlebar region so clicking
-    // anywhere in the titlebar (but not on the control buttons) fires
-    // title-clicked → activate-window in Compositor.slint.
-    // The control buttons are rendered on top and will eat their own events.
-    titlebar-touch := TouchArea {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: Tokens.titlebar-height;
-        // Lower z than control buttons so they take precedence.
-        clicked => { root.title-clicked(); }
-    }
-
-    } // end transform-wrapper
 }

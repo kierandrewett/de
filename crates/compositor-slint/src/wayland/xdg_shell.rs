@@ -44,6 +44,7 @@ impl XdgShellHandler for SpikeState {
             x,
             y,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            csd: false,
         });
 
         // Focus the new toplevel (most recently mapped = focused).
@@ -54,7 +55,44 @@ impl XdgShellHandler for SpikeState {
         }
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        // Track + configure the popup. Tracking it in `state.popups` lets the
+        // commit handler import the popup's pixels and `update_windows` push
+        // a PopupItem to Slint each frame so the menu actually renders.
+        let geom = positioner.get_geometry();
+        surface.with_pending_state(|s| {
+            s.geometry = geom;
+            s.positioner = positioner;
+        });
+        if let Err(e) = surface.send_configure() {
+            tracing::warn!("popup send_configure failed: {:?}", e);
+            return;
+        }
+        let parent = match surface.get_parent_surface() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("popup has no parent surface — discarding");
+                return;
+            }
+        };
+        let wl = surface.wl_surface().clone();
+        info!(
+            "new xdg popup at ({},{}) size {}x{}",
+            geom.loc.x, geom.loc.y, geom.size.w, geom.size.h
+        );
+        self.popups.push(crate::wayland_state::PopupInfo {
+            surface: wl,
+            popup: surface,
+            parent,
+            rel_x: geom.loc.x,
+            rel_y: geom.loc.y,
+            w: geom.size.w,
+            h: geom.size.h,
+            pixels: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::wayland_state::ClientSurfaceData::default(),
+            )),
+        });
+    }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl = surface.wl_surface();
@@ -80,7 +118,10 @@ impl XdgShellHandler for SpikeState {
         }
     }
 
-    fn popup_destroyed(&mut self, _surface: PopupSurface) {}
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        let wl = surface.wl_surface().clone();
+        self.popups.retain(|p| p.surface != wl);
+    }
 
     fn grab(
         &mut self,

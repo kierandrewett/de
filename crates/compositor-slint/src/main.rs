@@ -38,13 +38,19 @@ mod wayland_state;
 mod wayland;
 mod platform;
 mod renderer;
-mod chrome_shader;
+// chrome_shader retired in favour of `mod render` (separate single-purpose
+// passes). The old src/chrome_shader.rs + shaders/chrome.wgsl files remain on
+// disk for reference but are no longer compiled.
 mod theme;
 mod wallpaper;
 mod desktop;
 mod cursor;
 mod cursor_render;
 mod resize;
+mod snap;
+mod backdrop;
+mod ipc_server;
+mod render;
 pub mod wm;
 
 fn main() -> Result<()> {
