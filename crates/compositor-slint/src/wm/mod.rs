@@ -655,6 +655,11 @@ impl WindowManager {
         self.focus_stack.last().and_then(|k| self.windows.get(k)).map(|w| w.surface.clone())
     }
 
+    /// Look up the currently focused window's stable ID.
+    pub fn focused_id(&self) -> Option<i32> {
+        self.windows.values().find(|w| w.focused).map(|w| w.id)
+    }
+
     /// Drop focus from every window (e.g. after a click on the desktop).
     /// Returns true if at least one window changed focus state.
     pub fn unfocus_all(&mut self) -> bool {

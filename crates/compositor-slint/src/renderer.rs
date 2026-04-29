@@ -539,6 +539,50 @@ impl ApplicationHandler for CompositorApp {
                             ui.set_help_overlay_visible(!now);
                         }
                     }
+                    // Super+W (scancode 17) → close focused window.
+                    17 if pressed && self.super_held => {
+                        if let Some(id) = self.wm.focused_id() {
+                            self.pending_close.lock().unwrap().push_back(id);
+                            debug!("Super+W: queued close for focused id={}", id);
+                        }
+                    }
+                    // Super+M (scancode 50) → minimize focused window.
+                    50 if pressed && self.super_held => {
+                        if let Some(id) = self.wm.focused_id() {
+                            self.pending_minimize.lock().unwrap().push_back(id);
+                            debug!("Super+M: queued minimize for focused id={}", id);
+                        }
+                    }
+                    // Super+D (scancode 32) → show desktop / minimize all.
+                    32 if pressed && self.super_held => {
+                        let ids: Vec<i32> = self.wm.windows.values()
+                            .filter(|w| !w.minimized && !w.closing)
+                            .map(|w| w.id)
+                            .collect();
+                        let mut q = self.pending_minimize.lock().unwrap();
+                        for id in ids { q.push_back(id); }
+                        debug!("Super+D: minimized all visible windows");
+                    }
+                    // Escape → close any open compositor overlay (menus,
+                    // popouts, debug overlay) without forwarding to clients.
+                    1 if pressed => {
+                        if let Some(ui) = self.ui.as_ref() {
+                            let any_open =
+                                ui.get_desktop_menu_open()
+                                || ui.get_datetime_popout_open()
+                                || ui.get_control_centre_open()
+                                || ui.get_help_overlay_visible();
+                            if any_open {
+                                ui.set_desktop_menu_open(false);
+                                ui.set_datetime_popout_open(false);
+                                ui.set_control_centre_open(false);
+                                ui.set_help_overlay_visible(false);
+                                if let Some(gpu) = self.gpu_window.as_ref() {
+                                    gpu.mark_dirty();
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
 
