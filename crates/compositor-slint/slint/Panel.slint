@@ -57,11 +57,25 @@ export component Panel {
     bar := Rectangle {
         width: parent.width;
         height: parent.height;
-        // Theme tint sits directly on the bar — the wgpu pipeline draws a
-        // GPU real-time blur of the scene into final_tex within the panel
-        // rect before this overlay is composited, so no static Image.
-        background: root.resolved-bg;
+        background: transparent;
         clip: true;
+
+        // Backdrop layer.
+        Image {
+            x: 0;
+            y: 0;
+            width: root.backdrop-screen-w;
+            height: root.backdrop-screen-h;
+            source: root.backdrop;
+            image-fit: fill;
+        }
+
+        // Theme tint over the backdrop.
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: root.resolved-bg;
+        }
 
         bottom-border := Rectangle {
             x: 0;

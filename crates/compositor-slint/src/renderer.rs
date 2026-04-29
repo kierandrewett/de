@@ -203,15 +203,7 @@ struct CompositorApp {
     /// pass accumulates shadow on top of last frame's already-shadowed
     /// render_texture, which reads as flicker / progressively-darkening.
     final_texture: Option<wgpu::Texture>,
-    /// Dual-pass render: the OVERLAY pass (chrome-only=true) writes here.
-    /// It's the dock + panel + popouts + menus + launcher + cursor on a
-    /// transparent background. Alpha-composited onto final_tex AFTER the
-    /// blur passes, so the dock/panel UI stays crisp on top of the
-    /// real-time GPU-blurred backdrop.
-    overlay_texture: Option<wgpu::Texture>,
     render_texture_size: (u32, u32),
-    /// Real-time backdrop-blur pass (separable Gaussian RGBA + composite).
-    blur: Option<crate::render::blur::BlurPass>,
 
     gpu_window: Option<Rc<GpuWindowAdapter>>,
     window_ref: Arc<Mutex<Option<Rc<GpuWindowAdapter>>>>,
@@ -309,9 +301,7 @@ impl CompositorApp {
             swapchain_format: None,
             render_texture: None,
             final_texture: None,
-            overlay_texture: None,
             render_texture_size: (0, 0),
-            blur: None,
             gpu_window: None,
             window_ref,
             ui: Some(ui),
@@ -356,11 +346,10 @@ impl CompositorApp {
             let gpu_window = self.gpu_window.as_ref()?;
             let device = &gpu_window.wgpu_device;
             let format = self.swapchain_format.unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
-            self.render_texture  = Some(make_render_texture(device, width, height, format));
-            self.final_texture   = Some(make_render_texture(device, width, height, format));
-            self.overlay_texture = Some(make_render_texture(device, width, height, format));
+            self.render_texture = Some(make_render_texture(device, width, height, format));
+            self.final_texture  = Some(make_render_texture(device, width, height, format));
             self.render_texture_size = (width, height);
-            debug!("(Re)created scene+overlay+final textures {}x{} {:?}", width, height, format);
+            debug!("(Re)created render+final textures {}x{} {:?}", width, height, format);
         }
         self.render_texture.as_ref()
     }
@@ -409,10 +398,8 @@ impl ApplicationHandler for CompositorApp {
             std::sync::Arc::new(gpu_window.wgpu_device.clone()),
             format,
         );
-        let blur = crate::render::blur::BlurPass::new(&chrome.shared);
         self.chrome = Some(chrome);
-        self.blur   = Some(blur);
-        info!("ChromeRenderer + BlurPass initialised (shadow + border + highlight + real-time backdrop blur)");
+        info!("ChromeRenderer initialised (shadow + border + highlight passes)");
 
         gpu_window.resize(WIDTH, HEIGHT);
 
@@ -465,17 +452,13 @@ impl ApplicationHandler for CompositorApp {
                     self.swapchain_format = Some(fmt);
                 }
                 gpu_window.resize(w, h);
-                self.render_texture  = None;
-                self.final_texture   = None;
-                self.overlay_texture = None;
+                self.render_texture = None;
+                self.final_texture  = None;
                 self.wm.output_w = w as i32;
                 self.wm.output_h = h as i32;
                 self.backdrop.set_output_size(w, h);
                 if let Some(c) = self.chrome.as_mut() {
                     c.invalidate();
-                }
-                if let Some(b) = self.blur.as_mut() {
-                    b.invalidate();
                 }
             }
 
@@ -715,60 +698,17 @@ impl CompositorApp {
         let size = gpu_window.get_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
-        // ── Dual-pass Slint render. ──────────────────────────────────────────
-        // Pass A (`chrome-only=false`) draws the SCENE only — wallpaper,
-        // windows, layer-shell surfaces, popups — to `render_texture`.
-        // Pass B (`chrome-only=true`)  draws the OVERLAY only — dock, panel,
-        // popouts, menus, launcher, cursor — on a transparent background to
-        // `overlay_texture`.
-        //
-        // The wgpu pipeline below runs chrome passes on the scene, blurs the
-        // panel + dock pill rects of `final_tex`, then alpha-composites the
-        // overlay on top. That produces a real-time GPU-blurred backdrop
-        // for the dock + panel that follows real window content underneath
-        // (no more 200 ms-stale CPU pre-blur).
         if gpu_window.has_pending_redraw() {
-            // Allocate (or reuse) the scene + overlay textures.
-            self.get_render_texture(w, h);
-
-            // Render twice with `chrome-only` flipped — borrow scene + overlay
-            // from `self` separately so neither borrow overlaps.
-            if self.render_texture.is_some() && self.overlay_texture.is_some() {
-                let did_render = if let Some(ui) = self.ui.as_ref() {
-                    // Pass A — scene
-                    ui.set_chrome_only(false);
-                    let scene_ok = {
-                        let scene_tex = self.render_texture.as_ref().unwrap();
-                        gpu_window.render_to_texture(scene_tex).is_ok()
-                    };
-                    if !scene_ok {
-                        warn!("render_to_texture (scene) failed");
-                        return;
-                    }
-                    // Pass B — overlay
-                    ui.set_chrome_only(true);
-                    gpu_window.mark_dirty();
-                    let overlay_ok = {
-                        let overlay_tex = self.overlay_texture.as_ref().unwrap();
-                        gpu_window.render_to_texture(overlay_tex).is_ok()
-                    };
-                    if !overlay_ok {
-                        warn!("render_to_texture (overlay) failed");
-                        return;
-                    }
-                    // Restore default for any subsequent slint reads.
-                    ui.set_chrome_only(false);
-                    true
-                } else {
-                    false
-                };
-                if did_render {
-                    self.frame_count += 1;
-                    if self.frame_count % 60 == 0 {
-                        info!("frame loop: {} frames rendered", self.frame_count);
-                    }
-                    debug!("GPU render dual-pass: {}x{} (dirty, frame {})", w, h, self.frame_count);
+            if let Some(render_tex) = self.get_render_texture(w, h) {
+                if let Err(e) = gpu_window.render_to_texture(render_tex) {
+                    warn!("render_to_texture failed: {}", e);
+                    return;
                 }
+                self.frame_count += 1;
+                if self.frame_count % 60 == 0 {
+                    info!("frame loop: {} frames rendered", self.frame_count);
+                }
+                debug!("GPU render: {}x{} (dirty, frame {})", w, h, self.frame_count);
             }
         }
 
@@ -782,19 +722,21 @@ impl CompositorApp {
             Err(e) => { warn!("swapchain: {}", e); return; }
         };
 
-        if let (Some(scene_tex), Some(final_tex), Some(overlay_tex)) =
-            (self.render_texture.as_ref(), self.final_texture.as_ref(), self.overlay_texture.as_ref())
+        if let (Some(render_tex), Some(final_tex)) =
+            (self.render_texture.as_ref(), self.final_texture.as_ref())
         {
             let mut encoder = device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("chrome+blur+composite") }
+                &wgpu::CommandEncoderDescriptor { label: Some("chrome+blit") }
             );
 
-            // Step 1 — copy scene_tex → final_tex. final_tex is rebuilt
-            // every frame even on no-redraw frames, so chrome shadow doesn't
-            // accumulate on top of itself.
+            // Step 1 — copy render_tex → final_tex. final_tex is freshly
+            // populated every frame, even on frames where Slint didn't
+            // re-render. Without this, chrome passes that ran onto render_tex
+            // would accumulate shadow on top of last frame's shadow until
+            // Slint finally re-rendered and cleared it (visible as flicker).
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: scene_tex,
+                    texture: render_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -808,9 +750,9 @@ impl CompositorApp {
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
 
-            // Step 2 — chrome passes (shadow / border / highlight) draw onto
-            // final_tex. Z-order is preserved by re-blitting higher-z window
-            // rects from scene_tex onto final_tex between each window's chrome.
+            // Step 2 — chrome passes draw onto final_tex. scene_view is
+            // render_tex (only the squircle clip pass samples it; off by
+            // default). target_view is final_tex.
             if let Some(chrome) = self.chrome.as_mut() {
                 let chrome_windows: Vec<WindowChromeParams> = if let Some(ui) = self.ui.as_ref() {
                     let model = ui.get_windows();
@@ -819,6 +761,13 @@ impl CompositorApp {
                     (0..len).map(|i| {
                         let item = model.row_data(i).unwrap();
                         let focus_t = self.theme.window_focus_t(item.id);
+                        // GPU chrome (shadow + border + highlight) is drawn
+                        // around the VISIBLE chrome rect — for CSD apps that's
+                        // the cropped geom rect, for SSD it's geom + 33 px
+                        // titlebar. Using item.geom-w/h here (instead of
+                        // item.w/h, which is the configure size = full buffer
+                        // for CSD) keeps the shadow flush around what the
+                        // user actually sees.
                         let titlebar = if item.csd { 0.0 } else { 33.0 };
                         let chrome_w = item.geom_w.max(1) as f32;
                         let chrome_h = item.geom_h.max(1) as f32 + titlebar;
@@ -836,11 +785,20 @@ impl CompositorApp {
                 } else { Vec::new() };
 
                 if !chrome_windows.is_empty() {
-                    let scene_view  = scene_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    let scene_view  = render_tex.create_view(&wgpu::TextureViewDescriptor::default());
                     let target_view = final_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    // Snapshot the per-window rects in physical pixels;
+                    // used by the between-phases closure to re-blit each
+                    // window's region from render_tex onto final_tex,
+                    // overwriting any shadow that bled into the window's
+                    // footprint. Caps each rect to the surface bounds so
+                    // copy_texture_to_texture never reads/writes OOB.
                     let win_rects: Vec<(u32, u32, u32, u32)> = chrome_windows.iter().map(|win| {
                         let x = win.x as i32;
                         let y = win.y as i32;
+                        // chrome_windows w/h already include the SSD titlebar
+                        // (or the cropped geom_h for CSD), so this rect IS the
+                        // full visual footprint — no extra titlebar add.
                         let ww = win.w as i32;
                         let wh = win.h as i32;
                         let cx0 = x.max(0);
@@ -856,12 +814,22 @@ impl CompositorApp {
                         w, h,
                         &chrome_windows,
                         |enc, wi| {
+                            // Z-order fix: after each window's chrome
+                            // (shadow + border + highlight), re-blit ONLY
+                            // higher-z windows' rects from render_tex onto
+                            // final_tex. This overwrites any chrome from
+                            // this back window that fell inside a front
+                            // window's footprint with the front window's
+                            // actual content. render_tex already holds
+                            // z-stacked content from Slint's repeater so
+                            // copying its rects restores correct z without
+                            // per-window content textures.
                             for j in (wi + 1)..win_rects.len() {
                                 let (rx, ry, rw, rh) = win_rects[j];
                                 if rw == 0 || rh == 0 { continue }
                                 enc.copy_texture_to_texture(
                                     wgpu::TexelCopyTextureInfo {
-                                        texture: scene_tex,
+                                        texture: render_tex,
                                         mip_level: 0,
                                         origin: wgpu::Origin3d { x: rx, y: ry, z: 0 },
                                         aspect: wgpu::TextureAspect::All,
@@ -878,108 +846,85 @@ impl CompositorApp {
                         },
                     );
                 }
+
+                // ── Step 2b. Re-blit every visible UI overlay from render_tex
+                //              onto final_tex AFTER chrome. Chrome (shadow,
+                //              border, highlight) draws over whatever was on
+                //              final_tex — without re-blitting the overlays
+                //              the chrome bleeds through panels, popouts,
+                //              context menus, the launcher, etc. Each rect
+                //              is clamped to the swapchain so an overlay
+                //              positioned partly off-screen doesn't crash
+                //              copy_texture_to_texture.
+                let mut reblit = |x: i32, y: i32, rw: i32, rh: i32| {
+                    let cx0 = x.max(0);
+                    let cy0 = y.max(0);
+                    let cx1 = (x + rw).min(w as i32).max(cx0);
+                    let cy1 = (y + rh).min(h as i32).max(cy0);
+                    let cw = (cx1 - cx0) as u32;
+                    let ch = (cy1 - cy0) as u32;
+                    if cw == 0 || ch == 0 { return; }
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: render_tex, mip_level: 0,
+                            origin: wgpu::Origin3d { x: cx0 as u32, y: cy0 as u32, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: final_tex, mip_level: 0,
+                            origin: wgpu::Origin3d { x: cx0 as u32, y: cy0 as u32, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                    );
+                };
+
+                let panel_h = crate::wm::PANEL_HEIGHT.max(0);
+                let dock_h  = crate::wm::DOCK_HEIGHT.max(0);
+                let iw = w as i32;
+                let ih = h as i32;
+                // Always-visible bands.
+                reblit(0, 0, iw, panel_h);
+                reblit(0, ih - dock_h, iw, dock_h);
+
+                // Open-overlay rects — read state directly off the Slint
+                // window so the re-blit covers exactly what's painted.
+                if let Some(ui) = self.ui.as_ref() {
+                    if ui.get_datetime_popout_open() {
+                        // Centre-top, 320×380, anchored panel_h + 6.
+                        let pw = 320;
+                        let ph = 380;
+                        reblit((iw - pw) / 2, panel_h + 6, pw, ph);
+                    }
+                    if ui.get_control_centre_open() {
+                        let pw = 300;
+                        let ph = 220;
+                        reblit(iw - pw - 14, panel_h + 6, pw, ph);
+                    }
+                    if ui.get_launcher_open() {
+                        let pw = 540;
+                        let ph = 64;
+                        reblit((iw - pw) / 2, 120, pw, ph);
+                    }
+                    if ui.get_help_overlay_visible() {
+                        let pw = 480;
+                        let ph = 360;
+                        reblit((iw - pw) / 2, (ih - ph) / 2, pw, ph);
+                    }
+                    if ui.get_desktop_menu_open() {
+                        let pw = 220;
+                        let ph = 260;
+                        reblit(ui.get_desktop_menu_x(), ui.get_desktop_menu_y(), pw, ph);
+                    }
+                    if ui.get_dock_menu_open() {
+                        let pw = 220;
+                        let ph = 280;
+                        reblit(ui.get_dock_menu_x(), ui.get_dock_menu_y(), pw, ph);
+                    }
+                }
             }
 
-            // Step 3 — Real-time backdrop blur for the dock pill + top
-            // panel. Samples the SCENE texture (no overlay UI present, so
-            // no icons/clock to smear) and writes a separable Gaussian
-            // result back into final_tex within those rects, squircle-
-            // clipped for the dock and rectangular for the panel.
-            if let (Some(blur), Some(chrome)) = (self.blur.as_mut(), self.chrome.as_ref()) {
-                use crate::render::blur::{slot_offset, uniforms_for_blur, BlurShape};
-                use crate::render::common::{UNIFORM_STRIDE, UNIFORM_STRUCT_SIZE};
-
-                let panel_h = crate::wm::PANEL_HEIGHT.max(0) as f32;
-                let dock_h  = crate::wm::DOCK_HEIGHT.max(0) as f32;
-                let iw      = w as f32;
-                let ih      = h as f32;
-
-                // Dock pill: macOS-style centred horizontal bar. The actual
-                // pill width is determined by Slint's items-row preferred
-                // width — without a callback to read that we estimate
-                // dock_w as min(dock-icon-count × 64 + 2*16 padding, 90% iw).
-                let dock_icon_count = self.ui.as_ref().map(|ui| ui.get_dock_items().row_count()).unwrap_or(0) as f32;
-                let dock_pill_w = (dock_icon_count * 64.0 + 32.0).min(iw * 0.9).max(120.0);
-                let dock_pill_h = 64.0 + 2.0 * crate::wm::DOCK_PADDING as f32;
-                let dock_pill_x = (iw - dock_pill_w) / 2.0;
-                let dock_pill_y = ih - dock_h + crate::wm::DOCK_OUTER_GAP as f32;
-
-                // Panel: full-width rectangular band along the top edge.
-                let panel_x = 0.0;
-                let panel_y = 0.0;
-                let panel_w = iw;
-
-                let dock_uniforms  = uniforms_for_blur(
-                    dock_pill_x, dock_pill_y, dock_pill_w, dock_pill_h,
-                    iw, ih,
-                    24.0, 24.0, 0.6,
-                );
-                let panel_uniforms = uniforms_for_blur(
-                    panel_x, panel_y, panel_w, panel_h,
-                    iw, ih,
-                    24.0, 0.0, 0.0,
-                );
-
-                // Pack uniforms into the chrome dynamic buffer (slots 0,1).
-                let mut packed = vec![0u8; (UNIFORM_STRIDE * 2) as usize];
-                packed[0..UNIFORM_STRUCT_SIZE]
-                    .copy_from_slice(bytemuck::bytes_of(&dock_uniforms));
-                packed[UNIFORM_STRIDE as usize .. UNIFORM_STRIDE as usize + UNIFORM_STRUCT_SIZE]
-                    .copy_from_slice(bytemuck::bytes_of(&panel_uniforms));
-                queue.write_buffer(&chrome.shared.dynamic_uniform_buf, 0, &packed);
-
-                let final_view = final_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                let scene_view = scene_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-                blur.blur_into(
-                    &chrome.shared, &mut encoder,
-                    &scene_view, &final_view,
-                    w, h, slot_offset(0), BlurShape::Pill,
-                );
-                blur.blur_into(
-                    &chrome.shared, &mut encoder,
-                    &scene_view, &final_view,
-                    w, h, slot_offset(1), BlurShape::Rect,
-                );
-            }
-
-            // Step 4 — Alpha-composite the OVERLAY (dock + panel + popouts +
-            // menus + launcher + cursor) onto final_tex. The overlay was
-            // rendered with `chrome-only=true` on a transparent background
-            // so this src-over blend drops the UI pixels on top of the
-            // GPU-blurred backdrop without smearing the icons.
-            if let (Some(blur), Some(chrome)) = (self.blur.as_mut(), self.chrome.as_ref()) {
-                use crate::render::blur::{slot_offset, uniforms_for_blur};
-                use crate::render::common::{UNIFORM_STRIDE, UNIFORM_STRUCT_SIZE};
-
-                // Whole-surface overlay blit: rect_w=0 sentinel skips the
-                // bounds check in the shader and just samples everywhere.
-                let overlay_uniforms = uniforms_for_blur(
-                    0.0, 0.0, 0.0, 0.0,
-                    w as f32, h as f32,
-                    0.0, 0.0, 0.0,
-                );
-                let mut packed = vec![0u8; UNIFORM_STRIDE as usize];
-                packed[0..UNIFORM_STRUCT_SIZE]
-                    .copy_from_slice(bytemuck::bytes_of(&overlay_uniforms));
-                // Use slot 2 to avoid trampling slots 0/1 used by blur step.
-                queue.write_buffer(
-                    &chrome.shared.dynamic_uniform_buf,
-                    UNIFORM_STRIDE * 2,
-                    &packed,
-                );
-
-                let overlay_view = overlay_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                let final_view   = final_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-                blur.overlay_blit(
-                    &chrome.shared, &mut encoder,
-                    &overlay_view, &final_view,
-                    slot_offset(2),
-                );
-            }
-
-            // Step 5 — final_tex → swapchain.
+            // Step 3 — final_tex → swapchain.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: final_tex,
