@@ -1083,7 +1083,7 @@ impl CompositorApp {
 
             items.push(crate::WindowItem {
                 id: win.id,
-                title: SharedString::from(title),
+                title: SharedString::from(title.clone()),
                 x: win.anim.current_x(),
                 y: win.anim.current_y(),
                 w: win.anim.current_w(),
@@ -1100,6 +1100,17 @@ impl CompositorApp {
                 geom_h,
                 csd: toplevel.csd,
             });
+        }
+
+        // Push the focused window's title into the panel's "focused-app"
+        // slot. Falls back to "Desktop" when nothing is focused so the panel
+        // is never blank — matches GNOME's "Activities"/macOS finder pattern.
+        if let Some(ui) = self.ui.as_ref() {
+            let focused_title: String = items.iter()
+                .find(|it| it.focused)
+                .map(|it| it.title.to_string())
+                .unwrap_or_else(|| "Desktop".to_string());
+            ui.set_focused_app(SharedString::from(focused_title));
         }
 
         // In-place diff against the persistent VecModel by `id`. Rebuilding
@@ -2066,7 +2077,8 @@ impl CompositorApp {
                 w.awaiting_first_render,
             ));
         }
-        out.push_str("\nKeys: Super+T theme  Super+I debug  Super+/ help\n");
+        out.push_str("\nKeys: Super+T theme  Super+I debug  Super+W close  Super+M min\n");
+        out.push_str("      Super+D show-desktop  Super+/ help  Esc dismiss\n");
         out
     }
 
