@@ -151,6 +151,11 @@ export component Compositor inherits Window {
     in property      <[MenuItem]>    desktop-menu-items;
     callback desktop-menu-clicked(int);
 
+    // ── App launcher overlay (Super+Space) ───────────────────────────────────
+    in-out property <bool>     launcher-open: false;
+    in-out property <string>   launcher-query: "";
+    callback launcher-submit(string);
+
     // ── Dock per-app context menu ────────────────────────────────────────────
     in-out property <bool>           dock-menu-open: false;
     in-out property <int>            dock-menu-x: 0;
@@ -519,6 +524,65 @@ export component Compositor inherits Window {
         }
     }
 
+    // ── Layer 68: App launcher overlay (Spotlight-style) ─────────────────────
+    if root.launcher-open: TouchArea {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        z: 67;
+        clicked => { root.launcher-open = false; }
+    }
+    if root.launcher-open: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 120px;
+        width: 540px;
+        height: 64px;
+        z: 68;
+        background: Theme.mode == TokenMode.Dark
+            ? rgba(28, 30, 36, 0.97)
+            : rgba(252, 252, 252, 0.97);
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: Theme.mode == TokenMode.Dark
+            ? rgba(255, 255, 255, 0.10)
+            : rgba(0, 0, 0, 0.10);
+        drop-shadow-blur: 28px;
+        drop-shadow-offset-y: 12px;
+        drop-shadow-color: rgba(0, 0, 0, 0.55);
+        clip: true;
+
+        Image {
+            x: 16px;
+            y: (parent.height - 22px) / 2;
+            width: 22px;
+            height: 22px;
+            source: @image-url("../assets/icons/search.svg");
+            colorize: Theme.mode == TokenMode.Dark
+                ? rgba(255, 255, 255, 0.55)
+                : rgba(0, 0, 0, 0.45);
+        }
+
+        launcher-input := TextInput {
+            x: 50px;
+            y: 0;
+            width: parent.width - 60px;
+            height: parent.height;
+            text <=> root.launcher-query;
+            color: Theme.mode == TokenMode.Dark
+                ? rgba(255, 255, 255, 0.95)
+                : rgba(0, 0, 0, 0.92);
+            font-family: Tokens.font-family;
+            font-size: 18px;
+            single-line: true;
+            vertical-alignment: center;
+            accepted => {
+                root.launcher-submit(root.launcher-query);
+                root.launcher-open = false;
+                root.launcher-query = "";
+            }
+        }
+    }
+
     // ── Layer 70: Debug overlay (devtools) ───────────────────────────────────
     if root.debug-overlay-visible: Rectangle {
         x: 12px;
@@ -632,6 +696,7 @@ export component Compositor inherits Window {
                     "Super + T          Toggle light / dark theme\n"
                     + "Super + I          Toggle debug overlay\n"
                     + "Super + ?          Toggle this help\n"
+                    + "Super + Space      App launcher (Spotlight-style)\n"
                     + "Super + W          Close focused window\n"
                     + "Super + M          Minimise focused window\n"
                     + "Super + D          Show desktop / minimise all\n"
@@ -639,6 +704,7 @@ export component Compositor inherits Window {
                     + "Alt + Tab          Cycle windows (MRU)\n"
                     + "Esc                Dismiss menus / popouts / help\n"
                     + "Right-click desk   Open desktop context menu\n"
+                    + "Right-click dock   Per-app menu (Quit / Show All)\n"
                     + "Double-click bar   Maximise window\n"
                     + "Drag → screen edge Snap to half / quarter\n"
                     + "Drag → top edge    Maximise (snap)\n"

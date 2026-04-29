@@ -570,20 +570,33 @@ impl ApplicationHandler for CompositorApp {
                         for id in ids { q.push_back(id); }
                         debug!("Super+D: minimized all visible windows");
                     }
+                    // Super+Space (scancode 57) → toggle the app launcher.
+                    57 if pressed && self.super_held => {
+                        if let Some(ui) = self.ui.as_ref() {
+                            let now = ui.get_launcher_open();
+                            ui.set_launcher_open(!now);
+                            if !now { ui.set_launcher_query(SharedString::default()); }
+                        }
+                    }
                     // Escape → close any open compositor overlay (menus,
-                    // popouts, debug overlay) without forwarding to clients.
+                    // popouts, debug overlay, launcher) without forwarding
+                    // to clients.
                     1 if pressed => {
                         if let Some(ui) = self.ui.as_ref() {
                             let any_open =
                                 ui.get_desktop_menu_open()
                                 || ui.get_datetime_popout_open()
                                 || ui.get_control_centre_open()
-                                || ui.get_help_overlay_visible();
+                                || ui.get_help_overlay_visible()
+                                || ui.get_launcher_open()
+                                || ui.get_dock_menu_open();
                             if any_open {
                                 ui.set_desktop_menu_open(false);
                                 ui.set_datetime_popout_open(false);
                                 ui.set_control_centre_open(false);
                                 ui.set_help_overlay_visible(false);
+                                ui.set_launcher_open(false);
+                                ui.set_dock_menu_open(false);
                                 if let Some(gpu) = self.gpu_window.as_ref() {
                                     gpu.mark_dirty();
                                 }
@@ -2933,6 +2946,32 @@ pub fn run() -> Result<()> {
     // (via SpikeState in the main loop), so we push them onto a queue.
     let pending_dock_action: Arc<Mutex<VecDeque<(String, i32)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
+
+    // App launcher submit — match the typed query against any pinned app's
+    // id or display name (case-insensitive prefix); fall back to running
+    // the query verbatim through `sh -c` so users can also dispatch any
+    // command-line invocation via Super+Space.
+    {
+        let dock_entries_q = dock_entries.iter()
+            .map(|e| (e.item.app_id.to_string(), e.item.name.to_string(), e.exec.clone()))
+            .collect::<Vec<_>>();
+        ui.on_launcher_submit(move |q| {
+            let query = q.trim().to_string();
+            if query.is_empty() { return; }
+            let lq = query.to_lowercase();
+            // Find a pinned-app match by id or name prefix.
+            let exec = dock_entries_q.iter().find_map(|(id, name, exec)| {
+                if id.to_lowercase().contains(&lq)
+                   || name.to_lowercase().contains(&lq)
+                {
+                    Some(exec.clone())
+                } else { None }
+            }).unwrap_or(query);
+            tracing::info!("launcher: launching {:?}", exec);
+            let _ = std::process::Command::new("sh")
+                .arg("-c").arg(&exec).spawn();
+        });
+    }
 
     // StatusNotifierItem clicks — fire `Activate` / `ContextMenu` on the
     // item's DBus interface. We pull (service, object-path) straight off
