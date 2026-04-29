@@ -21,6 +21,7 @@
 //!   3. Border (0.5 px stroke) per window
 //!   4. Highlight (1 px inner top gradient) per window
 
+pub mod blur;
 pub mod common;
 pub mod border;
 pub mod highlight;

@@ -215,38 +215,21 @@ export component Dock {
             drop-shadow-offset-y: 8px;
             drop-shadow-color: rgba(0, 0, 0, 0.45);
 
-            // Clipped backdrop + theme tint + top-edge gloss — all
-            // confined to the pill's rounded rect. Border lives here too
-            // so the rounded edge clips it cleanly.
+            // Theme tint + 1px border + top-edge gloss — drawn on top of
+            // the GPU real-time blur (which the wgpu pipeline writes to
+            // final_tex within this pill's rect BEFORE the overlay pass is
+            // composited). No backdrop Image any more — the blur IS the
+            // backdrop now, computed per frame from the actual scene
+            // behind the pill.
             pill-bg := Rectangle {
                 x: 0; y: 0;
                 width: parent.width;
                 height: parent.height;
-                background: transparent;
+                background: root.resolved-bg;
                 border-radius: Tokens.dock-corner-radius;
                 border-width: 1px;
                 border-color: root.resolved-border;
                 clip: true;
-
-                // Backdrop image — pre-blurred wallpaper for now.
-                // (Real-time GPU blur of what's actually behind the dock
-                //  is the next pass; this gives us the same visual but
-                //  static.)
-                Image {
-                    x: -((root.backdrop-screen-w - parent.width) / 2 + pill.x);
-                    y: root.backdrop-offset-y;
-                    width: root.backdrop-screen-w;
-                    height: root.backdrop-screen-h;
-                    source: root.backdrop;
-                    image-fit: fill;
-                }
-
-                // Theme tint over the backdrop.
-                Rectangle {
-                    width: parent.width;
-                    height: parent.height;
-                    background: root.resolved-bg;
-                }
 
                 // Subtle top-edge gloss highlight (macOS-style).
                 Rectangle {

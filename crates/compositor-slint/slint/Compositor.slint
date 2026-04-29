@@ -116,6 +116,17 @@ export { TokenMode }
 
 // ── Top-level Compositor component ───────────────────────────────────────────
 export component Compositor inherits Window {
+    /// Dual-pass render toggle:
+    ///   - false (default): "scene" pass — wallpaper, windows, layer-shell
+    ///     surfaces, popups. The chrome+blur+composite pipeline samples
+    ///     this pass to produce a real-time backdrop blur for the dock pill
+    ///     and panel band.
+    ///   - true: "overlay" pass — dock, panel, popouts, menus, launcher,
+    ///     cursor on a transparent background. Alpha-blended on top of the
+    ///     blurred final_tex by the wgpu pipeline.
+    /// Rust flips this between the two render_to_texture calls each frame.
+    in property <bool>          chrome-only: false;
+
     // ── Inbound properties (Rust → Slint) ─────────────────────────────────────
     in property <[WindowItem]>     windows;
     in property <[LayerItem]>      layers;
@@ -222,7 +233,7 @@ export component Compositor inherits Window {
 
 
     // ── Layer 0: Wallpaper ────────────────────────────────────────────────────
-    Wallpaper {
+    if !root.chrome-only: Wallpaper {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
@@ -232,14 +243,20 @@ export component Compositor inherits Window {
 
     // ── Layer 1: Background / bottom layer-shell surfaces ────────────────────
     // Renders surfaces with layer-ordinal 0 (background) or 1 (bottom).
-    for layer in root.layers: LayerSurface {
-        visible: layer.layer-ordinal <= 1;
-        surface: layer.surface;
-        surface-x: layer.x * 1px;
-        surface-y: layer.y * 1px;
-        surface-width: layer.w * 1px;
-        surface-height: layer.h * 1px;
+    if !root.chrome-only: Rectangle {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
         z: 20;
+        for layer in root.layers: LayerSurface {
+            visible: layer.layer-ordinal <= 1;
+            surface: layer.surface;
+            surface-x: layer.x * 1px;
+            surface-y: layer.y * 1px;
+            surface-width: layer.w * 1px;
+            surface-height: layer.h * 1px;
+        }
     }
 
     // ── Layer 2: Windows with SSD chrome ─────────────────────────────────────
@@ -249,7 +266,7 @@ export component Compositor inherits Window {
     // "under" the dock visually disappear behind it without us hard-cutting
     // them off (which made the user lose the bottom of windows when dragged
     // down).
-    Rectangle {
+    if !root.chrome-only: Rectangle {
         x: 0;
         y: Tokens.panel-height;
         width: parent.width;
@@ -293,18 +310,24 @@ export component Compositor inherits Window {
 
     // ── Layer 3: Top / overlay layer-shell surfaces ───────────────────────────
     // Renders surfaces with layer-ordinal 2 (top) or 3 (overlay).
-    for layer in root.layers: LayerSurface {
-        visible: layer.layer-ordinal >= 2;
-        surface: layer.surface;
-        surface-x: layer.x * 1px;
-        surface-y: layer.y * 1px;
-        surface-width: layer.w * 1px;
-        surface-height: layer.h * 1px;
+    if !root.chrome-only: Rectangle {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
         z: 30;
+        for layer in root.layers: LayerSurface {
+            visible: layer.layer-ordinal >= 2;
+            surface: layer.surface;
+            surface-x: layer.x * 1px;
+            surface-y: layer.y * 1px;
+            surface-width: layer.w * 1px;
+            surface-height: layer.h * 1px;
+        }
     }
 
     // ── Layer 4: Dock ─────────────────────────────────────────────────────────
-    dock := Dock {
+    if root.chrome-only: Dock {
         x: 0;
         y: parent.height - self.height;
         width: parent.width;
@@ -329,7 +352,7 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 5: Panel ────────────────────────────────────────────────────────
-    panel := Panel {
+    if root.chrome-only: Panel {
         x: 0; y: 0;
         width: parent.width;
         z: 50;
@@ -355,14 +378,14 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 5c: Desktop / appindicator context menu ────────────────────────
-    if root.desktop-menu-open: TouchArea {
+    if root.chrome-only && root.desktop-menu-open: TouchArea {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
         z: 79;
         clicked => { root.desktop-menu-open = false; }
     }
-    desktop-menu := ContextMenu {
+    if root.chrome-only: ContextMenu {
         x: root.desktop-menu-x * 1px;
         y: root.desktop-menu-y * 1px;
         z: 80;
@@ -376,14 +399,14 @@ export component Compositor inherits Window {
     }
 
     // ── Dock per-app context menu (separate so it can have its own items) ─
-    if root.dock-menu-open: TouchArea {
+    if root.chrome-only && root.dock-menu-open: TouchArea {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
         z: 81;
         clicked => { root.dock-menu-open = false; }
     }
-    dock-menu := ContextMenu {
+    if root.chrome-only: ContextMenu {
         x: root.dock-menu-x * 1px;
         y: root.dock-menu-y * 1px;
         z: 82;
@@ -397,35 +420,44 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 5b: xdg_popup surfaces (context menus, dropdowns) ─────────────
+    // Wallpaper-side: popups belong to client windows, so render in scene pass.
     // Drawn above windows but below panels/popouts so the menu appears in
     // front of the parent window. Position is compositor-space — Rust
     // resolves parent-relative offsets when populating PopupItem each frame.
-    for popup in root.popups: Rectangle {
-        x: popup.x * 1px;
-        y: popup.y * 1px;
-        width: popup.w * 1px;
-        height: popup.h * 1px;
+    if !root.chrome-only: Rectangle {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
         z: 65;
-        background: Theme.window-content-bg;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: Theme.mode == TokenMode.Dark
-            ? rgba(255, 255, 255, 0.12)
-            : rgba(0, 0, 0, 0.10);
-        drop-shadow-blur: 18px;
-        drop-shadow-offset-y: 6px;
-        drop-shadow-color: rgba(0, 0, 0, 0.40);
-        clip: true;
-        Image {
-            width: parent.width;
-            height: parent.height;
-            source: popup.texture;
-            image-fit: fill;
+        for popup in root.popups: Rectangle {
+            x: popup.x * 1px;
+            y: popup.y * 1px;
+            width: popup.w * 1px;
+            height: popup.h * 1px;
+            background: Theme.window-content-bg;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.mode == TokenMode.Dark
+                ? rgba(255, 255, 255, 0.12)
+                : rgba(0, 0, 0, 0.10);
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: rgba(0, 0, 0, 0.40);
+            clip: true;
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: popup.texture;
+                image-fit: fill;
+            }
         }
     }
 
     // ── Layer 6: Snap preview overlay ────────────────────────────────────────
-    snap-preview := Rectangle {
+    // Snap preview is part of the SCENE (windows below dock), so it's drawn
+    // in the scene pass — it can sit behind the panel/dock for free.
+    if !root.chrome-only: Rectangle {
         x: root.snap-preview-x * 1px;
         y: root.snap-preview-y * 1px;
         width: root.snap-preview-w * 1px;
@@ -440,7 +472,7 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 6: Popouts ─────────────────────────────────────────────────────
-    if root.datetime-popout-open || root.control-centre-open: TouchArea {
+    if root.chrome-only && (root.datetime-popout-open || root.control-centre-open): TouchArea {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
@@ -451,7 +483,7 @@ export component Compositor inherits Window {
         }
     }
 
-    datetime-popout := DatetimePopout {
+    if root.chrome-only: DatetimePopout {
         x: (parent.width - self.width) / 2;
         y: Tokens.panel-height + 6px;
         z: 60;
@@ -463,7 +495,7 @@ export component Compositor inherits Window {
         calendar-days: root.popout-calendar-days;
     }
 
-    control-centre-popout := ControlCentrePopout {
+    if root.chrome-only: ControlCentrePopout {
         x: parent.width - self.width - 14px;
         y: Tokens.panel-height + 6px;
         z: 60;
@@ -479,7 +511,7 @@ export component Compositor inherits Window {
     // bright outline with a label. EDGE_ZONE band is shown as a faint inner
     // ring. Use this to compare what the hit-test thinks against the visual
     // chrome and to diagnose stray resize-cursor zones.
-    if root.debug-overlay-visible: Rectangle {
+    if root.chrome-only && root.debug-overlay-visible: Rectangle {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
@@ -528,14 +560,14 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 68: App launcher overlay (Spotlight-style) ─────────────────────
-    if root.launcher-open: TouchArea {
+    if root.chrome-only && root.launcher-open: TouchArea {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
         z: 67;
         clicked => { root.launcher-open = false; }
     }
-    if root.launcher-open: Rectangle {
+    if root.chrome-only && root.launcher-open: Rectangle {
         x: (parent.width - self.width) / 2;
         y: 120px;
         width: 540px;
@@ -587,7 +619,7 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 70: Debug overlay (devtools) ───────────────────────────────────
-    if root.debug-overlay-visible: Rectangle {
+    if root.chrome-only && root.debug-overlay-visible: Rectangle {
         x: 12px;
         y: Tokens.panel-height + 12px;
         width: 360px;
@@ -645,7 +677,7 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 75: Help overlay (Super+/) ─────────────────────────────────────
-    if root.help-overlay-visible: TouchArea {
+    if root.chrome-only && root.help-overlay-visible: TouchArea {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
@@ -721,9 +753,11 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 99: Custom cursor overlay ──────────────────────────────────────
-    // Painted at the highest z-order so it's always on top of everything.
-    // The image is positioned such that cursor-hotspot-{x,y} is at the pointer.
-    Image {
+    // Cursor lives in the OVERLAY pass so it draws crisply on top of the
+    // GPU-blurred dock/panel — and on top of the windows. Painted at the
+    // highest z-order. The image is positioned such that
+    // cursor-hotspot-{x,y} is at the pointer.
+    if root.chrome-only: Image {
         z: 99;
         x: (root.cursor-x - root.cursor-hotspot-x) * 1px;
         y: (root.cursor-y - root.cursor-hotspot-y) * 1px;

@@ -17,6 +17,12 @@ pub const PANEL_HEIGHT: i32 = 34;
 /// Dock height (reserved at bottom of screen). Matches Dock.slint:
 /// `64 px (icons) + 2 * dock-padding + 2 * dock-outer-gap` with both = 8 px.
 pub const DOCK_HEIGHT: i32 = 96;
+/// Dock pill inner padding (matches `Tokens.dock-padding` in Tokens.slint).
+pub const DOCK_PADDING: i32 = 8;
+/// Gap between the dock pill and the bottom screen edge (matches
+/// `Tokens.dock-outer-gap`). The pill itself is `DOCK_HEIGHT - 2 *
+/// DOCK_OUTER_GAP` tall.
+pub const DOCK_OUTER_GAP: i32 = 8;
 /// Titlebar height that the SSD chrome adds above the client content.
 pub const TITLEBAR_HEIGHT: f64 = 33.0;
 
