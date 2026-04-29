@@ -1121,11 +1121,16 @@ impl CompositorApp {
             //   * Surface → not implemented yet; fall back to compositor
             //               default so users still see something.
             use smithay::input::pointer::CursorImageStatus;
+            use smithay::input::pointer::CursorIcon;
             match &state.cursor_status {
                 CursorImageStatus::Hidden => {
                     ui.set_cursor_visible(false);
                 }
-                CursorImageStatus::Named(icon) => {
+                // Skip the default named cursor — that's what smithay sets on
+                // pointer.leave, and overriding it would clobber our own
+                // hit-zone-driven cursor (Move over titlebar, Resize on
+                // edges, etc.). Only honour explicit non-default names.
+                CursorImageStatus::Named(icon) if *icon != CursorIcon::Default => {
                     ui.set_cursor_visible(true);
                     if let Some((img, (hx, hy))) =
                         self.cursor_renderer.get_dynamic(icon.name())
@@ -1135,7 +1140,9 @@ impl CompositorApp {
                         ui.set_cursor_hotspot_y(hy);
                     }
                 }
-                CursorImageStatus::Surface(_) => {
+                CursorImageStatus::Named(_) | CursorImageStatus::Surface(_) => {
+                    // Default named or surface cursor → leave our own
+                    // hit-zone-driven cursor in place.
                     ui.set_cursor_visible(true);
                 }
             }
