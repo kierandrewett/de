@@ -30,6 +30,9 @@ component DockIconSlot {
     in property <bool>     show-separator: false;
 
     callback icon-clicked(string);
+    /// Right-click on the icon. Args: app-id, cursor x/y in slot-local space
+    /// (caller can convert to compositor-space for context-menu positioning).
+    callback icon-right-clicked(string, length, length);
 
     // Slot is just slightly larger than the button so neighbouring buttons
     // pack tight (6 px gap between them) — closer to the user's reference
@@ -70,6 +73,12 @@ component DockIconSlot {
     ta := TouchArea {
         width: parent.width;
         height: parent.height;
+        pointer-event(e) => {
+            if (e.button == PointerEventButton.right
+                && e.kind == PointerEventKind.up) {
+                root.icon-right-clicked(root.item.app-id, self.mouse-x, self.mouse-y);
+            }
+        }
         clicked => { root.icon-clicked(root.item.app-id); }
     }
 
@@ -150,6 +159,8 @@ export component Dock {
     in property <length>     backdrop-screen-h: 1px;
     in property <length>     backdrop-offset-y: 0px;
     callback icon-clicked(string);
+    /// Right-click — caller positions a context menu near the cursor.
+    callback icon-right-clicked(string);
 
     height: 64px + 2 * Tokens.dock-padding + 2 * Tokens.dock-outer-gap;
 
@@ -228,6 +239,7 @@ export component Dock {
                     DockIconSlot {
                         item: item;
                         icon-clicked(id) => { root.icon-clicked(id); }
+                        icon-right-clicked(id, mx, my) => { root.icon-right-clicked(id); }
                     }
                 }
             }

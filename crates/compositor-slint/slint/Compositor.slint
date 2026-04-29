@@ -140,6 +140,14 @@ export component Compositor inherits Window {
     in property      <[MenuItem]>    desktop-menu-items;
     callback desktop-menu-clicked(int);
 
+    // ── Dock per-app context menu ────────────────────────────────────────────
+    in-out property <bool>           dock-menu-open: false;
+    in-out property <int>            dock-menu-x: 0;
+    in-out property <int>            dock-menu-y: 0;
+    in-out property <string>         dock-menu-app-id: "";
+    in property      <[MenuItem]>    dock-menu-items;
+    callback dock-menu-clicked(string, int);
+
     // ── Snap preview overlay ─────────────────────────────────────────────────
     in property <bool>          snap-preview-visible: false;
     in property <int>           snap-preview-x:  0;
@@ -291,6 +299,14 @@ export component Compositor inherits Window {
         backdrop-screen-h: parent.height;
         backdrop-offset-y: -(parent.height - self.height);
         icon-clicked(app-id) => { root.launch-app(app-id); }
+        icon-right-clicked(app-id) => {
+            // Open the dock context menu above the cursor (220 px wide,
+            // ~240 px tall — fits standard 5–7 entries comfortably).
+            root.dock-menu-app-id = app-id;
+            root.dock-menu-x = root.cursor-x - 110;
+            root.dock-menu-y = root.cursor-y - 240;
+            root.dock-menu-open = true;
+        }
     }
 
     // ── Layer 5: Panel ────────────────────────────────────────────────────────
@@ -335,6 +351,27 @@ export component Compositor inherits Window {
             root.desktop-menu-clicked(id);
         }
         dismiss => { root.desktop-menu-open = false; }
+    }
+
+    // ── Dock per-app context menu (separate so it can have its own items) ─
+    if root.dock-menu-open: TouchArea {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        z: 81;
+        clicked => { root.dock-menu-open = false; }
+    }
+    dock-menu := ContextMenu {
+        x: root.dock-menu-x * 1px;
+        y: root.dock-menu-y * 1px;
+        z: 82;
+        items: root.dock-menu-items;
+        open: root.dock-menu-open;
+        item-clicked(id) => {
+            root.dock-menu-open = false;
+            root.dock-menu-clicked(root.dock-menu-app-id, id);
+        }
+        dismiss => { root.dock-menu-open = false; }
     }
 
     // ── Layer 5b: xdg_popup surfaces (context menus, dropdowns) ─────────────

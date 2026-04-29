@@ -2739,6 +2739,30 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // Dock per-app context menu — Open New Window, Show All Windows, Quit.
+    {
+        use crate::MenuItem;
+        let items = vec![
+            MenuItem { id: 1, label: SharedString::from("Open New Window"),
+                accelerator: SharedString::default(), separator: false, enabled: true },
+            MenuItem { id: 2, label: SharedString::from("Show All Windows"),
+                accelerator: SharedString::default(), separator: false, enabled: true },
+            MenuItem { id: -1, label: SharedString::default(),
+                accelerator: SharedString::default(), separator: true, enabled: false },
+            MenuItem { id: 3, label: SharedString::from("Keep in Dock"),
+                accelerator: SharedString::default(), separator: false, enabled: false },
+            MenuItem { id: 4, label: SharedString::from("Show in Files"),
+                accelerator: SharedString::default(), separator: false, enabled: false },
+            MenuItem { id: -1, label: SharedString::default(),
+                accelerator: SharedString::default(), separator: true, enabled: false },
+            MenuItem { id: 5, label: SharedString::from("Quit"),
+                accelerator: SharedString::from("⌘Q"), separator: false, enabled: true },
+        ];
+        let model = std::rc::Rc::new(VecModel::from(items));
+        ui.set_dock_menu_items(slint::ModelRc::from(model));
+    }
+    // dock-menu-clicked is wired AFTER `exec_map` is built (just below).
+
     // Launch-app callback.
     let exec_map: std::collections::HashMap<String, String> = dock_entries
         .iter()
@@ -2756,6 +2780,22 @@ pub fn run() -> Result<()> {
     let pending_minimize: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let pending_maximize: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let pending_activate: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+    // Dock context-menu callback — uses exec_map for "Open New Window".
+    {
+        let exec_map_q = exec_map.clone();
+        ui.on_dock_menu_clicked(move |app_id, action| {
+            tracing::info!("dock-menu: app={} action={}", app_id, action);
+            if action == 1 {
+                if let Some(exec) = exec_map_q.get(app_id.as_str()) {
+                    let _ = std::process::Command::new("sh")
+                        .arg("-c").arg(exec).spawn();
+                }
+            }
+            // Other actions (Show All Windows, Quit) need per-app window
+            // index in the WM — wire in a follow-up pass.
+        });
+    }
 
     {
         let q = pending_close.clone();
