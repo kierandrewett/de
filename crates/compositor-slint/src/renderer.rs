@@ -474,13 +474,11 @@ impl ApplicationHandler for CompositorApp {
                 self.scale_factor = scale as f32;
                 let logical_w = ((size.width  as f64 / scale).round() as u32).max(1);
                 let logical_h = ((size.height as f64 / scale).round() as u32).max(1);
-                if (prev_scale - self.scale_factor).abs() > 0.001 {
-                    info!(
-                        "compositor resize: logical={}x{} physical={}x{} scale_factor={} (was {})",
-                        logical_w, logical_h, size.width, size.height,
-                        self.scale_factor, prev_scale,
-                    );
-                }
+                info!(
+                    "compositor resize: logical={}x{} physical={}x{} scale_factor={} (was {})",
+                    logical_w, logical_h, size.width, size.height,
+                    self.scale_factor, prev_scale,
+                );
                 if let Some(surface) = self.wgpu_surface.as_ref() {
                     // wgpu surface is in physical pixels (raw size).
                     let fmt = configure_surface(
