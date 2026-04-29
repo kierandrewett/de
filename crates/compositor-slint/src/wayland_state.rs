@@ -271,6 +271,11 @@ pub struct SpikeState {
     // ── DMA-BUF two-stage import (Option B) ──────────────────────────────────
     /// Surfaceless EGL display — initialised lazily on first DMA-BUF import.
     /// `None` means not yet attempted or init failed (see `egl_init_tried`).
+    /// Latest cursor-image request from the focused client. `Default` keeps
+    /// our compositor-supplied xcursor; `Hidden` hides the cursor entirely
+    /// while the pointer is over that client; `Surface(_)` is a client-
+    /// supplied cursor surface (not yet honoured — falls back to default).
+    pub cursor_status: CursorImageStatus,
     pub egl_display: Option<EGLDisplay>,
     /// Surfaceless GLES renderer — initialised from `egl_display`.
     /// Used for: `ImportDma::import_dmabuf` → GL texture,
@@ -396,6 +401,7 @@ impl SpikeState {
             destroyed_surfaces: Vec::new(),
             should_exit: false,
             pointer_pos: (0.0, 0.0),
+            cursor_status: CursorImageStatus::default_named(),
             egl_display: None,
             gles_renderer: None,
             egl_init_tried: false,
@@ -875,7 +881,13 @@ impl SeatHandler for SpikeState {
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {}
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // Honour `wl_pointer.set_cursor` — primarily so clients that hide
+        // their cursor (e.g. video players in fullscreen, drawing apps) get
+        // the cursor to disappear. Surface cursors aren't rendered yet (TODO);
+        // we treat them as "default" so the user still sees something.
+        self.cursor_status = image;
+    }
 }
 
 delegate_seat!(SpikeState);

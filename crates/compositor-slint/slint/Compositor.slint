@@ -163,6 +163,10 @@ export component Compositor inherits Window {
     in property <float>         cursor-hotspot-y: 2.0;
     // Cursor icon size (square).
     in property <float>         cursor-size: 32.0;
+    /// True when our compositor cursor should render. Clients can request
+    /// "hide cursor" via `wl_pointer.set_cursor(NULL)` (e.g. video players
+    /// in fullscreen, drawing apps); this property toggles the overlay.
+    in property <bool>          cursor-visible: true;
 
     // ── Callbacks (Slint → Rust) ───────────────────────────────────────────────
     callback close-window(int);
@@ -604,6 +608,7 @@ export component Compositor inherits Window {
         width: root.cursor-size * 1px;
         height: root.cursor-size * 1px;
         source: root.cursor-image;
+        visible: root.cursor-visible;
         image-fit: fill;
     }
 }

@@ -1111,6 +1111,13 @@ impl CompositorApp {
                 .map(|it| it.title.to_string())
                 .unwrap_or_else(|| "Desktop".to_string());
             ui.set_focused_app(SharedString::from(focused_title));
+
+            // Honour `wl_pointer.set_cursor(NULL)` from clients that hide
+            // the cursor (video players in fullscreen, drawing apps).
+            // Surface-style cursors fall back to default for now.
+            use smithay::input::pointer::CursorImageStatus;
+            let visible = !matches!(state.cursor_status, CursorImageStatus::Hidden);
+            ui.set_cursor_visible(visible);
         }
 
         // In-place diff against the persistent VecModel by `id`. Rebuilding
