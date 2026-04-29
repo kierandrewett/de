@@ -7,12 +7,18 @@
 
 import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { StatusIcon } from "./widgets/StatusIcon.slint";
+import { TrayIconItem } from "./widgets/TrayItem.slint";
 
 export component Panel {
     in property <string> focused-app: "";
     in property <string> clock-text: "00:00";
     /// Short date string shown next to the time (e.g. "Wed 29 Apr").
     in property <string> date-text: "";
+    /// Registered StatusNotifierItem icons rendered to the right of the
+    /// status icons row. Empty when nothing's registered.
+    in property <[TrayIconItem]> tray-items;
+    callback tray-clicked(int);
+    callback tray-right-clicked(int);
     // Status icons default to phosphor. Filled variants are used where the
     // glyph is small + symbolic (audio, bluetooth, search); outline for the
     // power button (filled was too heavy in the bar) and the wifi/network
@@ -198,6 +204,45 @@ export component Panel {
                     icon: root.icon-power;
                     name: "power";
                     tint: root.resolved-fg;
+                }
+            }
+        }
+
+        // ── Tray icons (StatusNotifierItem) ─────────────────────────────────
+        // Sits left of the right-zone control-centre block. Each entry is a
+        // hover-highlighted icon with title tooltip; left click → Activate,
+        // right click → ContextMenu. `tray-row.preferred-width` makes the
+        // panel grow as items register / unregister.
+        tray-row := HorizontalLayout {
+            x: parent.width - right-zone.width - 8px - self.preferred-width;
+            y: (parent.height - 18px) / 2;
+            height: 18px;
+            spacing: 6px;
+            for it in root.tray-items: Rectangle {
+                width: 22px;
+                height: 22px;
+                background: tray-touch.has-hover
+                    ? root.resolved-hover-bg
+                    : transparent;
+                border-radius: 4px;
+                animate background { duration: 120ms; easing: ease-out; }
+                tray-touch := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.right
+                            && e.kind == PointerEventKind.up) {
+                            root.tray-right-clicked(it.id);
+                        }
+                    }
+                    clicked => { root.tray-clicked(it.id); }
+                }
+                Image {
+                    x: 3px; y: 3px;
+                    width: 16px;
+                    height: 16px;
+                    source: it.icon;
+                    image-fit: contain;
                 }
             }
         }

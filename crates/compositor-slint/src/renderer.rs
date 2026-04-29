@@ -2873,6 +2873,50 @@ pub fn run() -> Result<()> {
     // (via SpikeState in the main loop), so we push them onto a queue.
     let pending_dock_action: Arc<Mutex<VecDeque<(String, i32)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
+
+    // StatusNotifierItem clicks — fire `Activate` / `ContextMenu` on the
+    // item's DBus interface. We pull (service, object-path) straight off
+    // the Slint model so the click closure doesn't need a separate id →
+    // endpoint lookup; tray::activate / context_menu run the DBus call
+    // on a one-shot worker thread.
+    {
+        let weak = ui.as_weak();
+        ui.on_tray_clicked(move |id| {
+            let Some(ui) = weak.upgrade() else { return };
+            let model = ui.get_tray_items();
+            for i in 0..model.row_count() {
+                if let Some(it) = model.row_data(i) {
+                    if it.id == id {
+                        crate::tray::activate(
+                            it.service.to_string(),
+                            it.object_path.to_string(),
+                            0, 0,
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_tray_right_clicked(move |id| {
+            let Some(ui) = weak.upgrade() else { return };
+            let model = ui.get_tray_items();
+            for i in 0..model.row_count() {
+                if let Some(it) = model.row_data(i) {
+                    if it.id == id {
+                        crate::tray::context_menu(
+                            it.service.to_string(),
+                            it.object_path.to_string(),
+                            0, 0,
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
     {
         let exec_map_q = exec_map.clone();
         let q = pending_dock_action.clone();
@@ -3099,17 +3143,44 @@ pub fn run() -> Result<()> {
 
         // Drain any tray-host events accumulated since last tick; the
         // worker thread sends Added/Removed when apps register through
-        // the StatusNotifierWatcher.
+        // the StatusNotifierWatcher. When the set changes, rebuild the
+        // panel's tray-items model with resolved icons.
+        let mut tray_changed = false;
         while let Ok(ev) = tray_events.try_recv() {
             match ev {
                 crate::tray::TrayEvent::Added(item) => {
                     info!("tray: + {} ({})", item.title, item.service);
                     app.tray_items.push(item);
+                    tray_changed = true;
                 }
                 crate::tray::TrayEvent::Removed(id) => {
                     info!("tray: - id={}", id);
                     app.tray_items.retain(|it| it.id != id);
+                    tray_changed = true;
                 }
+            }
+        }
+        if tray_changed {
+            if let Some(ui) = app.ui.as_ref() {
+                let items: Vec<crate::TrayIconItem> = app.tray_items.iter()
+                    .map(|t| crate::TrayIconItem {
+                        id: t.id as i32,
+                        title: SharedString::from(t.title.as_str()),
+                        icon_name: SharedString::from(t.icon_name.as_str()),
+                        icon: if t.icon_name.is_empty() {
+                            slint::Image::default()
+                        } else {
+                            // Resolve by icon-theme name (e.g. "telegram",
+                            // "discord") via the existing desktop helper.
+                            desktop::load_icon_by_name(&t.icon_name)
+                                .unwrap_or_default()
+                        },
+                        service: SharedString::from(t.service.as_str()),
+                        object_path: SharedString::from(t.object_path.as_str()),
+                    })
+                    .collect();
+                let model = std::rc::Rc::new(VecModel::from(items));
+                ui.set_tray_items(slint::ModelRc::from(model));
             }
         }
 

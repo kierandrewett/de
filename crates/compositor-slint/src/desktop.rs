@@ -343,6 +343,15 @@ pub fn generic_app_icon() -> Option<PathBuf> {
         .or_else(|| resolve_icon("application-x-generic"))
 }
 
+/// Resolve a freedesktop icon name (e.g. "telegram", "discord",
+/// "network-wireless-signal-good") to a `slint::Image` via the system
+/// theme. Used for StatusNotifierItem entries which carry icon-name strings
+/// rather than full paths. Returns `None` if the theme lacks the icon.
+pub fn load_icon_by_name(name: &str) -> Option<slint::Image> {
+    let path = resolve_icon(name)?;
+    Some(load_icon(&path))
+}
+
 /// Load an icon from disk and return a Slint `Image`.  Falls back to a
 /// default (empty) image if the path is missing or loading fails.
 ///

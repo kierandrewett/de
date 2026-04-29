@@ -32,9 +32,11 @@ import { WindowChrome } from "./WindowChrome.slint";
 import { LayerSurface } from "./LayerSurface.slint";
 import { DatetimePopout, ControlCentrePopout } from "./Popouts.slint";
 import { ContextMenu, MenuItem } from "./widgets/ContextMenu.slint";
+import { TrayIconItem } from "./widgets/TrayItem.slint";
 
-// Re-export so Rust bindings see MenuItem.
+// Re-export so Rust bindings see these structs.
 export { MenuItem }
+export { TrayIconItem }
 
 // ── Cursor overlay ────────────────────────────────────────────────────────────
 // The cursor image is rendered as a Slint Image at the top of the z-stack.
@@ -105,6 +107,8 @@ export struct PopupItem {
     texture: image,
 }
 
+// TrayIconItem now lives in widgets/TrayItem.slint so Panel can import it.
+
 // Re-export DockItem so importers of Compositor.slint can use it directly.
 export { DockItem }
 // Re-export TokenMode for Rust bindings.
@@ -113,9 +117,12 @@ export { TokenMode }
 // ── Top-level Compositor component ───────────────────────────────────────────
 export component Compositor inherits Window {
     // ── Inbound properties (Rust → Slint) ─────────────────────────────────────
-    in property <[WindowItem]>  windows;
-    in property <[LayerItem]>   layers;
-    in property <[PopupItem]>   popups;
+    in property <[WindowItem]>     windows;
+    in property <[LayerItem]>      layers;
+    in property <[PopupItem]>      popups;
+    in property <[TrayIconItem]>   tray-items;
+    callback tray-clicked(int);
+    callback tray-right-clicked(int);
     in property <string>        focused-app: "";
     in property <string>        clock-text: "00:00";
     /// Short date string for the panel's clock zone (e.g. "Wed 29 Apr").
@@ -317,6 +324,9 @@ export component Compositor inherits Window {
         focused-app: root.focused-app;
         clock-text: root.clock-text;
         date-text: root.panel-date-text;
+        tray-items: root.tray-items;
+        tray-clicked(id) => { root.tray-clicked(id); }
+        tray-right-clicked(id) => { root.tray-right-clicked(id); }
         backdrop: root.wallpaper-blurred;
         backdrop-screen-w: parent.width;
         backdrop-screen-h: parent.height;
