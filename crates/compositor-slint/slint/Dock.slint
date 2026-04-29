@@ -155,14 +155,20 @@ component DockIconSlot {
         }
     }
 
-    // Active dot — centred below the button for running apps.
+    // Active indicator — centred below the button for running apps.
+    // macOS-style: a small pill (5×3) instead of a tight dot — focused
+    // window gets a wider 8 px pill so the user can spot the active one
+    // at a glance.
     if item.running: dot := Rectangle {
-        x: (parent.width - 4px) / 2;
+        property <length> w-pill: item.focused ? 8px : 5px;
+        x: (parent.width - w-pill) / 2;
         y: parent.height - 6px;
-        width: 4px;
-        height: 4px;
-        border-radius: 2px;
+        width: w-pill;
+        height: 3px;
+        border-radius: 1.5px;
         background: root.dot-color;
+        animate width      { duration: 200ms; easing: ease-in-out; }
+        animate background { duration: 200ms; easing: ease-in-out; }
     }
 }
 
