@@ -915,6 +915,15 @@ impl WindowManager {
         // a popup confuses them and clicks get dropped on the floor.
         let local_x = chrome_local_x + win.geom_x as f64;
         let local_y = chrome_local_y + win.geom_y as f64;
+        debug!(
+            "surface_under: ptr=({:.1},{:.1}) win={} chrome=({},{}) chrome_local=({:.1},{:.1}) geom=({},{},{},{}) csd={} -> local=({:.1},{:.1})",
+            x, y, win.id,
+            win.anim.current_x(), win.anim.current_y(),
+            chrome_local_x, chrome_local_y,
+            win.geom_x, win.geom_y, win.geom_w, win.geom_h,
+            win.csd,
+            local_x, local_y,
+        );
         Some((win.surface.clone(), local_x, local_y))
     }
 
