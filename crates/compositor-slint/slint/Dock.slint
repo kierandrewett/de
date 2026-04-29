@@ -228,13 +228,30 @@ export component Dock {
                 border-color: root.resolved-border;
                 clip: true;
 
-                // Backdrop image — pre-blurred wallpaper for now.
-                // (Real-time GPU blur of what's actually behind the dock
-                //  is the next pass; this gives us the same visual but
-                //  static.)
+                // Backdrop image — full-screen blurred wallpaper+windows
+                // synth. Positioned so its top-left lines up with
+                // compositor (0, 0): the pill samples whatever pixels of
+                // the synth are directly behind the pill on screen.
+                //
+                // Offsets:
+                //   x = -pill.x                    (cancel out pill's
+                //                                   centering offset)
+                //   y = backdrop-offset-y          (-(compositor.h -
+                //                                    dock.h) — the dock's
+                //                                    own compositor-y)
+                //       - dock-outer-gap           (the pill sits
+                //                                   dock-outer-gap below
+                //                                   the dock band's top)
+                //
+                // The previous formulation included an extra
+                // `(backdrop-screen-w - parent.width) / 2` term in x which
+                // double-counted the centering — the pill ended up
+                // sampling wallpaper pixels far to the left of where it
+                // actually sat on screen, so window content under the
+                // dock did not show up in the backdrop.
                 Image {
-                    x: -((root.backdrop-screen-w - parent.width) / 2 + pill.x);
-                    y: root.backdrop-offset-y;
+                    x: -pill.x;
+                    y: root.backdrop-offset-y - Tokens.dock-outer-gap;
                     width: root.backdrop-screen-w;
                     height: root.backdrop-screen-h;
                     source: root.backdrop;
