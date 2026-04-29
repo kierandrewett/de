@@ -125,10 +125,13 @@ component DockIconSlot {
     }
 
     // ── Tooltip — macOS-style, shows the app's display name on hover ──
-    // Sits above the button, fading in 100 ms after the cursor enters.
+    // Re-positioned to render INSIDE the slot but ABOVE the pill region
+    // (we render it from a Layer outside the pill in DockSlot). Negative
+    // y combined with `clip: false` on the slot lets it escape the dock
+    // pill's clip. Sits above the button, fading in 100 ms after enter.
     if ta.has-hover && root.item.name != "": Rectangle {
         x: (parent.width - self.width) / 2;
-        y: -self.height - 2px;
+        y: -self.height - 4px - (ta.has-hover ? 3px : 0px);
         width: tip-text.preferred-width + 14px;
         height: 22px;
         background: Theme.mode == TokenMode.Dark
@@ -228,7 +231,11 @@ export component Dock {
             border-radius: Tokens.dock-corner-radius;
             border-width: 1px;
             border-color: root.resolved-border;
-            clip: true;
+            // No `clip: true` — the dock-icon hover tooltip must escape
+            // upward past the pill rounded corners. The Image/tint children
+            // below are sized to the pill rect anyway, so they don't visibly
+            // overflow.
+            clip: false;
 
             drop-shadow-blur: 24px;
             drop-shadow-offset-y: 8px;

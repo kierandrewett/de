@@ -119,7 +119,10 @@ export component Panel {
                 clicked => { root.toggle-datetime-popout(); }
             }
 
+            // Hover bg — fills the clock-zone exactly so there's no visible
+            // offset between text and highlight. Sits behind the layout.
             Rectangle {
+                x: 0; y: 0;
                 width: parent.width;
                 height: parent.height;
                 border-radius: 6px;
@@ -129,9 +132,13 @@ export component Panel {
                 animate background { duration: 100ms; easing: ease-out; }
             }
 
+            // Filling the whole clock-zone with `alignment: center` lets the
+            // layout engine centre the date+time pair without having to
+            // compute preferred-width manually (which raced and produced
+            // the off-centre artefact the user saw).
             row-l := HorizontalLayout {
-                x: (parent.width - self.preferred-width) / 2;
-                y: 0;
+                x: 0; y: 0;
+                width: parent.width;
                 height: parent.height;
                 spacing: 10px;
                 alignment: center;

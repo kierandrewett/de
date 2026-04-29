@@ -317,10 +317,13 @@ export component Compositor inherits Window {
         icon-clicked(app-id) => { root.launch-app(app-id); }
         icon-right-clicked(app-id) => {
             // Open the dock context menu above the cursor (220 px wide,
-            // ~240 px tall — fits standard 5–7 entries comfortably).
+            // ~280 px tall). Clamps so the menu stays fully on screen even
+            // when the cursor is near the left / right edge of the dock.
             root.dock-menu-app-id = app-id;
-            root.dock-menu-x = root.cursor-x - 110;
-            root.dock-menu-y = root.cursor-y - 240;
+            root.dock-menu-x = clamp(root.cursor-x - 110, 8,
+                parent.width / 1px - 228);
+            root.dock-menu-y = clamp(root.cursor-y - 280, 40,
+                parent.height / 1px - 290);
             root.dock-menu-open = true;
         }
     }

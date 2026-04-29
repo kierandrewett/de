@@ -847,46 +847,80 @@ impl CompositorApp {
                     );
                 }
 
-                // ── Step 2b. Re-blit panel + dock from render_tex onto
-                //              final_tex AFTER all chrome is drawn. The
-                //              panel and dock are floating shell surfaces
-                //              that should overlay any window's shadow /
-                //              border that bled into their rect — without
-                //              this, a window near the top edge would show
-                //              its shadow over the top panel, and one near
-                //              the bottom would overlap the dock.
-                let panel_h = crate::wm::PANEL_HEIGHT.max(0) as u32;
-                let dock_h  = crate::wm::DOCK_HEIGHT.max(0)  as u32;
-                if panel_h > 0 && panel_h <= h {
+                // ── Step 2b. Re-blit every visible UI overlay from render_tex
+                //              onto final_tex AFTER chrome. Chrome (shadow,
+                //              border, highlight) draws over whatever was on
+                //              final_tex — without re-blitting the overlays
+                //              the chrome bleeds through panels, popouts,
+                //              context menus, the launcher, etc. Each rect
+                //              is clamped to the swapchain so an overlay
+                //              positioned partly off-screen doesn't crash
+                //              copy_texture_to_texture.
+                let mut reblit = |x: i32, y: i32, rw: i32, rh: i32| {
+                    let cx0 = x.max(0);
+                    let cy0 = y.max(0);
+                    let cx1 = (x + rw).min(w as i32).max(cx0);
+                    let cy1 = (y + rh).min(h as i32).max(cy0);
+                    let cw = (cx1 - cx0) as u32;
+                    let ch = (cy1 - cy0) as u32;
+                    if cw == 0 || ch == 0 { return; }
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
                             texture: render_tex, mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                            origin: wgpu::Origin3d { x: cx0 as u32, y: cy0 as u32, z: 0 },
                             aspect: wgpu::TextureAspect::All,
                         },
                         wgpu::TexelCopyTextureInfo {
                             texture: final_tex, mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                            origin: wgpu::Origin3d { x: cx0 as u32, y: cy0 as u32, z: 0 },
                             aspect: wgpu::TextureAspect::All,
                         },
-                        wgpu::Extent3d { width: w, height: panel_h, depth_or_array_layers: 1 },
+                        wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
                     );
-                }
-                if dock_h > 0 && dock_h <= h {
-                    let dock_y = h - dock_h;
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: render_tex, mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y: dock_y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: final_tex, mip_level: 0,
-                            origin: wgpu::Origin3d { x: 0, y: dock_y, z: 0 },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d { width: w, height: dock_h, depth_or_array_layers: 1 },
-                    );
+                };
+
+                let panel_h = crate::wm::PANEL_HEIGHT.max(0);
+                let dock_h  = crate::wm::DOCK_HEIGHT.max(0);
+                let iw = w as i32;
+                let ih = h as i32;
+                // Always-visible bands.
+                reblit(0, 0, iw, panel_h);
+                reblit(0, ih - dock_h, iw, dock_h);
+
+                // Open-overlay rects — read state directly off the Slint
+                // window so the re-blit covers exactly what's painted.
+                if let Some(ui) = self.ui.as_ref() {
+                    if ui.get_datetime_popout_open() {
+                        // Centre-top, 320×380, anchored panel_h + 6.
+                        let pw = 320;
+                        let ph = 380;
+                        reblit((iw - pw) / 2, panel_h + 6, pw, ph);
+                    }
+                    if ui.get_control_centre_open() {
+                        let pw = 300;
+                        let ph = 220;
+                        reblit(iw - pw - 14, panel_h + 6, pw, ph);
+                    }
+                    if ui.get_launcher_open() {
+                        let pw = 540;
+                        let ph = 64;
+                        reblit((iw - pw) / 2, 120, pw, ph);
+                    }
+                    if ui.get_help_overlay_visible() {
+                        let pw = 480;
+                        let ph = 360;
+                        reblit((iw - pw) / 2, (ih - ph) / 2, pw, ph);
+                    }
+                    if ui.get_desktop_menu_open() {
+                        let pw = 220;
+                        let ph = 260;
+                        reblit(ui.get_desktop_menu_x(), ui.get_desktop_menu_y(), pw, ph);
+                    }
+                    if ui.get_dock_menu_open() {
+                        let pw = 220;
+                        let ph = 280;
+                        reblit(ui.get_dock_menu_x(), ui.get_dock_menu_y(), pw, ph);
+                    }
                 }
             }
 
@@ -1669,14 +1703,25 @@ impl CompositorApp {
             let (x, y) = self.pointer_pos;
             let panel_h = crate::wm::PANEL_HEIGHT as f64;
             let oh      = self.wm.output_h as f64;
+            let ow      = self.wm.output_w as f64;
             let dock_h  = crate::wm::DOCK_HEIGHT as f64;
             let on_window = self.wm.pointer_click_focus(x, y).is_some();
             let in_panel = y < panel_h;
             let in_dock  = y >= oh - dock_h;
             if !on_window && !in_panel && !in_dock {
                 if let Some(ui) = self.ui.as_ref() {
-                    ui.set_desktop_menu_x(x as i32);
-                    ui.set_desktop_menu_y(y as i32);
+                    // Clamp the menu position so the rect (220 × ~260)
+                    // stays fully on screen — flips horizontally near the
+                    // right edge and vertically near the bottom edge,
+                    // matching macOS / GNOME behaviour.
+                    let menu_w = 220.0;
+                    let menu_h = 260.0;
+                    let mx = if x + menu_w > ow { (x - menu_w).max(0.0) } else { x };
+                    let my = if y + menu_h > oh - dock_h
+                        { (y - menu_h).max(panel_h) }
+                        else { y.max(panel_h) };
+                    ui.set_desktop_menu_x(mx as i32);
+                    ui.set_desktop_menu_y(my as i32);
                     ui.set_desktop_menu_open(true);
                     if let Some(gpu_window) = self.gpu_window.as_ref() {
                         gpu_window.mark_dirty();
@@ -2140,6 +2185,38 @@ impl CompositorApp {
                             pending_unmaximize: if maximized { Some((x, y)) } else { None },
                         });
                         debug!("Win+drag move started on window #{} (maximized={})", idx, maximized);
+                        let _ = hit_result;
+                        return;
+                    }
+                    // ── Window-control buttons ───────────────────────────
+                    // Click on close / minimize / maximize → queue the
+                    // matching WM action and skip drag init. We do this
+                    // here (not via the IconButton's TouchArea) because
+                    // Slint TouchAreas weren't always receiving events
+                    // through our windows-clip wrapper for unclear
+                    // reasons; `cursor::hit_test` always knows where the
+                    // controls are so this is the reliable path.
+                    if matches!(zone,
+                        HitZone::CloseButton
+                        | HitZone::MinimizeButton
+                        | HitZone::MaximizeButton)
+                    {
+                        let win_id = state.toplevels.get(idx)
+                            .and_then(|t| self.wm.id_for_surface(&t.surface));
+                        if let Some(id) = win_id {
+                            match zone {
+                                HitZone::CloseButton => {
+                                    self.pending_close.lock().unwrap().push_back(id);
+                                }
+                                HitZone::MinimizeButton => {
+                                    self.pending_minimize.lock().unwrap().push_back(id);
+                                }
+                                HitZone::MaximizeButton => {
+                                    self.pending_maximize.lock().unwrap().push_back(id);
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
                         let _ = hit_result;
                         return;
                     }
