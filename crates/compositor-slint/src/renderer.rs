@@ -1693,6 +1693,7 @@ impl CompositorApp {
                 DockItem {
                     icon: entry.item.icon.clone(),
                     app_id: entry.item.app_id.clone(),
+                    name:  entry.item.name.clone(),
                     running,
                     focused,
                     pinned: entry.item.pinned,
@@ -1720,6 +1721,7 @@ impl CompositorApp {
             items.push(DockItem {
                 icon,
                 app_id: SharedString::from(app_id.as_str()),
+                name:  SharedString::from(info.name.as_str()),
                 running: true,
                 focused,
                 pinned: false,
@@ -2619,6 +2621,7 @@ pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
             item: DockItem {
                 icon,
                 app_id: SharedString::from(app_id.as_str()),
+                name:   SharedString::from(info.name.as_str()),
                 running: false,
                 focused: false,
                 pinned: true,
@@ -2639,6 +2642,7 @@ pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
                 item: DockItem {
                     icon,
                     app_id: SharedString::from(app_id),
+                    name:   SharedString::from(info.name.as_str()),
                     running: false,
                     focused: false,
                     pinned: true,

@@ -15,6 +15,8 @@ import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 export struct DockItem {
     icon:    image,
     app-id:  string,
+    /// Display name (resolved from .desktop) — shown as a tooltip on hover.
+    name:    string,
     running: bool,
     focused: bool,
     pinned:  bool,
@@ -119,6 +121,37 @@ component DockIconSlot {
             height: parent.height - 6px;
             source: root.item.icon;
             image-fit: contain;
+        }
+    }
+
+    // ── Tooltip — macOS-style, shows the app's display name on hover ──
+    // Sits above the button, fading in 100 ms after the cursor enters.
+    if ta.has-hover && root.item.name != "": Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: -self.height - 2px;
+        width: tip-text.preferred-width + 14px;
+        height: 22px;
+        background: Theme.mode == TokenMode.Dark
+            ? rgba(20, 22, 28, 0.96)
+            : rgba(36, 38, 46, 0.95);
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.mode == TokenMode.Dark
+            ? rgba(255, 255, 255, 0.10)
+            : rgba(0, 0, 0, 0.18);
+        drop-shadow-blur: 12px;
+        drop-shadow-offset-y: 4px;
+        drop-shadow-color: rgba(0, 0, 0, 0.45);
+        tip-text := Text {
+            x: 7px; y: 0;
+            width: parent.width - 14px;
+            height: parent.height;
+            text: root.item.name;
+            color: rgba(255, 255, 255, 0.92);
+            font-family: Tokens.font-family;
+            font-size: 12px;
+            font-weight: 500;
+            vertical-alignment: center;
         }
     }
 
