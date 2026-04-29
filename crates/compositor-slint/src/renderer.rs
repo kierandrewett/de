@@ -659,6 +659,14 @@ impl CompositorApp {
             ui.set_panel_date_text(SharedString::from(local.format("%a %-d %b").to_string()));
             ui.set_popout_date_text(SharedString::from(local.format("%A, %-d %B").to_string()));
             ui.set_popout_day_text(SharedString::from(local.format("%A").to_string()));
+
+            // Calendar grid for the popout — rebuild only when the day
+            // changes (cheap to do every second; the model is 42 cells).
+            ui.set_popout_calendar_month_text(
+                SharedString::from(local.format("%B %Y").to_string()));
+            let cal = build_calendar_grid(local.date_naive());
+            let model = std::rc::Rc::new(VecModel::from(cal));
+            ui.set_popout_calendar_days(slint::ModelRc::from(model));
             if ui.get_debug_overlay_visible() {
                 let dump = self.build_debug_dump();
                 ui.set_debug_text(SharedString::from(dump));
@@ -2632,6 +2640,58 @@ impl CompositorApp {
 pub struct ResolvedDockEntry {
     pub item: DockItem,
     pub exec: String,
+}
+
+/// Build a 42-cell flat calendar grid (6 rows × 7 cols, Monday-first).
+/// Pads the start with prev-month trail days and the end with next-month
+/// trail days so every cell has a number — `is_other_month` flags the
+/// padding for muted rendering.
+fn build_calendar_grid(today: chrono::NaiveDate) -> Vec<crate::CalendarDay> {
+    use chrono::{Datelike, NaiveDate};
+    let year = today.year();
+    let month = today.month();
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
+    // chrono Mon=0..Sun=6 — matches our Mon-first layout.
+    let lead = first.weekday().num_days_from_monday() as i64;
+    let days_in_month: u32 = {
+        let next_month = if month == 12 {
+            NaiveDate::from_ymd_opt(year + 1, 1, 1)
+        } else {
+            NaiveDate::from_ymd_opt(year, month + 1, 1)
+        }.expect("valid next month");
+        (next_month - first).num_days() as u32
+    };
+    let mut cells = Vec::with_capacity(42);
+    // Prev-month trail.
+    let prev_last = first - chrono::Duration::days(1);
+    let prev_total = prev_last.day();
+    for i in 0..lead {
+        let day = prev_total - lead as u32 + 1 + i as u32;
+        cells.push(crate::CalendarDay {
+            day_num: day as i32,
+            is_today: false,
+            is_other_month: true,
+        });
+    }
+    // This month.
+    for d in 1..=days_in_month {
+        cells.push(crate::CalendarDay {
+            day_num: d as i32,
+            is_today: d == today.day(),
+            is_other_month: false,
+        });
+    }
+    // Next-month trail to fill 42 cells.
+    let mut trail = 1u32;
+    while cells.len() < 42 {
+        cells.push(crate::CalendarDay {
+            day_num: trail as i32,
+            is_today: false,
+            is_other_month: true,
+        });
+        trail += 1;
+    }
+    cells
 }
 
 pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {

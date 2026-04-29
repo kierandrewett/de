@@ -30,7 +30,7 @@ import { Panel } from "./Panel.slint";
 import { Dock, DockItem } from "./Dock.slint";
 import { WindowChrome } from "./WindowChrome.slint";
 import { LayerSurface } from "./LayerSurface.slint";
-import { DatetimePopout, ControlCentrePopout } from "./Popouts.slint";
+import { DatetimePopout, ControlCentrePopout, CalendarDay } from "./Popouts.slint";
 import { ContextMenu, MenuItem } from "./widgets/ContextMenu.slint";
 import { TrayIconItem } from "./widgets/TrayItem.slint";
 
@@ -139,6 +139,10 @@ export component Compositor inherits Window {
     in-out property <bool>      control-centre-open:  false;
     in property <string>        popout-date-text: "";
     in property <string>        popout-day-text:  "";
+    /// Header for the calendar widget — e.g. "April 2026".
+    in property <string>        popout-calendar-month-text: "";
+    /// 42-cell calendar grid (6 rows × 7 cols).
+    in property <[CalendarDay]> popout-calendar-days;
 
     // ── Desktop context menu ─────────────────────────────────────────────────
     in-out property <bool>           desktop-menu-open: false;
@@ -447,6 +451,8 @@ export component Compositor inherits Window {
         clock-text: root.clock-text;
         date-text: root.popout-date-text;
         day-text: root.popout-day-text;
+        calendar-month-text: root.popout-calendar-month-text;
+        calendar-days: root.popout-calendar-days;
     }
 
     control-centre-popout := ControlCentrePopout {
