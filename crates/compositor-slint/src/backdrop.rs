@@ -23,14 +23,17 @@ use image::{imageops, RgbaImage};
 use tracing::debug;
 
 /// Backdrop canvas width. Lower = much cheaper blur (cost is O(W·H·sigma)
-/// for the cascaded box-blur). 200 px is enough resolution for a heavily
-/// blurred surface; you don't notice the resolution behind 12 px σ.
-const BACKDROP_WIDTH: u32 = 200;
-/// Refresh cadence. The eye can't track high-frequency motion in heavily
-/// blurred surfaces, so 200 ms (5 Hz) is plenty and saves ~10× CPU vs 60 ms.
-const REFRESH_MS: u64 = 200;
-/// Gaussian σ applied after compositing windows onto the wallpaper.
-const BLUR_SIGMA: f32 = 12.0;
+/// for the cascaded box-blur). 320 px gives noticeably sharper backdrops
+/// than 200 while staying well under 1 ms per refresh.
+const BACKDROP_WIDTH: u32 = 320;
+/// Refresh cadence. 16 ms = effectively per-frame at 60 Hz so window
+/// movement reflects in the dock/panel backdrop with no visible lag.
+/// Cost stays low because the compositing + cascaded box-blur runs at
+/// 320 × ~180 px, not output resolution.
+const REFRESH_MS: u64 = 16;
+/// Gaussian σ applied after compositing windows onto the wallpaper. Higher
+/// hides the low backdrop resolution and reads as a softer macOS glass.
+const BLUR_SIGMA: f32 = 14.0;
 
 /// One window's contribution to the backdrop synthesis.
 pub struct WindowSnapshot<'a> {
