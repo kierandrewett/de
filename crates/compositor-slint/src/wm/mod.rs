@@ -907,24 +907,76 @@ impl WindowManager {
         if chrome_local_y < 0.0 {
             return None;
         }
-        // Always return the TOPLEVEL surface as the pointer-focus target,
-        // with coords shifted into buffer-space (chrome (0,0) maps to buffer
-        // (geom_x, geom_y) because we cropped the client's shadow/border
-        // padding). Firefox / GTK clients route subsurface events themselves
-        // — sending wl_pointer.motion to a subsurface that's only visible as
-        // a popup confuses them and clicks get dropped on the floor.
-        let local_x = chrome_local_x + win.geom_x as f64;
-        let local_y = chrome_local_y + win.geom_y as f64;
+        // Buffer-space position the user is pointing at.
+        let buffer_x = chrome_local_x + win.geom_x as f64;
+        let buffer_y = chrome_local_y + win.geom_y as f64;
+
+        // Walk the toplevel's subsurface tree and find the topmost wl_surface
+        // whose buffer rect contains the pointer. wayland clients expect
+        // pointer events at the surface ACTUALLY under the cursor (toplevel
+        // OR subsurface), with surface-local coords.
+        //
+        // Two-pass like import_shm_buffer: collect (surface, offset) inside
+        // the traversal, then resolve each surface's buffer dims OUTSIDE.
+        // Calling with_renderer_surface_state INSIDE the tree walk holds
+        // surface-state locks on top of the locks the walk itself already
+        // owns — that deadlocks the wayland thread.
+        let mut surfaces_and_offsets: Vec<(WlSurface, (i32, i32), u32)> = Vec::new();
+        let mut depth: u32 = 0;
+        with_surface_tree_downward(
+            &win.surface,
+            (0i32, 0i32),
+            |sub, states, parent_offset| {
+                let mut my_offset = *parent_offset;
+                if sub != &win.surface {
+                    let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
+                    let loc = sub_state.current().location;
+                    my_offset.0 += loc.x;
+                    my_offset.1 += loc.y;
+                }
+                TraversalAction::DoChildren(my_offset)
+            },
+            |sub, _, parent_offset| {
+                depth += 1;
+                surfaces_and_offsets.push((sub.clone(), *parent_offset, depth));
+            },
+            |_, _, _| true,
+        );
+
+        // Pass 2 — find topmost surface whose buffer rect contains the point.
+        let mut deepest: Option<(WlSurface, f64, f64, u32)> = None;
+        for (sub, off, d) in &surfaces_and_offsets {
+            let (sw, sh) = with_renderer_surface_state(sub, |st| {
+                st.buffer_size().map(|sz| (sz.w, sz.h)).unwrap_or((0, 0))
+            }).unwrap_or((0, 0));
+            if sw == 0 || sh == 0 { continue; }
+            let sx = off.0 as f64;
+            let sy = off.1 as f64;
+            let lx = buffer_x - sx;
+            let ly = buffer_y - sy;
+            if lx >= 0.0 && lx < sw as f64 && ly >= 0.0 && ly < sh as f64 {
+                deepest = Some((sub.clone(), lx, ly, *d));
+            }
+        }
+
+        let (focus_surface, local_x, local_y, target_depth) = match deepest {
+            Some(h) => h,
+            // No subsurface contained the point — fall back to the toplevel.
+            None => (win.surface.clone(), buffer_x, buffer_y, 0),
+        };
+
         debug!(
-            "surface_under: ptr=({:.1},{:.1}) win={} chrome=({},{}) chrome_local=({:.1},{:.1}) geom=({},{},{},{}) csd={} -> local=({:.1},{:.1})",
+            "surface_under: ptr=({:.1},{:.1}) win={} chrome=({},{}) chrome_local=({:.1},{:.1}) geom=({},{},{},{}) csd={} buffer=({:.1},{:.1}) target_depth={} -> local=({:.1},{:.1})",
             x, y, win.id,
             win.anim.current_x(), win.anim.current_y(),
             chrome_local_x, chrome_local_y,
             win.geom_x, win.geom_y, win.geom_w, win.geom_h,
             win.csd,
+            buffer_x, buffer_y,
+            target_depth,
             local_x, local_y,
         );
-        Some((win.surface.clone(), local_x, local_y))
+        Some((focus_surface, local_x, local_y))
     }
 
     /// Return windows sorted by z_order (ascending = back to front) for rendering.
