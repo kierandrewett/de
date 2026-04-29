@@ -26,7 +26,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 /// Dock icon size in logical pixels.  Rasterise SVG icons at this size.
-const DOCK_ICON_SIZE: u32 = 48;
+// Rasterise dock icons at 2× the visual size (52 px in the slot → 104 px
+// raster) so they stay crisp on HiDPI and don't look pixelated even when
+// the slot grows on hover. Slint's image-fit:contain downscales linearly.
+const DOCK_ICON_SIZE: u32 = 128;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SVG icon cache
@@ -377,7 +380,11 @@ pub fn load_icon(icon_path: &Path) -> slint::Image {
             None => {
                 // resvg failed — look for a PNG sibling at a raster size.
                 if let Some(icon_name) = icon_path.file_stem().and_then(|s| s.to_str()) {
-                    for size in &["48x48/apps", "64x64/apps", "256x256/apps", "32x32/apps"] {
+                    // Prefer larger sizes first — Slint downscales smoothly
+                    // but upscaling a 32×32 PNG to fill a 60 px slot looks
+                    // pixelated. 256 → 128 → 64 → 48 → 32 fallback chain.
+                    for size in &["256x256/apps", "128x128/apps", "96x96/apps",
+                                  "64x64/apps", "48x48/apps", "32x32/apps"] {
                         for root in &[
                             PathBuf::from("/usr/share/icons/hicolor"),
                             PathBuf::from("/usr/share/icons/Adwaita"),

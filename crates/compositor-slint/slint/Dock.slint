@@ -36,34 +36,24 @@ component DockIconSlot {
     /// (caller can convert to compositor-space for context-menu positioning).
     callback icon-right-clicked(string, length, length);
 
-    // Slot is just slightly larger than the button so neighbouring buttons
-    // pack tight (6 px gap between them) — closer to the user's reference
-    // dock screenshot.
-    width: 60px;
-    height: 64px;
+    // Slot is sized to give icons a generous footprint with minimal
+    // padding — macOS-style: icons fill ~80% of the slot, no border /
+    // background by default, only a faint hover highlight.
+    width: 64px;
+    height: 68px;
 
-    // ── Button-container colours (animated on mode switch / hover) ───────
-    property <color> button-bg: Theme.mode == TokenMode.Dark
-        ? rgba(255, 255, 255, 0.08)
-        : rgba(255, 255, 255, 0.55);
+    // ── Subtle hover background (animated). No idle bg, no border, no
+    //    top-edge gloss — the icon itself is the visual; we keep things
+    //    quiet until the cursor actually hovers a slot.
     property <color> button-bg-hover: Theme.mode == TokenMode.Dark
-        ? rgba(255, 255, 255, 0.14)
-        : rgba(255, 255, 255, 0.75);
-    property <color> button-bg-pressed: Theme.mode == TokenMode.Dark
-        ? rgba(255, 255, 255, 0.20)
-        : rgba(255, 255, 255, 0.90);
-    property <color> button-border: Theme.mode == TokenMode.Dark
         ? rgba(255, 255, 255, 0.10)
         : rgba(0, 0, 0, 0.06);
-    property <color> button-highlight-top: Theme.mode == TokenMode.Dark
-        ? rgba(255, 255, 255, 0.10)
-        : rgba(255, 255, 255, 0.60);
+    property <color> button-bg-pressed: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.18)
+        : rgba(0, 0, 0, 0.10);
 
-    animate button-bg            { duration: 200ms; easing: ease-in-out; }
-    animate button-bg-hover      { duration: 200ms; easing: ease-in-out; }
-    animate button-bg-pressed    { duration: 200ms; easing: ease-in-out; }
-    animate button-border        { duration: 200ms; easing: ease-in-out; }
-    animate button-highlight-top { duration: 200ms; easing: ease-in-out; }
+    animate button-bg-hover   { duration: 180ms; easing: ease-in-out; }
+    animate button-bg-pressed { duration: 180ms; easing: ease-in-out; }
 
     // Running-dot colours (locally-resolved for animation).
     property <color> dot-color: item.focused
@@ -84,41 +74,28 @@ component DockIconSlot {
         clicked => { root.icon-clicked(root.item.app-id); }
     }
 
-    // ── Button container ────────────────────────────────────────────────
-    // Bigger button (54×54), tighter 3 px icon inset so the glyph fills
-    // the button — matches the user's reference dock screenshot more closely.
+    // ── Hover spotlight (only visible on hover/press) ───────────────────
+    // No fill / border at rest — the icon is the entire visual.
     button := Rectangle {
-        property <length> button-size: 54px;
+        property <length> button-size: 60px;
         x: (parent.width - self.width) / 2;
-        y: 4px - (ta.has-hover ? 3px : 0px);
+        y: 4px - (ta.has-hover ? 4px : 0px);
         width: button-size;
         height: button-size;
-        border-radius: 13px;
+        border-radius: 14px;
         background: ta.pressed
             ? root.button-bg-pressed
-            : (ta.has-hover ? root.button-bg-hover : root.button-bg);
-        border-width: 1px;
-        border-color: root.button-border;
-        clip: true;
+            : (ta.has-hover ? root.button-bg-hover : transparent);
+        animate background { duration: 140ms; easing: ease-out; }
+        animate y          { duration: 200ms; easing: ease-out; }
 
-        animate background { duration: 120ms; easing: ease-out; }
-        animate y          { duration: 180ms; easing: ease-out; }
-
-        // Top-edge gloss highlight.
-        Rectangle {
-            x: 0; y: 0;
-            width: parent.width;
-            height: 1px;
-            background: root.button-highlight-top;
-            opacity: 0.85;
-        }
-
-        // Icon image, fills the button with only a 3 px inset.
+        // Icon image — fills almost the whole slot for a chunky, macOS-
+        // style appearance. 4 px inset leaves a tiny breathing margin.
         icon-img := Image {
-            x: 3px;
-            y: 3px;
-            width:  parent.width - 6px;
-            height: parent.height - 6px;
+            x: 4px;
+            y: 4px;
+            width:  parent.width - 8px;
+            height: parent.height - 8px;
             source: root.item.icon;
             image-fit: contain;
         }
@@ -220,53 +197,66 @@ export component Dock {
         height: 64px + 2 * Tokens.dock-padding;
         background: transparent;
 
-        // Inner pill.
+        // Inner pill — outer container is non-clipping so per-icon
+        // tooltips can escape upward past the rounded corners. The
+        // backdrop+tint are wrapped in a separate `pill-bg` Rectangle
+        // that DOES clip, so the blurred wallpaper image (which extends
+        // far beyond the pill bounds for the parallax effect) doesn't
+        // leak out past the squircle.
         pill := Rectangle {
             x: (parent.width - self.width) / 2;
             y: 0;
             width: items-row.preferred-width + 2 * Tokens.dock-padding;
             height: parent.height;
-
             background: transparent;
-            border-radius: Tokens.dock-corner-radius;
-            border-width: 1px;
-            border-color: root.resolved-border;
-            // No `clip: true` — the dock-icon hover tooltip must escape
-            // upward past the pill rounded corners. The Image/tint children
-            // below are sized to the pill rect anyway, so they don't visibly
-            // overflow.
             clip: false;
 
             drop-shadow-blur: 24px;
             drop-shadow-offset-y: 8px;
             drop-shadow-color: rgba(0, 0, 0, 0.45);
 
-            // Backdrop layer — anchored so the bottom strip of the wallpaper
-            // appears under the pill.
-            Image {
-                x: -((root.backdrop-screen-w - parent.width) / 2 + parent.x);
-                y: root.backdrop-offset-y;
-                width: root.backdrop-screen-w;
-                height: root.backdrop-screen-h;
-                source: root.backdrop;
-                image-fit: fill;
-            }
-
-            // Subtle top-edge gloss highlight (macOS-style).
-            Rectangle {
+            // Clipped backdrop + theme tint + top-edge gloss — all
+            // confined to the pill's rounded rect. Border lives here too
+            // so the rounded edge clips it cleanly.
+            pill-bg := Rectangle {
                 x: 0; y: 0;
                 width: parent.width;
-                height: 1px;
-                background: Theme.mode == TokenMode.Dark
-                    ? rgba(255, 255, 255, 0.12)
-                    : rgba(255, 255, 255, 0.65);
-            }
-
-            // Theme tint over the backdrop.
-            Rectangle {
-                width: parent.width;
                 height: parent.height;
-                background: root.resolved-bg;
+                background: transparent;
+                border-radius: Tokens.dock-corner-radius;
+                border-width: 1px;
+                border-color: root.resolved-border;
+                clip: true;
+
+                // Backdrop image — pre-blurred wallpaper for now.
+                // (Real-time GPU blur of what's actually behind the dock
+                //  is the next pass; this gives us the same visual but
+                //  static.)
+                Image {
+                    x: -((root.backdrop-screen-w - parent.width) / 2 + pill.x);
+                    y: root.backdrop-offset-y;
+                    width: root.backdrop-screen-w;
+                    height: root.backdrop-screen-h;
+                    source: root.backdrop;
+                    image-fit: fill;
+                }
+
+                // Theme tint over the backdrop.
+                Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    background: root.resolved-bg;
+                }
+
+                // Subtle top-edge gloss highlight (macOS-style).
+                Rectangle {
+                    x: 0; y: 0;
+                    width: parent.width;
+                    height: 1px;
+                    background: Theme.mode == TokenMode.Dark
+                        ? rgba(255, 255, 255, 0.12)
+                        : rgba(255, 255, 255, 0.65);
+                }
             }
 
             items-row := HorizontalLayout {

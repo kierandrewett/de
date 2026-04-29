@@ -177,11 +177,19 @@ export component WindowChrome {
             border-bottom-right-radius: 0px;
 
             // Titlebar click-to-activate / double-click-to-maximise touch
-            // area. Declared FIRST inside titlebar so the controls (declared
-            // last → highest z) intercept events before this fires.
+            // area. Sized to cover the LEFT region of the titlebar only —
+            // explicitly excluding the controls block at the right — so it
+            // can never compete with the IconButton TouchAreas for the
+            // close / minimize / maximize click events. Without this carve-
+            // out the user's clicks on the close button were being eaten
+            // by titlebar-touch (Slint's nested-TouchArea routing rules
+            // depend on order and bounds; the cleanest fix is non-
+            // overlapping bounds).
             titlebar-touch := TouchArea {
                 x: 0; y: 0;
-                width: parent.width;
+                width: parent.width
+                     - (Tokens.control-size * 3 + Tokens.control-gap * 2)
+                     - Tokens.control-inset * 2;
                 height: parent.height;
                 clicked => { root.title-clicked(); }
                 double-clicked => { root.maximize-clicked(); }

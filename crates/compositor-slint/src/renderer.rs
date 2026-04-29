@@ -2188,35 +2188,16 @@ impl CompositorApp {
                         let _ = hit_result;
                         return;
                     }
-                    // ── Window-control buttons ───────────────────────────
-                    // Click on close / minimize / maximize → queue the
-                    // matching WM action and skip drag init. We do this
-                    // here (not via the IconButton's TouchArea) because
-                    // Slint TouchAreas weren't always receiving events
-                    // through our windows-clip wrapper for unclear
-                    // reasons; `cursor::hit_test` always knows where the
-                    // controls are so this is the reliable path.
+                    // Don't start a drag when the press lands on a control
+                    // button — Slint's IconButton TouchArea will fire
+                    // `clicked` and route through close-clicked /
+                    // minimize-clicked / maximize-clicked. We just need to
+                    // avoid hijacking the press into a move drag.
                     if matches!(zone,
                         HitZone::CloseButton
                         | HitZone::MinimizeButton
                         | HitZone::MaximizeButton)
                     {
-                        let win_id = state.toplevels.get(idx)
-                            .and_then(|t| self.wm.id_for_surface(&t.surface));
-                        if let Some(id) = win_id {
-                            match zone {
-                                HitZone::CloseButton => {
-                                    self.pending_close.lock().unwrap().push_back(id);
-                                }
-                                HitZone::MinimizeButton => {
-                                    self.pending_minimize.lock().unwrap().push_back(id);
-                                }
-                                HitZone::MaximizeButton => {
-                                    self.pending_maximize.lock().unwrap().push_back(id);
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
                         let _ = hit_result;
                         return;
                     }
