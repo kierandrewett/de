@@ -511,10 +511,20 @@ impl WindowManager {
     }
 
     /// Compute smart cascade position for the next new window.
-    /// Offsets by 30 px each new window, wraps at screen edges.
+    /// First window is centred on the safe area (panel + dock excluded);
+    /// subsequent windows cascade by 30 px down/right, wrapping at edges.
     fn smart_cascade_position(&mut self) -> (i32, i32) {
         let slot = self.cascade_slot;
         self.cascade_slot += 1;
+
+        // Centre the very first spawned window on the visible safe area —
+        // matches macOS / GNOME "open in middle of screen" intuition.
+        if slot == 0 && self.windows.is_empty() {
+            let safe_h = (self.output_h - PANEL_HEIGHT - DOCK_HEIGHT).max(DEFAULT_WINDOW_H);
+            let cx = (self.output_w  - DEFAULT_WINDOW_W) / 2;
+            let cy = PANEL_HEIGHT + (safe_h - DEFAULT_WINDOW_H).max(0) / 2;
+            return (cx.max(20), cy.max(PANEL_HEIGHT));
+        }
 
         let x = CASCADE_BASE_X + slot * CASCADE_STEP;
         let y = CASCADE_BASE_Y + PANEL_HEIGHT + slot * CASCADE_STEP;
