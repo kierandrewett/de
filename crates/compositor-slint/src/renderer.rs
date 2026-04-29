@@ -1112,12 +1112,33 @@ impl CompositorApp {
                 .unwrap_or_else(|| "Desktop".to_string());
             ui.set_focused_app(SharedString::from(focused_title));
 
-            // Honour `wl_pointer.set_cursor(NULL)` from clients that hide
-            // the cursor (video players in fullscreen, drawing apps).
-            // Surface-style cursors fall back to default for now.
+            // Honour `wl_pointer.set_cursor` requests from clients:
+            //   * Hidden  → set cursor-visible=false (video / drawing apps).
+            //   * Named   → look up the named cursor in the system Xcursor
+            //               theme and override our default — this is what
+            //               makes the cursor change to text-beam over text
+            //               fields, pointer over links, wait spinners, etc.
+            //   * Surface → not implemented yet; fall back to compositor
+            //               default so users still see something.
             use smithay::input::pointer::CursorImageStatus;
-            let visible = !matches!(state.cursor_status, CursorImageStatus::Hidden);
-            ui.set_cursor_visible(visible);
+            match &state.cursor_status {
+                CursorImageStatus::Hidden => {
+                    ui.set_cursor_visible(false);
+                }
+                CursorImageStatus::Named(icon) => {
+                    ui.set_cursor_visible(true);
+                    if let Some((img, (hx, hy))) =
+                        self.cursor_renderer.get_dynamic(icon.name())
+                    {
+                        ui.set_cursor_image(img);
+                        ui.set_cursor_hotspot_x(hx);
+                        ui.set_cursor_hotspot_y(hy);
+                    }
+                }
+                CursorImageStatus::Surface(_) => {
+                    ui.set_cursor_visible(true);
+                }
+            }
         }
 
         // In-place diff against the persistent VecModel by `id`. Rebuilding

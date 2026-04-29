@@ -233,6 +233,10 @@ pub struct CursorRenderer {
     nesw_cache: HashMap<i32, slint::Image>,
     /// Cached Adwaita cursors keyed by name. None = tried + failed.
     adwaita_cache: HashMap<&'static str, Option<AdwaitaImage>>,
+    /// Cached cursors keyed by arbitrary name — used for `wl_pointer.set_cursor`
+    /// requests where clients pass a named cursor (text, pointer, wait, ...).
+    /// Key is owned `String` so we can intern any name the client throws at us.
+    dynamic_cache: HashMap<String, Option<AdwaitaImage>>,
 }
 
 impl CursorRenderer {
@@ -242,7 +246,22 @@ impl CursorRenderer {
             nwse_cache: HashMap::new(),
             nesw_cache: HashMap::new(),
             adwaita_cache: HashMap::new(),
+            dynamic_cache: HashMap::new(),
         }
+    }
+
+    /// Load + cache an Xcursor by arbitrary name (used for client-requested
+    /// cursors via `wl_pointer.set_cursor`). Returns `(image, (hx, hy))` if
+    /// the system theme has it, otherwise `None` so the caller can fall back
+    /// to the compositor default.
+    pub fn get_dynamic(&mut self, name: &str) -> Option<(slint::Image, (f32, f32))> {
+        if !self.dynamic_cache.contains_key(name) {
+            let loaded = try_load_adwaita(name, CURSOR_SIZE);
+            self.dynamic_cache.insert(name.to_string(), loaded);
+        }
+        self.dynamic_cache.get(name)
+            .and_then(|o| o.as_ref())
+            .map(|a| (a.image.clone(), a.hotspot))
     }
 
     /// Lazily load + cache an Adwaita cursor by name.
