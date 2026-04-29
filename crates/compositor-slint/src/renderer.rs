@@ -249,6 +249,8 @@ struct CompositorApp {
 
     // Pending WM actions from Slint callbacks (processed in the main loop).
     pending_close:    Arc<Mutex<VecDeque<i32>>>,
+    /// Dock-menu deferred actions: `(app_id, action_id)` — 2=Show All, 5=Quit.
+    pending_dock_action: Arc<Mutex<VecDeque<(String, i32)>>>,
     pending_minimize: Arc<Mutex<VecDeque<i32>>>,
     pending_maximize: Arc<Mutex<VecDeque<i32>>>,
     pending_activate: Arc<Mutex<VecDeque<i32>>>,
@@ -318,6 +320,7 @@ impl CompositorApp {
             wm: WindowManager::new(WIDTH as i32, HEIGHT as i32),
             alt_tab: AltTabState::default(),
             pending_close:    Arc::new(Mutex::new(VecDeque::new())),
+            pending_dock_action: Arc::new(Mutex::new(VecDeque::new())),
             pending_minimize: Arc::new(Mutex::new(VecDeque::new())),
             pending_maximize: Arc::new(Mutex::new(VecDeque::new())),
             pending_activate: Arc::new(Mutex::new(VecDeque::new())),
@@ -953,14 +956,20 @@ impl CompositorApp {
             csd_now: bool,
             csd_verdict: bool,
             is_resizing: bool,
+            app_id: String,
         }
         let mut metas: Vec<ToplevelMeta> = Vec::with_capacity(state.toplevels.len());
         for (i, tl) in state.toplevels.iter().enumerate() {
-            let (gx_xdg, gy_xdg, gw_xdg, gh_xdg) = with_states(&tl.surface, |states| {
+            let (gx_xdg, gy_xdg, gw_xdg, gh_xdg, app_id) = with_states(&tl.surface, |states| {
                 let mut guard = states.cached_state.get::<SurfaceCachedState>();
-                guard.current().geometry
+                let geom = guard.current().geometry
                     .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h))
-                    .unwrap_or((0, 0, 0, 0))
+                    .unwrap_or((0, 0, 0, 0));
+                let app_id = states.data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|d| d.lock().ok()?.app_id.clone())
+                    .unwrap_or_default();
+                (geom.0, geom.1, geom.2, geom.3, app_id)
             });
             let (bw, bh, auto_bbox) = {
                 let p = tl.pixels.lock().unwrap();
@@ -984,6 +993,7 @@ impl CompositorApp {
                 csd_now: tl.csd,
                 csd_verdict: tl.csd || has_padding,
                 is_resizing: Some(i) == resizing_idx,
+                app_id,
             });
         }
 
@@ -999,6 +1009,9 @@ impl CompositorApp {
                     win.geom_h = m.gh;
                     win.geom_x = m.gx;
                     win.geom_y = m.gy;
+                }
+                if !m.app_id.is_empty() && win.app_id != m.app_id {
+                    win.app_id = m.app_id.clone();
                 }
             }
             if m.csd_verdict && !m.csd_now {
@@ -1393,6 +1406,43 @@ impl CompositorApp {
             info!("WM: activate-window({})", id);
             self.wm.focus_by_id(id);
             self.update_focused_surface(state);
+        }
+
+        // Dock-menu deferred actions: Show All Windows / Quit.
+        let dock_actions: Vec<(String, i32)> = {
+            let mut q = self.pending_dock_action.lock().unwrap();
+            q.drain(..).collect()
+        };
+        for (app_id, action) in dock_actions {
+            let ids = self.wm.ids_for_app(&app_id);
+            info!("WM: dock-action app={} action={} → {} window(s)",
+                app_id, action, ids.len());
+            match action {
+                2 => {
+                    // Show All Windows — raise + focus the most-recent one
+                    // belonging to this app. Future polish: open a window
+                    // overview / mission-control style picker.
+                    if let Some(&id) = ids.last() {
+                        self.wm.focus_by_id(id);
+                        self.update_focused_surface(state);
+                    }
+                }
+                5 => {
+                    // Quit — close every window for this app via the same
+                    // path Slint's close-window callback uses.
+                    for id in ids {
+                        let surface = self.wm.windows.values()
+                            .find(|w| w.id == id)
+                            .map(|w| w.surface.clone());
+                        if let Some(surf) = surface {
+                            self.send_xdg_close(&surf, state);
+                            self.wm.begin_close_by_id(id);
+                        }
+                    }
+                    self.update_focused_surface(state);
+                }
+                _ => {}
+            }
         }
 
         // Alt-tab steps
@@ -2781,19 +2831,28 @@ pub fn run() -> Result<()> {
     let pending_maximize: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let pending_activate: Arc<Mutex<VecDeque<i32>>> = Arc::new(Mutex::new(VecDeque::new()));
 
-    // Dock context-menu callback — uses exec_map for "Open New Window".
+    // Dock context-menu actions — actions 2 & 5 need access to the WM
+    // (via SpikeState in the main loop), so we push them onto a queue.
+    let pending_dock_action: Arc<Mutex<VecDeque<(String, i32)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
     {
         let exec_map_q = exec_map.clone();
+        let q = pending_dock_action.clone();
         ui.on_dock_menu_clicked(move |app_id, action| {
             tracing::info!("dock-menu: app={} action={}", app_id, action);
-            if action == 1 {
-                if let Some(exec) = exec_map_q.get(app_id.as_str()) {
-                    let _ = std::process::Command::new("sh")
-                        .arg("-c").arg(exec).spawn();
+            match action {
+                1 => {
+                    // Open New Window — fire the .desktop exec directly.
+                    if let Some(exec) = exec_map_q.get(app_id.as_str()) {
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c").arg(exec).spawn();
+                    }
+                }
+                _ => {
+                    // Defer to the main loop so we can read/mutate the WM.
+                    q.lock().unwrap().push_back((app_id.to_string(), action));
                 }
             }
-            // Other actions (Show All Windows, Quit) need per-app window
-            // index in the WM — wire in a follow-up pass.
         });
     }
 
@@ -2981,6 +3040,7 @@ pub fn run() -> Result<()> {
     app.pending_minimize = pending_minimize;
     app.pending_maximize = pending_maximize;
     app.pending_activate = pending_activate;
+    app.pending_dock_action = pending_dock_action;
 
     // 7. Main loop.
     info!("Entering GPU compositor main loop");

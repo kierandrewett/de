@@ -670,6 +670,16 @@ impl WindowManager {
         self.windows.values().find(|w| w.focused).map(|w| w.id)
     }
 
+    /// Return the stable ids of every mapped (non-closing) window whose
+    /// `app_id` matches `target` exactly. Used by the dock context menu's
+    /// "Show All Windows" / "Quit" actions.
+    pub fn ids_for_app(&self, target: &str) -> Vec<i32> {
+        self.windows.values()
+            .filter(|w| !w.closing && w.app_id == target)
+            .map(|w| w.id)
+            .collect()
+    }
+
     /// Drop focus from every window (e.g. after a click on the desktop).
     /// Returns true if at least one window changed focus state.
     pub fn unfocus_all(&mut self) -> bool {
