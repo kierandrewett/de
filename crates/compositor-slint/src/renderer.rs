@@ -1622,6 +1622,105 @@ impl CompositorApp {
             self.wm.alt_tab_commit();
             self.update_focused_surface(state);
         }
+
+        // ── xdg-shell client requests ─────────────────────────────────────
+        self.process_xdg_requests(state);
+    }
+
+    /// Drain `pending_xdg_*` queues populated by the wayland-thread
+    /// xdg-shell handlers and apply them. Move/resize start an
+    /// `ActiveDrag` using the current pointer position; max/min/fullscreen
+    /// route through the existing WM helpers and reply with a configure.
+    fn process_xdg_requests(&mut self, state: &mut SpikeState) {
+        // Move
+        let moves: Vec<WlSurface> = state.pending_xdg_move.drain(..).collect();
+        for surface in moves {
+            // Skip if a drag is already active — clients sometimes re-fire
+            // move during an in-flight grab.
+            if self.active_drag.is_some() {
+                continue;
+            }
+            let Some(idx) = state.toplevels.iter().position(|t| t.surface == surface) else {
+                continue;
+            };
+            let (px, py) = self.pointer_pos;
+            let t = &state.toplevels[idx];
+            self.active_drag = Some(ActiveDrag::Move {
+                toplevel_idx: idx,
+                offset_x: px - t.x as f64,
+                offset_y: py - t.y as f64,
+                pending_unmaximize: None,
+            });
+            debug!("xdg client move_request → ActiveDrag::Move on tl#{}", idx);
+        }
+
+        // Resize
+        let resizes: Vec<(WlSurface, ResizeEdge)> = state.pending_xdg_resize.drain(..).collect();
+        for (surface, edge) in resizes {
+            if self.active_drag.is_some() {
+                continue;
+            }
+            let Some(idx) = state.toplevels.iter().position(|t| t.surface == surface) else {
+                continue;
+            };
+            let (px, py) = self.pointer_pos;
+            let t = &state.toplevels[idx];
+            // WM owns the authoritative logical size; fall back to buffer
+            // dims if the window isn't tracked yet (shouldn't happen post-
+            // sync_new_toplevels, but stays robust).
+            let (w, h) = self.wm.id_for_surface(&t.surface)
+                .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
+                .map(|w| (w.w, w.h))
+                .unwrap_or_else(|| {
+                    let pix = t.pixels.lock().unwrap();
+                    (pix.width as i32, pix.height as i32)
+                });
+            self.active_drag = Some(ActiveDrag::Resize {
+                toplevel_idx: idx,
+                edge,
+                start_ptr_x: px,
+                start_ptr_y: py,
+                start_geom: WindowGeomSnapshot { x: t.x, y: t.y, w, h },
+                last_configure_at: None,
+                dock_snap_engaged_at: None,
+            });
+            debug!("xdg client resize_request {:?} → ActiveDrag::Resize on tl#{}", edge, idx);
+        }
+
+        // Maximize / unmaximize. Treat fullscreen identically — we have no
+        // separate fullscreen geometry yet; honour the protocol state but
+        // share the maximize geometry.
+        let mut max_actions: Vec<(WlSurface, bool)> = state.pending_xdg_maximize.drain(..).collect();
+        max_actions.extend(state.pending_xdg_fullscreen.drain(..));
+        for (surface, want_max) in max_actions {
+            let Some(id) = self.wm.id_for_surface(&surface) else { continue };
+            {
+                let win = match self.wm.windows.values_mut().find(|w| w.id == id) {
+                    Some(w) => w,
+                    None => continue,
+                };
+                if want_max && !win.maximized {
+                    win.start_maximize(self.wm.output_w, self.wm.output_h);
+                } else if !want_max && win.maximized {
+                    win.start_unmaximize();
+                }
+            }
+            // Reply with a configure carrying the new size.
+            let (new_w, new_h) = self.wm.windows.values()
+                .find(|w| w.id == id)
+                .map(|w| (w.w, w.h))
+                .unwrap_or((800, 600));
+            self.send_configure(&surface, new_w, new_h, state);
+        }
+
+        // Minimize
+        let minimizes: Vec<WlSurface> = state.pending_xdg_minimize.drain(..).collect();
+        for surface in minimizes {
+            if let Some(id) = self.wm.id_for_surface(&surface) {
+                self.wm.minimize_by_id(id);
+                self.update_focused_surface(state);
+            }
+        }
     }
 
     /// Update `state.active_surface` and keyboard focus from the WM focused window.

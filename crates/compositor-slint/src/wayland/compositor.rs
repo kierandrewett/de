@@ -24,6 +24,7 @@ use smithay::{
             CompositorHandler, CompositorState, SurfaceAttributes,
         },
         dmabuf::get_dmabuf,
+        shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
 };
 use tracing::debug;
@@ -84,6 +85,38 @@ impl CompositorHandler for SpikeState {
         }).flatten();
         if let Some(dmabuf) = dmabuf {
             self.import_dmabuf_for_surface(surface, &dmabuf);
+        }
+
+        // Initial xdg_surface configure must arrive AFTER the client has had
+        // a chance to populate app_id/title/decoration mode but BEFORE it
+        // commits its first buffer with content. We deferred the
+        // send_configure() out of new_toplevel/new_popup; fire it here on
+        // the first commit if it has not yet been sent.
+        if let Some(toplevel) = self.toplevels.iter().find(|t| &t.surface == surface) {
+            let initial_sent = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .map(|d| d.lock().unwrap().initial_configure_sent)
+                    .unwrap_or(true)
+            });
+            if !initial_sent {
+                toplevel.toplevel.send_configure();
+            }
+        }
+        if let Some(popup) = self.popups.iter().find(|p| &p.surface == surface) {
+            let initial_sent = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgPopupSurfaceData>()
+                    .map(|d| d.lock().unwrap().initial_configure_sent)
+                    .unwrap_or(true)
+            });
+            if !initial_sent {
+                if let Err(e) = popup.popup.send_configure() {
+                    tracing::warn!("popup initial send_configure failed: {:?}", e);
+                }
+            }
         }
 
         // Walk up the wl_subsurface parent chain. Bounded depth so a
