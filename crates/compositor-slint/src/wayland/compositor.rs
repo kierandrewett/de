@@ -161,6 +161,29 @@ impl CompositorHandler for SpikeState {
         use smithay::input::pointer::CursorImageStatus;
         if let CursorImageStatus::Surface(cursor_surf) = &self.cursor_status {
             if cursor_surf == surface || *cursor_surf == root {
+                // Animated client cursors (Mesa libwayland-cursor, GTK
+                // throbbers, etc.) page through frames by setting a
+                // wl_surface.offset on each commit. The protocol says
+                // the hotspot is implicitly adjusted by the inverse
+                // delta — without this, the cursor's pivot point drifts
+                // every frame.
+                use smithay::input::pointer::CursorImageSurfaceData;
+                with_states(cursor_surf, |states| {
+                    let buffer_delta = states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer_delta
+                        .take();
+                    if let (Some(delta), Some(attrs_data)) = (
+                        buffer_delta,
+                        states.data_map.get::<CursorImageSurfaceData>(),
+                    ) {
+                        if let Ok(mut attrs) = attrs_data.lock() {
+                            attrs.hotspot -= delta;
+                        }
+                    }
+                });
                 let pixels = self.cursor_surface_pixels.clone();
                 let _ = import_shm_buffer(cursor_surf, &pixels);
                 return;
