@@ -500,6 +500,11 @@ impl SpikeState {
         let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
         XWaylandKeyboardGrabState::new::<Self>(dh);
 
+        // wl_fixes — lets clients destroy a wl_registry properly without
+        // leaking the resource on our side. Stateless; create the global
+        // and let the macro-generated dispatch handle the rest.
+        smithay::wayland::fixes::FixesState::new::<Self>(dh);
+
         let mut state = Self {
             display_handle,
             loop_handle,
@@ -1185,6 +1190,10 @@ impl DataDeviceHandler for SpikeState {
 }
 
 smithay::delegate_data_device!(SpikeState);
+
+// wl_fixes: registry-destroy stub — no app-level handler trait, the
+// FixesState dispatch is auto-generated from the global created above.
+smithay::delegate_fixes!(SpikeState);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // PrimarySelectionHandler
