@@ -16,6 +16,8 @@ smithay = { git = "https://github.com/Smithay/smithay.git", features = [
     "use_system_lib",
     "backend_egl",
     "desktop",
+    "xwayland",
+    "x11rb_event_source",
 ] }
 calloop = "0.13"
 wayland-server = "0.31"

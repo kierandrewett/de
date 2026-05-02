@@ -17,3 +17,4 @@ pub mod session_lock;
 pub mod timing;
 pub mod toplevel;
 pub mod xdg_shell;
+pub mod xwayland;

@@ -27,6 +27,7 @@ use smithay::{
         dmabuf::get_dmabuf,
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
+    xwayland::XWaylandClientData,
 };
 use tracing::debug;
 
@@ -39,13 +40,16 @@ impl CompositorHandler for SpikeState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        // Anvil pattern: a client may have non-`ClientState` user-data
-        // (notably the XWayland WM-side connection on builds with XWayland).
-        // Returning a reference borrowed from `client` keeps the function
-        // panic-free; when our `ClientState` is absent we fall back to a
-        // process-wide empty `CompositorClientState` whose `'static`
-        // lifetime is compatible with any `'a`.
+        // A client may have one of several user-data types: our regular
+        // `ClientState` for normal wayland clients, `XWaylandClientData`
+        // for the XWayland WM-side connection, or some other data we
+        // don't know about. Try each in turn; if none match, fall back
+        // to a process-wide empty `CompositorClientState` (the `'static`
+        // lifetime of the `OnceLock` is compatible with any `'a`).
         if let Some(state) = client.get_data::<ClientState>() {
+            return &state.compositor_state;
+        }
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
             return &state.compositor_state;
         }
         static FALLBACK: std::sync::OnceLock<CompositorClientState> = std::sync::OnceLock::new();
@@ -121,7 +125,9 @@ impl CompositorHandler for SpikeState {
                     .unwrap_or(true)
             });
             if !initial_sent {
-                toplevel.toplevel.send_configure();
+                if let Some(t) = toplevel.toplevel.as_ref() {
+                    t.send_configure();
+                }
             }
         }
         if let Some(popup) = self.popups.iter().find(|p| &p.surface == surface) {

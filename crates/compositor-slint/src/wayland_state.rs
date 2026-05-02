@@ -116,7 +116,10 @@ use smithay::{
         xdg_system_bell::XdgSystemBellState,
         xdg_toplevel_icon::XdgToplevelIconManager,
         xdg_toplevel_tag::XdgToplevelTagManager,
+        xwayland_keyboard_grab::XWaylandKeyboardGrabState,
+        xwayland_shell::XWaylandShellState,
     },
+    xwayland::X11Wm,
 };
 use tracing::{debug, info, warn};
 
@@ -161,8 +164,13 @@ pub struct ClientSurfaceData {
 pub struct ToplevelInfo {
     /// The wayland surface for this toplevel.
     pub surface: WlSurface,
-    /// The ToplevelSurface handle (for sending configure / close to the client).
-    pub toplevel: ToplevelSurface,
+    /// The xdg `ToplevelSurface` handle for native wayland clients. `None`
+    /// for X11/Xwayland toplevels — those use `x11_surface` for configure /
+    /// close round-trips instead.
+    pub toplevel: Option<ToplevelSurface>,
+    /// `Some(_)` when this toplevel is backed by an X11 window (i.e. the
+    /// client is an Xwayland app). Mutually exclusive with `toplevel`.
+    pub x11_surface: Option<smithay::xwayland::X11Surface>,
     /// Cascaded compositor-space position.
     pub x: i32,
     pub y: i32,
@@ -279,6 +287,16 @@ pub struct SpikeState {
     /// wired yet, but the global must still bind so `grim` /
     /// `xdg-desktop-portal-wlr` / OBS don't error out at startup.
     pub image_copy_capture_state: ImageCopyCaptureState,
+
+    // ── XWayland ─────────────────────────────────────────────────────────
+    /// The xwayland_shell_v1 global state — needed for the Xwayland process to
+    /// associate a wl_surface with the X11 window it represents.
+    pub xwayland_shell_state: XWaylandShellState,
+    /// The X11 window manager attached to the running Xwayland instance.
+    /// `None` until `XWaylandEvent::Ready` fires (or after Xwayland exits).
+    pub xwm: Option<X11Wm>,
+    /// X11 display number Xwayland is listening on (for `DISPLAY=:N`).
+    pub xdisplay: Option<u32>,
 
     // ── Bookkeeping ───────────────────────────────────────────────────────
     /// The single virtual output for this compositor. Stored here so the
@@ -432,6 +450,9 @@ impl SpikeState {
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(dh);
 
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
+        XWaylandKeyboardGrabState::new::<Self>(dh);
+
         let mut state = Self {
             display_handle,
             loop_handle,
@@ -480,6 +501,9 @@ impl SpikeState {
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
+            xwayland_shell_state,
+            xwm: None,
+            xdisplay: None,
             output: None,
             active_surface: None,
             dnd_icon: None,
@@ -1089,6 +1113,11 @@ impl DndGrabHandler for SpikeState {
         self.dnd_icon = None;
     }
 }
+
+// `impl DndGrabHandler for SpikeState` already lives above (custom
+// `dropped`/`cancelled` for the dnd_icon lifecycle); X11Wm::start_wm's
+// trait bound is satisfied by that impl too — no second blanket impl
+// needed here.
 
 impl DataDeviceHandler for SpikeState {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
