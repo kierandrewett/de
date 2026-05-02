@@ -28,8 +28,8 @@ We evaluated two compositor library options:
 ### Our choice: Smithay
 We chose smithay because:
 1. **Rust-native** — no FFI, no unsafe boundary with C code, full ownership of memory
-2. **Rendering freedom** — we own the entire render pipeline (critical for our squircle clipping, macOS borders, SDF shaders, and iced decoration rendering)
-3. **COSMIC precedent** — System76 built a full DE on smithay with iced, proving the architecture works at scale
+2. **Rendering freedom** — we own the entire render pipeline (critical for our squircle clipping, macOS borders, SDF shaders, and Slint scene rendering)
+3. **COSMIC precedent** — System76 built a full DE on smithay, proving the architecture works at scale
 4. **Protocol parity** — smithay implements virtually every protocol wlroots does, plus smithay's delegate pattern makes adding new protocols mechanical
 
 ### wlroots protocols we still need
@@ -68,7 +68,7 @@ For each window:
     3. Set up squircle clip mask (stencil buffer or SDF shader)
     4. Draw client texture through clip mask
     5. Draw inner highlight (inset squircle stroke)
-    6. If SSD: draw iced title bar texture above client
+    6. If SSD: composite Slint WindowChrome titlebar above client
     ↓
 Submit final framebuffer to DRM/KMS for display
 ```
@@ -76,16 +76,12 @@ Submit final framebuffer to DRM/KMS for display
 ### Server-side vs Client-side Decorations
 - **CSD (Client-Side Decorations):** The client draws its own title bar and window chrome. GTK4/libadwaita apps insist on this. We still clip the whole window with our squircle mask and add our shadow/border — the client never knows.
 - **SSD (Server-Side Decorations):** We draw the title bar, window controls (close/max/min), and frame. The client just renders content. We negotiate this via `xdg-decoration-unstable-v1` — we advertise "ServerSide" preference, and apps that support it will give us a clean content rect.
-- **Our approach:** For SSD windows, we render the title bar using iced's `IcedElement` pattern (same as COSMIC). The iced widget tree gets rendered to a GPU texture, composited above the client surface. For CSD windows, we just clip and add border/shadow.
+- **Our approach:** For SSD windows, the titlebar is part of the Slint scene (`slint/WindowChrome.slint`) — Slint rasterises it via FemtoVG into the same render texture as the windows themselves, no per-window iced trees. For CSD windows we just clip the buffer to the xdg geom rect and run our own GPU shadow/border passes.
 
 ### Layer Shell (how our shell UI works)
-`wlr-layer-shell-v1` lets special surfaces anchor to screen edges with an "exclusive zone" (area that windows avoid). Our panel, dock, launcher, and notification popups are all layer-shell surfaces:
-- **Panel:** Layer::Top, anchor top, exclusive zone = 30px (windows stay below)
-- **Dock:** Layer::Top, anchor bottom, exclusive zone = dock height
-- **Launcher:** Layer::Overlay, no anchor (floating, centred), no exclusive zone
-- **Notifications:** Layer::Overlay, anchor top-right, no exclusive zone
+`wlr-layer-shell-v1` lets special surfaces anchor to screen edges with an "exclusive zone" (area that windows avoid). The original architecture ran the panel, dock, and launcher as separate iced layer-shell client processes; the current architecture folds all of those into the compositor's own Slint scene (`slint/Compositor.slint`) — single render pipeline, no IPC roundtrip. Layer-shell support is still implemented and exposed for THIRD-PARTY clients (waybar replacements, swaync, mako, etc.) — those connect to our wayland socket like any other client and are composited via `wayland/layer_shell.rs`.
 
-These are separate Wayland client processes that connect to our compositor's Wayland socket. In dev mode (winit), they render inside the winit window just like any other client.
+Notification popups remain a separate IPC-driven path: `crates/notification` runs the freedesktop notification D-Bus service in a sibling process, the compositor consumes its events over the unix-socket IPC, and the popout is rendered inside the Slint scene.
 
 ---
 
@@ -259,15 +255,15 @@ pub enum Backend {
 
 ## COSMIC as Reference Architecture
 
-COSMIC (System76's DE) is our closest architectural reference. They use smithay + iced and solved the same problems we're solving:
+COSMIC (System76's DE) was our original architectural reference and many patterns still apply:
 
-- **cosmic-comp** — their compositor, uses smithay, implements `IcedElement` for rendering iced widget trees as GPU textures inside the compositor's render loop for SSD decorations
-- **libcosmic** — their fork of iced with additional widgets, theming, and wayland integration
-- **cosmic-panel** — their panel, uses `wlr-layer-shell`
-- **cosmic-applet-status-area** — their system tray, implements StatusNotifierWatcher + DBusMenu
+- **cosmic-comp** — their compositor, uses smithay, implements `IcedElement` for rendering iced widget trees as GPU textures inside the compositor's render loop for SSD decorations. Our equivalent is the Slint WindowChrome composited into the same render texture.
+- **libcosmic** — their fork of iced with additional widgets, theming, and wayland integration. We use Slint instead.
+- **cosmic-panel** — their panel, uses `wlr-layer-shell`. Our panel is in-process inside the Slint scene.
+- **cosmic-applet-status-area** — their system tray, implements StatusNotifierWatcher + DBusMenu. We do the same in `crates/compositor-slint/src/tray.rs`.
 - **cosmic-applets** — panel applets for audio, bluetooth, battery, etc.
-- **cosmic-launcher** — their app launcher
-- **cosmic-notifications** — their notification daemon
+- **cosmic-launcher** — their app launcher. Ours is a Slint overlay (Super+Space).
+- **cosmic-notifications** — their notification daemon. Ours is `crates/notification`.
 
 Key COSMIC source repos to study:
 - https://github.com/pop-os/cosmic-comp (compositor)
@@ -282,18 +278,16 @@ We are NOT forking COSMIC. We're building our own DE with our own design languag
 
 ### Running in dev mode
 ```bash
-# Terminal 1: compositor in a winit window
-cargo run -p compositor -- --winit
+# All-in-one — builds and launches compositor + notification + portal,
+# then exports WAYLAND_DISPLAY for any clients you want to point at it.
+./dev.sh
 
-# Terminal 2: start panel inside the compositor
-WAYLAND_DISPLAY=wayland-myDE cargo run -p shell-panel
-
-# Terminal 3: start dock
-WAYLAND_DISPLAY=wayland-myDE cargo run -p shell-dock
-
-# Terminal 4: open a test app
-WAYLAND_DISPLAY=wayland-myDE alacritty
+# Then in another terminal:
+WAYLAND_DISPLAY=wayland-1 alacritty       # or any other wayland client
 ```
+
+The compositor runs as a wayland client inside the host session
+(winit-on-wayland). A bare-TTY DRM/KMS path is not yet wired.
 
 ### Why winit backend matters
 Without the winit backend, you'd need to switch TTYs or use a nested Wayland compositor to test. With it, you just `cargo run` and your compositor opens as a window on your existing desktop. This is how smithay's own "anvil" sample compositor works — it supports `--winit`, `--x11`, and `--tty-udev` backends.

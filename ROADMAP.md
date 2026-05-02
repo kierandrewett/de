@@ -103,7 +103,7 @@ Numbered for tracking. Dispatched across waves 3-6.
 52. World clocks
 53. Weather widget
 54. Dock auto-hide
-55. Dock magnification on hover (porting back from iced)
+55. Dock magnification on hover
 
 ### Shell apps (56-70)
 56. App launcher (Spotlight-style, fuzzy + recent + math)

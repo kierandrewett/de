@@ -1,7 +1,7 @@
 # Wayland Protocol Reference: Building a Full Desktop Environment
 
 **Target:** Feature parity with GNOME (Mutter), KDE (KWin), and Hyprland  
-**Stack:** Smithay + iced + custom compositor  
+**Stack:** Smithay + Slint + custom compositor  
 **Date:** April 2026
 
 ---

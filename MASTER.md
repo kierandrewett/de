@@ -13,41 +13,38 @@ You are orchestrating the build of a custom Wayland desktop environment in Rust.
 
 ## Stack
 - **Smithay** — Wayland compositor library (Rust)
-- **iced** — UI framework for shell chrome, window decorations, and apps
+- **Slint** (1.16, unstable-wgpu-28) — single-process UI for shell chrome,
+  window decorations, panel, dock, popouts. Replaces the iced-based
+  multi-process shell.
+- **wgpu-28** + custom WGSL passes — GPU compositing (shadow / border /
+  highlight / blur)
 - **resvg/usvg** — SVG rasterisation (cursors, icons)
-- **tiny-skia** — CPU rendering (prototyping, fallback)
-- **wgpu** or smithay's GlesRenderer — GPU rendering
+- **tiny-skia** — CPU rendering (cursor + backdrop synth)
 - **calloop** — event loop (smithay's default)
 - **zbus** — D-Bus (portals, notifications, tray, MPRIS)
-- **PipeWire** — screen sharing/recording streams
-
-## Backends
-- **Dev mode:** `cargo run -p compositor -- --winit` — runs as nested compositor in a winit window
-- **Prod mode:** `cargo run -p compositor -- --tty-udev` — runs on bare TTY with DRM/KMS
+- **PipeWire** — screen sharing/recording streams (planned)
 
 ## Workspace Structure
 ```
 Cargo.toml                    # workspace root
 crates/
-├── compositor/               # Wayland compositor binary (smithay)
+├── compositor-slint/         # Wayland compositor + shell (single binary)
 │   └── src/
-│       ├── main.rs           # backend selection (winit vs udev)
-│       ├── state.rs          # global compositor state
-│       ├── render/           # rendering pipeline, borders, shadows, clipping
-│       ├── shell/            # window management, snapping, animations
-│       ├── wayland/          # protocol handler wiring
-│       └── ipc.rs            # unix socket IPC server
+│       ├── main.rs           # entry point
+│       ├── renderer.rs       # frame loop, wgpu pipeline, IPC dispatch
+│       ├── wayland/          # per-protocol handler split
+│       ├── render/           # chrome shader passes (shadow / border / hl)
+│       ├── wm/               # window manager (z-order, animations)
+│       ├── desktop.rs        # dock entry resolution + icon loading
+│       ├── tray.rs           # StatusNotifierWatcher / KStatusNotifierItem
+│       └── ipc_server.rs     # unix socket IPC server
 ├── rounding/                 # Squircle corner rounding engine
 ├── animation/                # Spring + easing animation engine
 ├── cursor/                   # SVG cursor theme loader + renderer
-├── status-notifier/          # StatusNotifierItem D-Bus host
-├── notification/             # org.freedesktop.Notifications server
-├── portal/                   # xdg-desktop-portal backend (D-Bus service)
-├── portal-ui/                # File picker UI (standalone iced app)
-├── shell-panel/              # Top panel + control centre (iced, layer-shell)
-├── shell-dock/               # Dock (iced, layer-shell)
-├── shell-launcher/           # Spotlight search (iced, layer-shell)
-├── shell-devtools/           # Iced UI inspector/devtools
+├── text-render/              # Text rasterisation helper
+├── status-notifier/          # StatusNotifierItem D-Bus host (lib)
+├── notification/             # org.freedesktop.Notifications server (bin)
+├── portal/                   # xdg-desktop-portal backend (bin)
 ├── theme/                    # Shared theme tokens, colours, spacing
 └── ipc/                      # Shared IPC message types
 ```
@@ -78,7 +75,6 @@ Subagents MUST:
 | `feat/rounding` | Squircle rounding engine | `subagents/01-rounding.md` |
 | `feat/animation` | Spring + easing animation | `subagents/02-animation.md` |
 | `feat/cursor` | SVG cursor subsystem | `subagents/03-cursor.md` |
-| `feat/devtools` | Iced DevTools inspector | `subagents/04-devtools.md` |
 | `feat/theme` | Shared theme tokens | `subagents/05-theme.md` |
 | `feat/ipc` | Shared IPC types | `subagents/06-ipc.md` |
 
@@ -97,11 +93,10 @@ Subagents MUST:
 | `feat/portal` | XDG Desktop Portal | `subagents/12-portal.md` |
 
 ### Phase 4 — Shell UI (depends on Phase 2 + 3)
-| Branch | Subagent | Prompt File |
-|--------|----------|-------------|
-| `feat/shell-panel` | Panel + control centre | `subagents/13-panel.md` |
-| `feat/shell-dock` | Dock | `subagents/14-dock.md` |
-| `feat/shell-launcher` | Spotlight launcher | `subagents/15-launcher.md` |
+The original plan was three separate iced layer-shell binaries (panel,
+dock, launcher). The current implementation folds all three into the
+compositor's own Slint scene under `crates/compositor-slint/slint/` —
+single process, single render pipeline, no IPC roundtrip for shell UI.
 
 ## Subagent Dispatch Command
 For each subagent, run:
@@ -119,35 +114,7 @@ After all subagents in a phase complete:
 5. Fix any cross-crate type mismatches
 6. Then deploy next phase
 
-## Root Cargo.toml Template
-```toml
-[workspace]
-resolver = "2"
-members = [
-    "crates/rounding",
-    "crates/animation",
-    "crates/cursor",
-    "crates/theme",
-    "crates/ipc",
-    "crates/shell-devtools",
-    "crates/status-notifier",
-    "crates/notification",
-    "crates/portal",
-    "crates/portal-ui",
-    "crates/compositor",
-    "crates/shell-panel",
-    "crates/shell-dock",
-    "crates/shell-launcher",
-]
-
-[workspace.dependencies]
-tiny-skia = "0.11"
-resvg = "0.44"
-usvg = "0.44"
-zbus = "5"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-```
+## Root Cargo.toml
+The active workspace is the source of truth — see `Cargo.toml` at the
+repo root. The shell-* crates listed in earlier revisions of this doc
+have been retired.

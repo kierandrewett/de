@@ -2,6 +2,16 @@
 # Usage: cat de-prompts/ORCHESTRATOR.md | claude --model opus -p
 # Or:    claude --model opus "Read de-prompts/ORCHESTRATOR.md and execute it"
 
+> **Historical record.** This doc captures the original multi-process
+> deployment plan (compositor + iced shell-panel + iced shell-dock +
+> iced shell-launcher + iced shell-devtools + iced portal-ui). The
+> current architecture has converged: panel/dock/launcher/devtools all
+> live inside `crates/compositor-slint` as part of its own Slint scene,
+> and the iced-based crates have been deleted from the tree. Phases
+> 1–3 ran roughly as documented; Phase 4 was reabsorbed into the
+> compositor binary instead of shipping as separate iced clients. Read
+> the rest as how-we-got-here, not how-to-build-it-today.
+
 You are the orchestrator for building a custom Wayland desktop environment in Rust. Your job is to dispatch subagent workers, monitor their progress, validate their output, and integrate their work. You operate in cycles.
 
 ---

@@ -147,7 +147,7 @@ For each window, back to front:
    - Fill the squircle with the content area background colour
 
 4. TITLE BAR (SSD only)
-   - Render the iced IcedElement title bar texture
+   - Render the Slint WindowChrome titlebar (rendered to render_tex by FemtoVG)
    - Clip to squircle with top corners at 12px inner radius
    - Draw 0.5px bottom divider line
 
@@ -163,7 +163,7 @@ For each window, back to front:
 
 7. WINDOW CONTROLS (SSD only)
    - Render minimize/maximize/close buttons in top-right
-   - These are part of the iced title bar element
+   - These are part of the Slint WindowChrome titlebar (IconButton TouchAreas)
 ```
 
 ---
