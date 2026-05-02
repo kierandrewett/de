@@ -384,13 +384,24 @@ impl WindowState {
         self.phase = AnimPhase::Restoring;
     }
 
-    /// Start maximize: animate geometry to output size minus panel/dock.
-    pub fn start_maximize(&mut self, output_w: i32, output_h: i32) {
+    /// Start maximize: animate geometry to output size minus reserved
+    /// (panel/dock) areas. `top/bottom/left/right` are the per-edge work-area
+    /// reservations from the layer-shell exclusive-zone arrange pass and
+    /// already include the built-in chrome floors.
+    pub fn start_maximize_in(
+        &mut self,
+        output_w: i32,
+        output_h: i32,
+        top: i32,
+        bottom: i32,
+        left: i32,
+        right: i32,
+    ) {
         self.pre_maximize = Some((self.x, self.y, self.w, self.h));
-        let max_x = 0;
-        let max_y = PANEL_HEIGHT;
-        let max_w = output_w;
-        let max_h = output_h - PANEL_HEIGHT - DOCK_HEIGHT;
+        let max_x = left;
+        let max_y = top;
+        let max_w = (output_w - left - right).max(0);
+        let max_h = (output_h - top - bottom).max(0);
         self.anim.set_geometry_target(max_x, max_y, max_w, max_h);
         self.anim.opacity.set_target(1.0);
         self.anim.scale.set_target(1.0);
@@ -400,6 +411,13 @@ impl WindowState {
         self.y = max_y;
         self.w = max_w;
         self.h = max_h;
+    }
+
+    /// Back-compat shim that uses the built-in panel/dock constants only —
+    /// callers that have access to the WM's reserved-zone state should
+    /// prefer `start_maximize_in`.
+    pub fn start_maximize(&mut self, output_w: i32, output_h: i32) {
+        self.start_maximize_in(output_w, output_h, PANEL_HEIGHT, DOCK_HEIGHT, 0, 0);
     }
 
     /// Restore from maximize.
@@ -462,6 +480,15 @@ pub struct WindowManager {
     /// Output size (set from renderer, default 1280×960).
     pub output_w: i32,
     pub output_h: i32,
+    /// Per-edge area reserved by mapped wlr-layer-shell surfaces with an
+    /// exclusive zone (refreshed each frame from `SpikeState::reserved_zones`).
+    /// Toplevel placement / maximize uses `top.max(PANEL_HEIGHT)` etc. so the
+    /// built-in shell chrome still claims its slot when no third-party panel
+    /// is mapped, but a real panel/dock pushes windows out of the way.
+    pub reserved_top: i32,
+    pub reserved_bottom: i32,
+    pub reserved_left: i32,
+    pub reserved_right: i32,
     /// Alt-tab state: current index into focus_stack (None = inactive).
     pub alt_tab_idx: Option<usize>,
     /// Instant of last animation tick (for dt computation).
@@ -478,9 +505,38 @@ impl WindowManager {
             cascade_slot: 0,
             output_w,
             output_h,
+            reserved_top: 0,
+            reserved_bottom: 0,
+            reserved_left: 0,
+            reserved_right: 0,
             alt_tab_idx: None,
             last_tick: None,
         }
+    }
+
+    /// Forward per-edge exclusive-zone reservations from the layer-shell
+    /// arrange pass. Called once per frame; cheap (4 i32 writes).
+    pub fn set_reserved_zones(&mut self, top: i32, bottom: i32, left: i32, right: i32) {
+        self.reserved_top = top.max(0);
+        self.reserved_bottom = bottom.max(0);
+        self.reserved_left = left.max(0);
+        self.reserved_right = right.max(0);
+    }
+
+    /// Effective top/bottom/left/right reserved area for toplevel placement.
+    /// Built-in shell chrome (PANEL_HEIGHT / DOCK_HEIGHT) acts as a floor —
+    /// a third-party panel with a larger exclusive zone wins.
+    pub fn effective_top(&self) -> i32 {
+        self.reserved_top.max(PANEL_HEIGHT)
+    }
+    pub fn effective_bottom(&self) -> i32 {
+        self.reserved_bottom.max(DOCK_HEIGHT)
+    }
+    pub fn effective_left(&self) -> i32 {
+        self.reserved_left
+    }
+    pub fn effective_right(&self) -> i32 {
+        self.reserved_right
     }
 
     /// Surface key: raw pointer cast to usize (stable for the lifetime of the surface).
@@ -517,26 +573,32 @@ impl WindowManager {
         let slot = self.cascade_slot;
         self.cascade_slot += 1;
 
+        let top = self.effective_top();
+        let bottom = self.effective_bottom();
+        let left = self.effective_left();
+        let right = self.effective_right();
+
         // Centre the very first spawned window on the visible safe area —
         // matches macOS / GNOME "open in middle of screen" intuition.
         if slot == 0 && self.windows.is_empty() {
-            let safe_h = (self.output_h - PANEL_HEIGHT - DOCK_HEIGHT).max(DEFAULT_WINDOW_H);
-            let cx = (self.output_w  - DEFAULT_WINDOW_W) / 2;
-            let cy = PANEL_HEIGHT + (safe_h - DEFAULT_WINDOW_H).max(0) / 2;
-            return (cx.max(20), cy.max(PANEL_HEIGHT));
+            let safe_h = (self.output_h - top - bottom).max(DEFAULT_WINDOW_H);
+            let safe_w = (self.output_w - left - right).max(DEFAULT_WINDOW_W);
+            let cx = left + (safe_w - DEFAULT_WINDOW_W) / 2;
+            let cy = top + (safe_h - DEFAULT_WINDOW_H).max(0) / 2;
+            return (cx.max(left + 20), cy.max(top));
         }
 
-        let x = CASCADE_BASE_X + slot * CASCADE_STEP;
-        let y = CASCADE_BASE_Y + PANEL_HEIGHT + slot * CASCADE_STEP;
+        let x = CASCADE_BASE_X.max(left) + slot * CASCADE_STEP;
+        let y = CASCADE_BASE_Y + top + slot * CASCADE_STEP;
 
         // Wrap when reaching edges (leave room for the default window size).
-        let max_x = self.output_w - DEFAULT_WINDOW_W - 20;
-        let max_y = self.output_h - DEFAULT_WINDOW_H - DOCK_HEIGHT - 20;
+        let max_x = self.output_w - DEFAULT_WINDOW_W - right - 20;
+        let max_y = self.output_h - DEFAULT_WINDOW_H - bottom - 20;
 
         // If wrapped past edges, reset cascade.
-        if x > max_x.max(CASCADE_BASE_X) || y > max_y.max(CASCADE_BASE_Y + PANEL_HEIGHT) {
+        if x > max_x.max(CASCADE_BASE_X) || y > max_y.max(CASCADE_BASE_Y + top) {
             self.cascade_slot = 0;
-            return (CASCADE_BASE_X, CASCADE_BASE_Y + PANEL_HEIGHT);
+            return (CASCADE_BASE_X.max(left), CASCADE_BASE_Y + top);
         }
 
         (x, y)
@@ -780,11 +842,18 @@ impl WindowManager {
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
+            let (ow, oh) = (self.output_w, self.output_h);
+            let (t, b, l, r) = (
+                self.effective_top(),
+                self.effective_bottom(),
+                self.effective_left(),
+                self.effective_right(),
+            );
             if let Some(win) = self.windows.get_mut(&key) {
                 if win.maximized {
                     win.start_unmaximize();
                 } else {
-                    win.start_maximize(self.output_w, self.output_h);
+                    win.start_maximize_in(ow, oh, t, b, l, r);
                 }
             }
         }
