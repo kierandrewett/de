@@ -1592,7 +1592,17 @@ impl CompositorApp {
         };
         for id in minimize_ids {
             info!("WM: minimize-window({})", id);
+            let surface = self
+                .wm
+                .windows
+                .values()
+                .find(|w| w.id == id)
+                .map(|w| w.surface.clone());
             self.wm.minimize_by_id(id);
+            // Mirror to X11 so xwayland clients learn they're now hidden.
+            if let Some(surf) = surface {
+                self.sync_x11_window_state(&surf, state, None, None, Some(true));
+            }
             self.update_focused_surface(state);
         }
 
@@ -1609,11 +1619,19 @@ impl CompositorApp {
                 .find(|w| w.id == id)
                 .map(|w| (w.w, w.h))
                 .unwrap_or((800, 600));
-            let surface = self.wm.windows.values()
+            let (surface, now_max) = self
+                .wm
+                .windows
+                .values()
                 .find(|w| w.id == id)
-                .map(|w| w.surface.clone());
+                .map(|w| (w.surface.clone(), w.maximized))
+                .map(|(s, m)| (Some(s), m))
+                .unwrap_or((None, false));
             if let Some(surf) = surface {
                 self.send_configure(&surf, new_w, new_h, state);
+                // Mirror to X11. We don't try to gate on "is this an X11
+                // window" — the helper does that and is a no-op otherwise.
+                self.sync_x11_window_state(&surf, state, Some(now_max), None, None);
             }
         }
 
@@ -1805,6 +1823,45 @@ impl CompositorApp {
             if let Some(kb) = state.seat.get_keyboard() {
                 kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
             }
+        }
+    }
+
+    /// Mirror a WM-driven maximize/fullscreen/minimize toggle back to the
+    /// X11Surface so xwayland-backed clients see consistent state.
+    ///
+    /// `pending_xdg_*` queues already cover the *client*-initiated path (the
+    /// X11 client asked to maximise → we propagated to the WM). This helper
+    /// covers the other direction — when the user double-clicks our title
+    /// bar, alt-drags into a snap, or hits the dock "minimise" — so the X11
+    /// client doesn't end up with stale `_NET_WM_STATE_MAXIMIZED` flags.
+    ///
+    /// All three `set_*` calls are no-ops on native wayland toplevels (we
+    /// just skip them) — we never modify protocol state from here, only the
+    /// X11-side bookkeeping.
+    fn sync_x11_window_state(
+        &self,
+        surface: &WlSurface,
+        state: &SpikeState,
+        maximized: Option<bool>,
+        fullscreen: Option<bool>,
+        hidden: Option<bool>,
+    ) {
+        let Some(x11) = state
+            .toplevels
+            .iter()
+            .find(|t| &t.surface == surface)
+            .and_then(|t| t.x11_surface.clone())
+        else {
+            return;
+        };
+        if let Some(v) = maximized {
+            let _ = x11.set_maximized(v);
+        }
+        if let Some(v) = fullscreen {
+            let _ = x11.set_fullscreen(v);
+        }
+        if let Some(v) = hidden {
+            let _ = x11.set_hidden(v);
         }
     }
 
@@ -2306,6 +2363,12 @@ impl CompositorApp {
                                         );
                                         toplevel.send_configure();
                                     }
+                                    // X11 clients won't see the unmaximize via
+                                    // xdg_toplevel.configure — push the state
+                                    // change to them directly.
+                                    self.sync_x11_window_state(
+                                        &surface, state, Some(false), None, None,
+                                    );
                                     if let Some(ActiveDrag::Move { offset_x, offset_y, pending_unmaximize, .. })
                                         = &mut self.active_drag
                                     {
