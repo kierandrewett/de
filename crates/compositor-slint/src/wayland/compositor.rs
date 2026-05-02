@@ -20,8 +20,9 @@ use smithay::{
     },
     wayland::{
         compositor::{
-            add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorClientState,
-            CompositorHandler, CompositorState, SurfaceAttributes,
+            add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes,
         },
         dmabuf::get_dmabuf,
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
@@ -38,7 +39,17 @@ impl CompositorHandler for SpikeState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        // Anvil pattern: a client may have non-`ClientState` user-data
+        // (notably the XWayland WM-side connection on builds with XWayland).
+        // Returning a reference borrowed from `client` keeps the function
+        // panic-free; when our `ClientState` is absent we fall back to a
+        // process-wide empty `CompositorClientState` whose `'static`
+        // lifetime is compatible with any `'a`.
+        if let Some(state) = client.get_data::<ClientState>() {
+            return &state.compositor_state;
+        }
+        static FALLBACK: std::sync::OnceLock<CompositorClientState> = std::sync::OnceLock::new();
+        FALLBACK.get_or_init(CompositorClientState::default)
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {
@@ -76,6 +87,15 @@ impl CompositorHandler for SpikeState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // Sync subsurfaces stage their state into the parent's pending tree
+        // and become visible only when the parent commits — running the
+        // root-buffer recomposite now would re-read stale parent state and
+        // waste a frame's worth of allocation. The parent's later commit
+        // will walk this subsurface in `with_surface_tree_downward`.
+        if is_sync_subsurface(surface) {
+            return;
+        }
 
         // If the surface's current buffer is a DMA-BUF, run the GPU readback
         // now (the pre-commit blocker has guaranteed the acquire fence
@@ -119,16 +139,12 @@ impl CompositorHandler for SpikeState {
             }
         }
 
-        // Walk up the wl_subsurface parent chain. Bounded depth so a
-        // malformed parent chain (would-be cycle) can't hang the wayland
-        // thread.
-        use smithay::wayland::compositor::get_parent;
+        // Walk up the wl_subsurface parent chain to the root. The
+        // wl_subsurface protocol guarantees this graph is acyclic, so an
+        // unbounded walk cannot hang.
         let mut root: WlSurface = surface.clone();
-        for _ in 0..32 {
-            match get_parent(&root) {
-                Some(p) => root = p,
-                None => break,
-            }
+        while let Some(p) = get_parent(&root) {
+            root = p;
         }
 
         // If this commit is for the current cursor surface (a client set a
