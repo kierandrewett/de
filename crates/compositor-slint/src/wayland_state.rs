@@ -201,6 +201,17 @@ pub struct PopupInfo {
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
 }
 
+/// Active drag-and-drop icon surface paired with the accumulated buffer
+/// offset (the hotspot, in logical pixels). Each commit on the icon
+/// surface adds the freshly-set `wl_surface.offset` (a.k.a. buffer_delta)
+/// to `offset`; the renderer subtracts it from the cursor position so
+/// the client-declared hotspot lands exactly on the pointer.
+#[derive(Debug, Clone)]
+pub struct DndIcon {
+    pub surface: WlSurface,
+    pub offset: smithay::utils::Point<i32, smithay::utils::Logical>,
+}
+
 /// One ext-session-lock-v1 surface (one per output the locker covers).
 /// Stored on `SpikeState::lock_surfaces`; the renderer composites these
 /// fullscreen and skips everything else while a lock is active.
@@ -338,7 +349,12 @@ pub struct SpikeState {
     /// an icon, cleared in `DndGrabHandler::dropped` / `cancelled`. The
     /// renderer composites this surface under the cursor while a DnD is
     /// active.
-    pub dnd_icon: Option<WlSurface>,
+    ///
+    /// `offset` is the accumulated `wl_surface.offset` (== buffer_delta on
+    /// commit) — clients use it as the icon's hotspot relative to its
+    /// top-left, so we subtract it from the icon's draw position so the
+    /// hotspot lands exactly on the cursor.
+    pub dnd_icon: Option<DndIcon>,
 
     /// Composited pixel buffer for the active DnD icon surface. Populated by
     /// the commit handler each time the icon surface commits (matches the
@@ -1106,9 +1122,12 @@ impl WaylandDndGrabHandler for SpikeState {
     ) {
         // Capture the icon so the renderer can composite it under the cursor
         // while the drag is active. Cleared in `DndGrabHandler::dropped` and
-        // `cancelled`. (Anvil tracks an offset alongside the surface; we
-        // don't have a hotspot story yet so origin-anchor is fine.)
-        self.dnd_icon = icon;
+        // `cancelled`. The accumulated wl_surface.offset is treated as the
+        // hotspot (matches anvil + sway); see `DndIcon::offset`.
+        self.dnd_icon = icon.map(|surface| DndIcon {
+            surface,
+            offset: smithay::utils::Point::from((0, 0)),
+        });
 
         match type_ {
             GrabType::Pointer => {

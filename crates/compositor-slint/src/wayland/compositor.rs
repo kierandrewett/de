@@ -171,8 +171,25 @@ impl CompositorHandler for SpikeState {
         // to it like any other surface but we route into a dedicated buffer
         // because it's a transient overlay drawn by the renderer under the
         // cursor, not a window the WM tracks.
-        if let Some(icon_surf) = self.dnd_icon.clone() {
+        //
+        // We also accumulate the wl_surface.offset (= buffer_delta) into
+        // the DndIcon's offset field. Clients use this as the icon's
+        // hotspot relative to its top-left; the renderer subtracts it
+        // from the cursor position when blitting so the hotspot lands
+        // exactly on the pointer.
+        if let Some(icon_surf) = self.dnd_icon.as_ref().map(|i| i.surface.clone()) {
             if icon_surf == *surface || icon_surf == root {
+                let buffer_delta = with_states(&icon_surf, |states| {
+                    states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer_delta
+                        .take()
+                });
+                if let (Some(delta), Some(icon)) = (buffer_delta, self.dnd_icon.as_mut()) {
+                    icon.offset += delta;
+                }
                 let pixels = self.dnd_icon_pixels.clone();
                 let _ = import_shm_buffer(&icon_surf, &pixels);
                 return;

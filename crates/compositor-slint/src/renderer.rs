@@ -337,6 +337,11 @@ struct DndIconSnapshot {
     /// to physical when blitting onto `final_tex`.
     cursor_x: f64,
     cursor_y: f64,
+    /// Accumulated wl_surface.offset (== buffer_delta on commit), in
+    /// LOGICAL pixels. Subtracted from the cursor position so the icon's
+    /// declared hotspot lands exactly on the pointer.
+    hotspot_x: i32,
+    hotspot_y: i32,
 }
 
 impl CompositorApp {
@@ -1045,11 +1050,14 @@ impl CompositorApp {
             if let Some(snap) = self.dnd_icon_snapshot.as_ref() {
                 if let Some(pass) = self.dnd_icon_pass.as_mut() {
                     let s = self.scale_factor;
-                    let cx_phys = snap.cursor_x as f32 * s;
-                    let cy_phys = snap.cursor_y as f32 * s;
-                    // Origin at (0, 0) hotspot — anvil tracks an offset
-                    // updated by the wl_surface offset event; we don't
-                    // yet so the icon's top-left sits at the cursor.
+                    // Subtract the icon's accumulated wl_surface.offset
+                    // (the hotspot in logical pixels) from the cursor
+                    // position so the hotspot pixel sits under the
+                    // pointer rather than the icon's top-left.
+                    let logical_x = snap.cursor_x - snap.hotspot_x as f64;
+                    let logical_y = snap.cursor_y - snap.hotspot_y as f64;
+                    let cx_phys = (logical_x as f32) * s;
+                    let cy_phys = (logical_y as f32) * s;
                     let final_view = final_tex.create_view(
                         &wgpu::TextureViewDescriptor::default(),
                     );
@@ -1723,7 +1731,7 @@ impl CompositorApp {
         // redraw whenever the icon is actively drawn so cursor motion
         // updates the on-screen position without waiting for slint dirty.
         let prev_active = self.dnd_icon_snapshot.is_some();
-        self.dnd_icon_snapshot = if state.dnd_icon.is_some() {
+        self.dnd_icon_snapshot = if let Some(icon) = state.dnd_icon.as_ref() {
             let p = state.dnd_icon_pixels.lock().unwrap();
             if p.width > 0 && p.height > 0 {
                 Some(DndIconSnapshot {
@@ -1732,6 +1740,8 @@ impl CompositorApp {
                     height: p.height,
                     cursor_x: state.pointer_pos.0,
                     cursor_y: state.pointer_pos.1,
+                    hotspot_x: icon.offset.x,
+                    hotspot_y: icon.offset.y,
                 })
             } else {
                 None
