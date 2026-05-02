@@ -72,7 +72,11 @@ use crate::wayland_state::{ClientSurfaceData, SpikeState, ToplevelInfo};
 /// Lives on the *child* X11Surface's `user_data()`. Updated when:
 ///   - the window first maps (via `refresh_transient_for`)
 ///   - smithay reports `WmWindowProperty::TransientFor` later in life.
+///
+/// The full focus-stealing-prevention / close-cascade rules read this — those
+/// are scheduled for the next pass; capturing the link first is a prereq.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct X11TransientFor(pub WlSurface);
 
 /// Resolve `child`'s `WM_TRANSIENT_FOR` parent into a `WlSurface` and
