@@ -217,6 +217,11 @@ struct CompositorApp {
     /// Composable chrome render pipeline — shadow / border / highlight (and
     /// optional squircle-clip) as separate, single-purpose passes.
     chrome: Option<ChromeRenderer>,
+    /// Single-pass alpha-blend renderer for the DnD icon overlay. Built
+    /// once per swapchain creation; lives until the renderer is torn
+    /// down. Replaces the earlier `queue.write_texture` overwrite that
+    /// dropped icon transparency.
+    dnd_icon_pass: Option<crate::render::dnd_icon::DndIconPass>,
 
     // Theme state — mode_t / per-window focus_t animations.
     theme: ThemeState,
@@ -354,6 +359,7 @@ impl CompositorApp {
             window_ref,
             ui: Some(ui),
             chrome: None,
+            dnd_icon_pass: None,
             theme: ThemeState::new(),
             super_held: false,
             pointer_pos: (0.0, 0.0),
@@ -451,6 +457,11 @@ impl ApplicationHandler for CompositorApp {
         );
         self.chrome = Some(chrome);
         info!("ChromeRenderer initialised (shadow + border + highlight passes)");
+
+        self.dnd_icon_pass = Some(crate::render::dnd_icon::DndIconPass::new(
+            std::sync::Arc::new(gpu_window.wgpu_device.clone()),
+            format,
+        ));
 
         // Initial resize: physical = logical at startup (winit hasn't
         // delivered a Resized yet) — scale_factor is queried from the
@@ -1025,52 +1036,31 @@ impl CompositorApp {
                 }
             }
 
-            // Step 2c — DnD icon: write the icon surface's pixels straight
-            // into final_tex on top of the composited scene at the cursor
-            // position. We use queue.write_texture (no alpha blending) so
-            // translucent icon pixels render as opaque on the icon's
-            // bounding rect — acceptable v1; a textured-quad blend pass can
-            // replace this without touching the wayland_state side.
+            // Step 2c — DnD icon: alpha-blend the icon surface into
+            // final_tex on top of the composited scene at the cursor
+            // position. Done as a textured-quad render pass with
+            // src-over blending so translucent / soft-edged icons
+            // render correctly (the previous queue.write_texture
+            // overwrite forced everything to opaque).
             if let Some(snap) = self.dnd_icon_snapshot.as_ref() {
-                let s = self.scale_factor;
-                let cx_phys = (snap.cursor_x as f32 * s).round() as i32;
-                let cy_phys = (snap.cursor_y as f32 * s).round() as i32;
-                // Clip the icon rect to final_tex bounds. Origin (0, 0)
-                // hotspot — anvil uses an offset stored in DndIcon, which
-                // is updated by the wl_surface offset event; we don't track
-                // that yet so the icon's top-left sits at the cursor.
-                let icon_w = snap.width as i32;
-                let icon_h = snap.height as i32;
-                let dst_x0 = cx_phys.max(0);
-                let dst_y0 = cy_phys.max(0);
-                let dst_x1 = (cx_phys + icon_w).min(w as i32).max(dst_x0);
-                let dst_y1 = (cy_phys + icon_h).min(h as i32).max(dst_y0);
-                let copy_w = (dst_x1 - dst_x0) as u32;
-                let copy_h = (dst_y1 - dst_y0) as u32;
-                if copy_w > 0 && copy_h > 0 {
-                    // Source-rect offset accounts for clipping at the left/top edge.
-                    let src_x = (dst_x0 - cx_phys) as u32;
-                    let src_y = (dst_y0 - cy_phys) as u32;
-                    let bytes_per_row = snap.width * 4;
-                    let offset = (src_y * bytes_per_row + src_x * 4) as usize;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: final_tex,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: dst_x0 as u32,
-                                y: dst_y0 as u32,
-                                z: 0,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &snap.pixels[offset..],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(bytes_per_row),
-                            rows_per_image: Some(snap.height),
-                        },
-                        wgpu::Extent3d { width: copy_w, height: copy_h, depth_or_array_layers: 1 },
+                if let Some(pass) = self.dnd_icon_pass.as_mut() {
+                    let s = self.scale_factor;
+                    let cx_phys = snap.cursor_x as f32 * s;
+                    let cy_phys = snap.cursor_y as f32 * s;
+                    // Origin at (0, 0) hotspot — anvil tracks an offset
+                    // updated by the wl_surface offset event; we don't
+                    // yet so the icon's top-left sits at the cursor.
+                    let final_view = final_tex.create_view(
+                        &wgpu::TextureViewDescriptor::default(),
+                    );
+                    pass.render(
+                        queue,
+                        &mut encoder,
+                        &final_view,
+                        w, h,
+                        (cx_phys, cy_phys, snap.width as f32, snap.height as f32),
+                        &snap.pixels,
+                        snap.width, snap.height,
                     );
                 }
             }

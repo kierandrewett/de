@@ -23,6 +23,7 @@
 
 pub mod common;
 pub mod border;
+pub mod dnd_icon;
 pub mod highlight;
 pub mod shadow;
 pub mod squircle;
