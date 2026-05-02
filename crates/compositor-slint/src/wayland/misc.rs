@@ -57,9 +57,19 @@ impl XdgActivationHandler for SpikeState {
         &mut self,
         _token: XdgActivationToken,
         _token_data: XdgActivationTokenData,
-        _surface: WlSurface,
+        surface: WlSurface,
     ) {
-        // TODO: raise the corresponding window when window management is wired.
+        // Honour the activation request unconditionally for now — anvil
+        // does the same. A focus-stealing-prevention pass would gate on
+        // `token_data.user_data` (a recent user-interaction serial); we
+        // don't yet track that. Without this handler doing anything,
+        // "open from terminal" / "click notification action" workflows
+        // never raise the new window.
+        self.active_surface = Some(surface.clone());
+        if let Some(kb) = self.seat.get_keyboard() {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            kb.set_focus(self, Some(surface), serial);
+        }
     }
 }
 
