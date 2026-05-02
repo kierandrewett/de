@@ -179,6 +179,24 @@ impl CompositorHandler for SpikeState {
             return;
         }
 
+        // Layer-shell surface: import its DMA-BUF (if any) into the
+        // LayerInfo pixel buffer. SHM import for layer surfaces happens
+        // each frame in `refresh_layer_layout`; DMA-BUF needs to land
+        // here because the surface-keyed `dmabuf_pending` map is
+        // populated by `import_dmabuf_for_surface` above and consumed
+        // wherever the surface lives. Without this, DMA-BUF layer-shell
+        // clients (anything wgpu/Vulkan-backed) get blank panels.
+        let layer_idx = self.layer_surfaces.iter()
+            .position(|li| li.surface.wl_surface() == &root);
+        if let Some(idx) = layer_idx {
+            let pixels_arc = self.layer_surfaces[idx].pixels.clone();
+            if let Some(data) = self.dmabuf_pending.remove(&root.id()) {
+                debug!("DMA-BUF: consuming pending {}x{} pixels for layer surface", data.width, data.height);
+                *pixels_arc.lock().unwrap() = data;
+            }
+            return;
+        }
+
         let toplevel_idx = self.toplevels.iter().position(|t| t.surface == root);
         debug!("commit: surface_is_toplevel={} root_in_toplevels={}",
             surface == &root, toplevel_idx.is_some());

@@ -255,12 +255,9 @@ impl SpikeState {
 
             // Re-composite the surface tree (root + subsurfaces) into the
             // per-layer pixel buffer so the renderer can upload it as a
-            // texture this frame. The compositor commit handler bails out
-            // before reaching layer surfaces (it only handles toplevels /
-            // popups / cursor), so we drive the SHM import here. DMA-BUF
-            // layer-shell clients don't currently land here — those are
-            // imported in the commit handler keyed by surface, but layer
-            // surfaces aren't yet wired into that path.
+            // texture this frame. The commit handler now also routes
+            // DMA-BUF layer-shell clients into this same pixel buffer
+            // (keyed by surface id in `dmabuf_pending`).
             let _ = import_shm_buffer(li.surface.wl_surface(), &li.pixels);
         }
 
