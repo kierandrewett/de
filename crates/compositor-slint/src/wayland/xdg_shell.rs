@@ -1,16 +1,30 @@
 //! xdg-shell handler — toplevels, popups, configure.
+//!
+//! Initial-configure deferral: per the xdg-shell protocol the first
+//! `xdg_surface.configure` must arrive AFTER the client has had a chance to
+//! set its `app_id` / `title` / decoration mode but BEFORE it commits its
+//! first buffer. We therefore do NOT call `send_configure()` from
+//! `new_toplevel` / `new_popup`; it is deferred to the commit handler in
+//! `wayland/compositor.rs`, which checks `XdgToplevelSurfaceData::initial_configure_sent`
+//! and fires the configure on the very first commit.
 
 use std::sync::{Arc, Mutex};
 
 use smithay::{
     delegate_xdg_shell,
-    utils::SERIAL_COUNTER,
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge as XdgResizeEdge},
+        wayland_server::protocol::{wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface},
+    },
+    utils::{Serial, SERIAL_COUNTER},
     wayland::shell::xdg::{
-        PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler,
+        XdgShellState,
     },
 };
 use tracing::info;
 
+use crate::resize::ResizeEdge;
 use crate::wayland_state::{ClientSurfaceData, SpikeState, ToplevelInfo};
 
 /// Cascading window offset: each new window is placed 40px further right/down.
@@ -29,11 +43,13 @@ impl XdgShellHandler for SpikeState {
 
         info!("new xdg toplevel #{} at ({},{})", idx, x, y);
 
-        // Tell the client its initial size (content area: width × height).
+        // Pre-set the initial content size; the actual `send_configure()`
+        // is deferred to the commit handler so the client has had a chance
+        // to set app_id / title / decoration mode first (avoids a stale
+        // first round-trip and bad initial decoration negotiation).
         surface.with_pending_state(|s| {
             s.size = Some((800, 600).into());
         });
-        surface.send_configure();
 
         let wl_surface = surface.wl_surface().clone();
 
@@ -56,18 +72,14 @@ impl XdgShellHandler for SpikeState {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
-        // Track + configure the popup. Tracking it in `state.popups` lets the
-        // commit handler import the popup's pixels and `update_windows` push
-        // a PopupItem to Slint each frame so the menu actually renders.
+        // Track + pre-configure the popup. As with toplevels, the initial
+        // `send_configure()` is deferred to the commit handler so it goes
+        // out after the client has fully populated its xdg_surface state.
         let geom = positioner.get_geometry();
         surface.with_pending_state(|s| {
             s.geometry = geom;
             s.positioner = positioner;
         });
-        if let Err(e) = surface.send_configure() {
-            tracing::warn!("popup send_configure failed: {:?}", e);
-            return;
-        }
         let parent = match surface.get_parent_surface() {
             Some(p) => p,
             None => {
@@ -123,13 +135,7 @@ impl XdgShellHandler for SpikeState {
         self.popups.retain(|p| p.surface != wl);
     }
 
-    fn grab(
-        &mut self,
-        _surface: PopupSurface,
-        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
-        _serial: smithay::utils::Serial,
-    ) {
-    }
+    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
 
     fn reposition_request(
         &mut self,
@@ -141,6 +147,95 @@ impl XdgShellHandler for SpikeState {
             s.geometry = positioner.get_geometry();
         });
         surface.send_repositioned(token);
+    }
+
+    fn ack_configure(&mut self, _surface: WlSurface, _configure: Configure) {
+        // Smithay caches acknowledged configures internally; we have no
+        // resize-grab state machine on the wayland side to advance (the
+        // renderer drives configures during drags and treats the next
+        // committed buffer as confirmation). Implementing this handler at
+        // all is what stops GTK4 etc. spinning in a configure storm — the
+        // protocol just needs the trait method to be reachable.
+    }
+
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {
+        // Defer: the renderer has the pointer position + ActiveDrag
+        // machinery. It will translate this into an `ActiveDrag::Move`
+        // grab on its next iteration.
+        self.pending_xdg_move.push(surface.wl_surface().clone());
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: WlSeat,
+        _serial: Serial,
+        edges: XdgResizeEdge,
+    ) {
+        let edge = match edges {
+            XdgResizeEdge::Top => ResizeEdge::North,
+            XdgResizeEdge::Bottom => ResizeEdge::South,
+            XdgResizeEdge::Left => ResizeEdge::West,
+            XdgResizeEdge::Right => ResizeEdge::East,
+            XdgResizeEdge::TopLeft => ResizeEdge::NorthWest,
+            XdgResizeEdge::TopRight => ResizeEdge::NorthEast,
+            XdgResizeEdge::BottomLeft => ResizeEdge::SouthWest,
+            XdgResizeEdge::BottomRight => ResizeEdge::SouthEast,
+            // `None` (no edge) — protocol-spec: treat as a no-op.
+            _ => return,
+        };
+        self.pending_xdg_resize.push((surface.wl_surface().clone(), edge));
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|s| {
+            s.states.set(xdg_toplevel::State::Maximized);
+        });
+        self.pending_xdg_maximize.push((surface.wl_surface().clone(), true));
+        // Protocol requires us to always reply with a configure. If the
+        // initial configure has not been sent yet the deferred path will
+        // include the Maximized state we just set above.
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        }
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|s| {
+            s.states.unset(xdg_toplevel::State::Maximized);
+            s.size = None;
+        });
+        self.pending_xdg_maximize.push((surface.wl_surface().clone(), false));
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        }
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        surface.with_pending_state(|s| {
+            s.states.set(xdg_toplevel::State::Fullscreen);
+            s.fullscreen_output = output;
+        });
+        self.pending_xdg_fullscreen.push((surface.wl_surface().clone(), true));
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|s| {
+            s.states.unset(xdg_toplevel::State::Fullscreen);
+            s.size = None;
+            s.fullscreen_output = None;
+        });
+        self.pending_xdg_fullscreen.push((surface.wl_surface().clone(), false));
+        if surface.is_initial_configure_sent() {
+            surface.send_configure();
+        }
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        self.pending_xdg_minimize.push(surface.wl_surface().clone());
     }
 }
 

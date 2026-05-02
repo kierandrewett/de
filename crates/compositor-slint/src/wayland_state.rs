@@ -265,6 +265,24 @@ pub struct SpikeState {
     /// The WM processes these to begin close animations.
     pub destroyed_surfaces: Vec<WlSurface>,
 
+    // ── xdg-shell client requests routed to the renderer ────────────────────
+    /// Toplevel surfaces whose client called `xdg_toplevel.move`. The
+    /// renderer drains this in `process_wm_actions` and starts an
+    /// `ActiveDrag::Move` if the pointer is grabbed.
+    pub pending_xdg_move: Vec<WlSurface>,
+    /// `(surface, edge)` pairs from `xdg_toplevel.resize`.
+    pub pending_xdg_resize: Vec<(WlSurface, crate::resize::ResizeEdge)>,
+    /// `(surface, want_maximized)` from `xdg_toplevel.set_maximized` /
+    /// `unset_maximized`. The renderer applies via `WindowManager::start_maximize`
+    /// / `start_unmaximize` and replies with a configure carrying the new state.
+    pub pending_xdg_maximize: Vec<(WlSurface, bool)>,
+    /// `(surface, want_fullscreen)` from `set_fullscreen` / `unset_fullscreen`.
+    /// We treat fullscreen identically to maximize for now (no per-output
+    /// targeting yet) but report the protocol state honestly.
+    pub pending_xdg_fullscreen: Vec<(WlSurface, bool)>,
+    /// Toplevel surfaces whose client called `xdg_toplevel.set_minimized`.
+    pub pending_xdg_minimize: Vec<WlSurface>,
+
     pub should_exit: bool,
     pub pointer_pos: (f64, f64),
 
@@ -405,6 +423,11 @@ impl SpikeState {
             layer_surfaces: Vec::new(),
             client_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             destroyed_surfaces: Vec::new(),
+            pending_xdg_move: Vec::new(),
+            pending_xdg_resize: Vec::new(),
+            pending_xdg_maximize: Vec::new(),
+            pending_xdg_fullscreen: Vec::new(),
+            pending_xdg_minimize: Vec::new(),
             should_exit: false,
             pointer_pos: (0.0, 0.0),
             cursor_status: CursorImageStatus::default_named(),
