@@ -13,9 +13,18 @@
 
 use smithay::{
     delegate_compositor,
-    backend::renderer::utils::on_commit_buffer_handler,
-    reexports::wayland_server::{protocol::wl_surface::WlSurface, Client},
-    wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState},
+    backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
+    reexports::{
+        calloop::Interest,
+        wayland_server::{protocol::wl_surface::WlSurface, Client, Resource},
+    },
+    wayland::{
+        compositor::{
+            add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorClientState,
+            CompositorHandler, CompositorState, SurfaceAttributes,
+        },
+        dmabuf::get_dmabuf,
+    },
 };
 use tracing::debug;
 
@@ -31,8 +40,51 @@ impl CompositorHandler for SpikeState {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        // Mesa 24+ Vulkan WSI / explicit-sync clients may commit a DMA-BUF
+        // before the producer GPU has finished writing to it. Importing on
+        // commit without waiting samples garbage. We mirror anvil's approach:
+        // block the commit on the dmabuf's implicit acquire-fence becoming
+        // readable, then let smithay re-drive the commit via blocker_cleared.
+        add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
+            let maybe_dmabuf = with_states(surface, |surface_data| {
+                surface_data
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .pending()
+                    .buffer
+                    .as_ref()
+                    .and_then(|assignment| match assignment {
+                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
+                        _ => None,
+                    })
+            });
+            let Some(dmabuf) = maybe_dmabuf else { return };
+            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else { return };
+            let Some(client) = surface.client() else { return };
+            let res = state.loop_handle.insert_source(source, move |_, _, data| {
+                let dh = data.display_handle.clone();
+                data.client_compositor_state(&client).blocker_cleared(data, &dh);
+                Ok(())
+            });
+            if res.is_ok() {
+                add_blocker(surface, blocker);
+            }
+        });
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // If the surface's current buffer is a DMA-BUF, run the GPU readback
+        // now (the pre-commit blocker has guaranteed the acquire fence
+        // signalled). Result lands in `dmabuf_pending` keyed by surface id.
+        let dmabuf = with_renderer_surface_state(surface, |s| {
+            s.buffer().and_then(|b| get_dmabuf(b).cloned().ok())
+        }).flatten();
+        if let Some(dmabuf) = dmabuf {
+            self.import_dmabuf_for_surface(surface, &dmabuf);
+        }
 
         // Walk up the wl_subsurface parent chain. Bounded depth so a
         // malformed parent chain (would-be cycle) can't hang the wayland
@@ -94,16 +146,13 @@ impl CompositorHandler for SpikeState {
                 self.toplevels[idx].csd = true;
             }
 
-            // If SHM import produced nothing (width == 0), check DMA-BUF pending.
-            // `dmabuf_imported` stores pixel data keyed by "WxH" — we look up the
-            // first matching key that has a non-zero width.
+            // If SHM import produced nothing (width == 0), pull the
+            // surface-keyed DMA-BUF pixels populated earlier in this commit.
+            // Keying by surface id (rather than "WxH") prevents two surfaces
+            // at the same resolution from swapping each other's frames.
             if pixels_arc.lock().unwrap().width == 0 {
-                // Find any pending DMA-BUF entry (we take the first available).
-                // In practice a single client commits one buffer at a time.
-                if let Some((_key, data)) = self.dmabuf_pending.iter().find(|(_, d)| d.width > 0).map(|(k, d)| (k.clone(), d.clone())) {
+                if let Some(data) = self.dmabuf_pending.remove(&surface.id()) {
                     debug!("DMA-BUF: consuming pending {}x{} pixels for toplevel", data.width, data.height);
-                    let key = format!("{}x{}", data.width, data.height);
-                    self.dmabuf_pending.remove(&key);
                     *pixels_arc.lock().unwrap() = data;
                 }
             }

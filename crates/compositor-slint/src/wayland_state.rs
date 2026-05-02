@@ -49,9 +49,9 @@ use smithay::{
     reexports::{
         calloop::{LoopHandle, LoopSignal},
         wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
-            Client, DisplayHandle,
+            Client, DisplayHandle, Resource,
         },
     },
     utils::{Clock, Monotonic},
@@ -289,9 +289,11 @@ pub struct SpikeState {
     pub gles_renderer: Option<GlesRenderer>,
     /// Set to `true` once EGL init was attempted so we don't retry on every frame.
     pub egl_init_tried: bool,
-    /// Pending DMA-BUF pixel data keyed by "WxH" string.
-    /// Written in `dmabuf_imported`; consumed in `commit()`.
-    pub dmabuf_pending: std::collections::HashMap<String, ClientSurfaceData>,
+    /// Pending DMA-BUF pixel data keyed by the surface's `ObjectId`.
+    /// Populated by `import_dmabuf_for_surface` from the commit handler;
+    /// drained in `commit()`. Keying by surface (not "WxH") keeps two
+    /// surfaces with identical dimensions from swapping each other's frames.
+    pub dmabuf_pending: std::collections::HashMap<ObjectId, ClientSurfaceData>,
 }
 
 impl SpikeState {
@@ -466,6 +468,90 @@ impl SpikeState {
         );
         self.egl_display = Some(egl_display);
         self.gles_renderer = Some(renderer);
+    }
+
+    /// Import a DMA-BUF that has just been committed to `surface`, run the
+    /// CPU-roundtrip readback and store the resulting pixels in
+    /// `dmabuf_pending` keyed by the surface's `ObjectId`.
+    ///
+    /// Called from the commit handler — at that point the acquire-fence
+    /// pre-commit blocker (see `install_dmabuf_blocker`) guarantees the
+    /// producer GPU is done, so reading from the dmabuf is safe.
+    pub fn import_dmabuf_for_surface(&mut self, surface: &WlSurface, dmabuf: &Dmabuf) {
+        self.ensure_gles_renderer();
+
+        let renderer = match self.gles_renderer.as_mut() {
+            Some(r) => r,
+            None => {
+                warn!(planes = dmabuf.num_planes(), "DMA-BUF: no GLES renderer at commit");
+                return;
+            }
+        };
+
+        let gles_texture = match renderer.import_dmabuf(dmabuf, None) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("DMA-BUF: GLES import failed at commit ({e:?})");
+                return;
+            }
+        };
+
+        use smithay::backend::allocator::Buffer as AllocBuffer;
+        let size = dmabuf.size();
+        let (w, h) = (size.w as u32, size.h as u32);
+
+        let region = smithay::utils::Rectangle::from_loc_and_size(
+            smithay::utils::Point::from((0, 0)),
+            smithay::utils::Size::from((size.w, size.h)),
+        );
+
+        let mapping = match renderer.copy_texture(
+            &gles_texture,
+            region,
+            smithay::backend::allocator::Fourcc::Abgr8888,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("DMA-BUF: copy_texture failed ({e:?})");
+                return;
+            }
+        };
+
+        let raw = match renderer.map_texture(&mapping) {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                warn!("DMA-BUF: map_texture failed ({e:?})");
+                return;
+            }
+        };
+
+        // copy_texture with Abgr8888 gives [R, G, B, A] non-premultiplied;
+        // slint::Image::from_rgba8_premultiplied expects premultiplied.
+        let pixel_count = (w * h) as usize;
+        let mut rgba_pm = Vec::with_capacity(pixel_count * 4);
+        for chunk in raw.chunks(4) {
+            let (r, g, b, a) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+            let af = a as f32 / 255.0;
+            rgba_pm.push((r as f32 * af) as u8);
+            rgba_pm.push((g as f32 * af) as u8);
+            rgba_pm.push((b as f32 * af) as u8);
+            rgba_pm.push(a);
+        }
+
+        debug!(
+            "DMA-BUF: imported {}x{} ({} planes) for surface {:?} → {} RGBA bytes",
+            w, h, dmabuf.num_planes(), surface.id(), rgba_pm.len()
+        );
+
+        self.dmabuf_pending.insert(
+            surface.id(),
+            ClientSurfaceData {
+                pixels: rgba_pm,
+                width: w,
+                height: h,
+                dirty: true,
+            },
+        );
     }
 }
 
@@ -783,7 +869,10 @@ impl DmabufHandler for SpikeState {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // Lazily start EGL + GLES on the first DMA-BUF import.
+        // We can only validate the DMA-BUF here — the client hasn't attached
+        // it to any wl_surface yet, so we cannot store pixels keyed by
+        // surface. The actual GLES readback happens at commit time once we
+        // know the destination surface (see `import_dmabuf_for_surface`).
         self.ensure_gles_renderer();
 
         let renderer = match self.gles_renderer.as_mut() {
@@ -798,76 +887,15 @@ impl DmabufHandler for SpikeState {
             }
         };
 
-        // Stage 1: import DMA-BUF as a GLES texture via EGL image.
-        let gles_texture = match renderer.import_dmabuf(&dmabuf, None) {
-            Ok(t) => t,
+        match renderer.import_dmabuf(&dmabuf, None) {
+            Ok(_) => {
+                let _ = notifier.successful::<SpikeState>();
+            }
             Err(e) => {
                 warn!("DMA-BUF: GLES import failed ({e:?}) — client should fall back to SHM");
                 drop(notifier);
-                return;
             }
-        };
-
-        // Stage 2: read the GL texture back to CPU RAM via a PBO (glReadPixels).
-        use smithay::backend::allocator::Buffer as AllocBuffer;
-        let size = dmabuf.size();
-        let (w, h) = (size.w as u32, size.h as u32);
-
-        let region = smithay::utils::Rectangle::from_loc_and_size(
-            smithay::utils::Point::from((0, 0)),
-            smithay::utils::Size::from((size.w, size.h)),
-        );
-
-        let mapping = match renderer.copy_texture(&gles_texture, region, smithay::backend::allocator::Fourcc::Abgr8888) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("DMA-BUF: copy_texture failed ({e:?})");
-                // Texture imported but can't read back — signal success anyway so
-                // the client doesn't stall; the surface will just appear blank this frame.
-                let _ = notifier.successful::<SpikeState>();
-                return;
-            }
-        };
-
-        let raw = match renderer.map_texture(&mapping) {
-            Ok(bytes) => bytes.to_vec(),
-            Err(e) => {
-                warn!("DMA-BUF: map_texture failed ({e:?})");
-                let _ = notifier.successful::<SpikeState>();
-                return;
-            }
-        };
-
-        // `copy_texture` with Abgr8888 gives us [R, G, B, A] bytes (non-premultiplied).
-        // Convert to premultiplied RGBA8 for `slint::Image::from_rgba8_premultiplied`.
-        let pixel_count = (w * h) as usize;
-        let mut rgba_pm = Vec::with_capacity(pixel_count * 4);
-        for chunk in raw.chunks(4) {
-            let (r, g, b, a) = (chunk[0], chunk[1], chunk[2], chunk[3]);
-            let af = a as f32 / 255.0;
-            rgba_pm.push((r as f32 * af) as u8);
-            rgba_pm.push((g as f32 * af) as u8);
-            rgba_pm.push((b as f32 * af) as u8);
-            rgba_pm.push(a);
         }
-
-        // Store the pixel data.  The compositor handler will pick it up in `commit`.
-        // We key by (width, height) as a lightweight identity; the real surface
-        // match happens in commit() when we look up the ToplevelInfo.
-        debug!("DMA-BUF: imported {}x{} ({} planes) → {} RGBA bytes", w, h, dmabuf.num_planes(), rgba_pm.len());
-
-        // Signal success to the client before storing the pixels so the client
-        // can proceed to compose the next frame.
-        let _ = notifier.successful::<SpikeState>();
-
-        // Store in a temporary slot keyed by "WxH" — commit() will match by surface.
-        let key = format!("{}x{}", w, h);
-        self.dmabuf_pending.insert(key, ClientSurfaceData {
-            pixels: rgba_pm,
-            width: w,
-            height: h,
-            dirty: true,
-        });
     }
 }
 
