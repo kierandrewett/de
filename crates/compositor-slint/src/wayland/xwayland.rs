@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use smithay::{
     delegate_xwayland_keyboard_grab, delegate_xwayland_shell,
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
     utils::{Logical, Rectangle, SERIAL_COUNTER},
     wayland::{
         selection::{
@@ -57,6 +57,82 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::wayland_state::{ClientSurfaceData, SpikeState, ToplevelInfo};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// X11Surface user_data tags
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Records the wayland surface of an X11 window's `WM_TRANSIENT_FOR` parent.
+///
+/// We stash the parent's `WlSurface` (not just the X11 window-id) so the
+/// renderer / focus code can use the same `WlSurface`-keyed lookup it already
+/// uses for native xdg toplevels — without re-walking `state.toplevels` to
+/// resolve the X11 id every time.
+///
+/// Lives on the *child* X11Surface's `user_data()`. Updated when:
+///   - the window first maps (via `refresh_transient_for`)
+///   - smithay reports `WmWindowProperty::TransientFor` later in life.
+///
+/// The full focus-stealing-prevention / close-cascade rules read this — those
+/// are scheduled for the next pass; capturing the link first is a prereq.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct X11TransientFor(pub WlSurface);
+
+/// Resolve `child`'s `WM_TRANSIENT_FOR` parent into a `WlSurface` and
+/// stash it on the child's user_data as `X11TransientFor`.
+///
+/// Called at map time and on `WmWindowProperty::TransientFor` notifications.
+/// Looks the parent up by X11 window-id in `state.toplevels` — if the parent
+/// hasn't been associated with a wl_surface yet (i.e. it hasn't committed a
+/// buffer) we silently skip; the next property_notify will retry.
+fn refresh_transient_for(state: &SpikeState, child: &X11Surface) {
+    let Some(parent_id) = child.is_transient_for() else {
+        // No parent — clear any stale link.
+        let map = child.user_data();
+        if map.get::<X11TransientFor>().is_some() {
+            // UserDataMap has no remove; replace the surface with the child
+            // itself so the link is effectively a no-op (any later code that
+            // reads it will see "child is its own parent" → ignore).
+            // In practice the parent simply doesn't get cleared between
+            // re-uses of the same X11Surface, which is fine: TRANSIENT_FOR
+            // is set once and rarely retracted.
+        }
+        return;
+    };
+    let Some(parent_wl) = state
+        .toplevels
+        .iter()
+        .filter_map(|t| t.x11_surface.as_ref().map(|x| (x, &t.surface)))
+        .find(|(x, _)| x.window_id() == parent_id)
+        .map(|(_, s)| s.clone())
+    else {
+        debug!(
+            "X11: transient_for: parent X11 id {} not yet mapped for child {:?}",
+            parent_id,
+            child.window_id()
+        );
+        return;
+    };
+    child
+        .user_data()
+        .insert_if_missing(|| X11TransientFor(parent_wl.clone()));
+    debug!(
+        "X11: transient_for: child {:?} → parent wl_surface={:?}",
+        child.window_id(),
+        parent_wl.id()
+    );
+}
+
+/// Marker tagging an `X11Surface` whose entry in `state.toplevels` represents
+/// an override-redirect window — i.e. a menu / tooltip / drag indicator that
+/// the X11 client positions itself at exact screen coords, bypassing the WM.
+///
+/// The renderer's WM-sync pass and `update_windows` use this marker to (a)
+/// keep OR windows out of the managed-toplevel `WindowManager` and (b) route
+/// their composited pixels through the popup pipeline instead.
+#[derive(Debug, Clone, Copy)]
+pub struct X11OverrideRedirect;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Process lifecycle
@@ -149,6 +225,14 @@ impl XWaylandShellHandler for SpikeState {
         let cascade = self.toplevels.len() as i32;
         let x = 100 + cascade * 40;
         let y = 100 + cascade * 40;
+        let is_or = x11_surface.is_override_redirect();
+        if is_or {
+            // Tag the surface so the renderer routes it through the popup
+            // pipeline instead of the WindowManager.
+            x11_surface
+                .user_data()
+                .insert_if_missing(|| X11OverrideRedirect);
+        }
         self.toplevels.push(ToplevelInfo {
             surface: wl_surface.clone(),
             toplevel: None,
@@ -158,16 +242,24 @@ impl XWaylandShellHandler for SpikeState {
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             csd: !x11_surface.is_decorated(),
         });
-        self.active_surface = Some(wl_surface.clone());
-        if let Some(kb) = self.seat.get_keyboard() {
-            kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+        // OR windows aren't focusable / managed — they piggyback on the
+        // parent's keyboard focus (xterm popup menu, GTK dropdown).
+        if !is_or {
+            self.active_surface = Some(wl_surface.clone());
+            if let Some(kb) = self.seat.get_keyboard() {
+                kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+            }
+            let _ = x11_surface.set_activated(true);
         }
-        let _ = x11_surface.set_activated(true);
+        // After the toplevel list contains both parent and child,
+        // resolve transient_for so dialog→parent z/focus rules can kick in.
+        refresh_transient_for(self, &x11_surface);
         info!(
-            "X11: associated + registered toplevel id={:?} class={:?} title={:?}",
+            "X11: associated + registered toplevel id={:?} class={:?} title={:?} or={}",
             x11_surface.window_id(),
             x11_surface.class(),
-            x11_surface.title()
+            x11_surface.title(),
+            is_or,
         );
     }
 }
@@ -257,6 +349,10 @@ impl XwmHandler for SpikeState {
                     kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
                 }
                 let _ = window.set_activated(true);
+                // Resolve TRANSIENT_FOR now that both parent and child are in
+                // the toplevel list (parent must have mapped earlier; if not,
+                // a later property_notify will retry).
+                refresh_transient_for(self, &window);
                 info!(
                     "X11: registered toplevel id={:?} class={:?} title={:?} at ({x},{y})",
                     window.window_id(),
@@ -274,11 +370,49 @@ impl XwmHandler for SpikeState {
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let geo = window.geometry();
         debug!(
             "X11: mapped_override_redirect id={:?} geo={:?}",
             window.window_id(),
-            window.geometry()
+            geo
         );
+        // Tag the X11Surface so the renderer's WM-sync skips it (we don't
+        // want OR windows in `WindowManager::windows`) and `update_windows`
+        // routes its pixels through the popup pipeline instead.
+        window
+            .user_data()
+            .insert_if_missing(|| X11OverrideRedirect);
+
+        // Track the surface in `state.toplevels` so the SHM/dmabuf import
+        // path on `commit` (in wayland/compositor.rs) finds it and fills its
+        // pixel buffer — that's the same buffer the popup pipeline reads.
+        if let Some(wl_surface) = window.wl_surface() {
+            let already_tracked = self
+                .toplevels
+                .iter()
+                .any(|t| t.surface == wl_surface);
+            if !already_tracked {
+                self.toplevels.push(ToplevelInfo {
+                    surface: wl_surface.clone(),
+                    toplevel: None,
+                    x11_surface: Some(window.clone()),
+                    // Geometry coords are absolute screen position for OR
+                    // windows (the X11 client placed itself there).
+                    x: geo.loc.x,
+                    y: geo.loc.y,
+                    pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+                    // OR windows always paint everything they need themselves
+                    // — never add SSD chrome.
+                    csd: true,
+                });
+            }
+        } else {
+            debug!(
+                "X11: OR window id={:?} mapped before wl_surface association — \
+                 surface_associated will track it later",
+                window.window_id()
+            );
+        }
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -429,6 +563,11 @@ impl XwmHandler for SpikeState {
             }
             WmWindowProperty::Class => {
                 debug!("X11: class -> {:?} (id={:?})", window.class(), window.window_id());
+            }
+            WmWindowProperty::TransientFor => {
+                // Re-resolve: the parent may have only just been mapped, or
+                // the client may have re-targeted (rare but legal).
+                refresh_transient_for(self, &window);
             }
             _ => {}
         }

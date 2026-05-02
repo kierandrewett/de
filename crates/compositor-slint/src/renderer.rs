@@ -1164,6 +1164,18 @@ impl CompositorApp {
         }
         let mut metas: Vec<ToplevelMeta> = Vec::with_capacity(state.toplevels.len());
         for (i, tl) in state.toplevels.iter().enumerate() {
+            // Override-redirect X11 windows live in `state.toplevels` so the
+            // SHM/dmabuf import path fills their pixel buffer, but they're
+            // routed through the popup pipeline (built later in this fn) —
+            // skip the WM/CSD bookkeeping for them.
+            if tl
+                .x11_surface
+                .as_ref()
+                .map(|x| x.user_data().get::<crate::wayland::xwayland::X11OverrideRedirect>().is_some())
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let (gx_xdg, gy_xdg, gw_xdg, gh_xdg, app_id) = with_states(&tl.surface, |states| {
                 let mut guard = states.cached_state.get::<SurfaceCachedState>();
                 let geom = guard.current().geometry
@@ -1507,6 +1519,51 @@ impl CompositorApp {
             });
         }
 
+        // ── X11 override-redirect windows (menus / tooltips / drag indicators)
+        //     piggyback on the popup pipeline. They're tracked in
+        //     `state.toplevels` so SHM/dmabuf import lands in `tl.pixels`,
+        //     positioned at absolute screen coords by the X11 client itself
+        //     (we re-read X11Surface::geometry every frame because the client
+        //     can move them at any time without a configure round-trip).
+        //
+        //     IDs use a high offset to avoid collision with xdg_popup ids
+        //     (which are indices into `state.popups`, well below 1<<20).
+        const X11_OR_ID_BASE: i32 = 1 << 20;
+        for (oi, tl) in state.toplevels.iter().enumerate() {
+            let Some(x11) = tl.x11_surface.as_ref() else { continue };
+            if x11
+                .user_data()
+                .get::<crate::wayland::xwayland::X11OverrideRedirect>()
+                .is_none()
+            {
+                continue;
+            }
+            let (bw, bh, has_pixels) = {
+                let p = tl.pixels.lock().unwrap();
+                (p.width as i32, p.height as i32, p.width > 0)
+            };
+            if !has_pixels {
+                continue;
+            }
+            let geo = x11.geometry();
+            let p = tl.pixels.lock().unwrap();
+            let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                &p.pixels, p.width, p.height,
+            );
+            let texture = slint::Image::from_rgba8_premultiplied(pixel_buf);
+            drop(p);
+            let w = if geo.size.w > 0 { geo.size.w } else { bw };
+            let h = if geo.size.h > 0 { geo.size.h } else { bh };
+            popup_items.push(crate::PopupItem {
+                id: X11_OR_ID_BASE + oi as i32,
+                x: geo.loc.x,
+                y: geo.loc.y,
+                w,
+                h,
+                texture,
+            });
+        }
+
         // In-place diff for popups (same pattern as windows): keep order;
         // remove rows whose id disappeared; update existing; insert new.
         let pmodel = &self.popups_model;
@@ -1684,7 +1741,17 @@ impl CompositorApp {
         };
         for id in minimize_ids {
             info!("WM: minimize-window({})", id);
+            let surface = self
+                .wm
+                .windows
+                .values()
+                .find(|w| w.id == id)
+                .map(|w| w.surface.clone());
             self.wm.minimize_by_id(id);
+            // Mirror to X11 so xwayland clients learn they're now hidden.
+            if let Some(surf) = surface {
+                self.sync_x11_window_state(&surf, state, None, None, Some(true));
+            }
             self.update_focused_surface(state);
         }
 
@@ -1701,11 +1768,19 @@ impl CompositorApp {
                 .find(|w| w.id == id)
                 .map(|w| (w.w, w.h))
                 .unwrap_or((800, 600));
-            let surface = self.wm.windows.values()
+            let (surface, now_max) = self
+                .wm
+                .windows
+                .values()
                 .find(|w| w.id == id)
-                .map(|w| w.surface.clone());
+                .map(|w| (w.surface.clone(), w.maximized))
+                .map(|(s, m)| (Some(s), m))
+                .unwrap_or((None, false));
             if let Some(surf) = surface {
                 self.send_configure(&surf, new_w, new_h, state);
+                // Mirror to X11. We don't try to gate on "is this an X11
+                // window" — the helper does that and is a no-op otherwise.
+                self.sync_x11_window_state(&surf, state, Some(now_max), None, None);
             }
         }
 
@@ -1897,6 +1972,45 @@ impl CompositorApp {
             if let Some(kb) = state.seat.get_keyboard() {
                 kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
             }
+        }
+    }
+
+    /// Mirror a WM-driven maximize/fullscreen/minimize toggle back to the
+    /// X11Surface so xwayland-backed clients see consistent state.
+    ///
+    /// `pending_xdg_*` queues already cover the *client*-initiated path (the
+    /// X11 client asked to maximise → we propagated to the WM). This helper
+    /// covers the other direction — when the user double-clicks our title
+    /// bar, alt-drags into a snap, or hits the dock "minimise" — so the X11
+    /// client doesn't end up with stale `_NET_WM_STATE_MAXIMIZED` flags.
+    ///
+    /// All three `set_*` calls are no-ops on native wayland toplevels (we
+    /// just skip them) — we never modify protocol state from here, only the
+    /// X11-side bookkeeping.
+    fn sync_x11_window_state(
+        &self,
+        surface: &WlSurface,
+        state: &SpikeState,
+        maximized: Option<bool>,
+        fullscreen: Option<bool>,
+        hidden: Option<bool>,
+    ) {
+        let Some(x11) = state
+            .toplevels
+            .iter()
+            .find(|t| &t.surface == surface)
+            .and_then(|t| t.x11_surface.clone())
+        else {
+            return;
+        };
+        if let Some(v) = maximized {
+            let _ = x11.set_maximized(v);
+        }
+        if let Some(v) = fullscreen {
+            let _ = x11.set_fullscreen(v);
+        }
+        if let Some(v) = hidden {
+            let _ = x11.set_hidden(v);
         }
     }
 
@@ -2398,6 +2512,12 @@ impl CompositorApp {
                                         );
                                         toplevel.send_configure();
                                     }
+                                    // X11 clients won't see the unmaximize via
+                                    // xdg_toplevel.configure — push the state
+                                    // change to them directly.
+                                    self.sync_x11_window_state(
+                                        &surface, state, Some(false), None, None,
+                                    );
                                     if let Some(ActiveDrag::Move { offset_x, offset_y, pending_unmaximize, .. })
                                         = &mut self.active_drag
                                     {
@@ -3896,6 +4016,19 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
 
     // Register new toplevels.
     for toplevel in &state.toplevels {
+        // OR windows are popup-like and never managed by the WM.
+        if toplevel
+            .x11_surface
+            .as_ref()
+            .map(|x| {
+                x.user_data()
+                    .get::<crate::wayland::xwayland::X11OverrideRedirect>()
+                    .is_some()
+            })
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let key = toplevel.surface.id().protocol_id() as usize;
         if !wm.windows.contains_key(&key) {
             // Register the toplevel with the WM (starts open animation).
