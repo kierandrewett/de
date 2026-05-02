@@ -311,35 +311,69 @@ impl XwmHandler for SpikeState {
         _xwm: XwmId,
         window: X11Surface,
         _button: u32,
-        _edges: X11ResizeEdge,
+        edges: X11ResizeEdge,
     ) {
-        // TODO: route to WindowManager resize machinery (PointerResizeGrab).
-        debug!("X11: resize_request id={:?}", window.window_id());
+        debug!("X11: resize_request id={:?} edges={:?}", window.window_id(), edges);
+        if let Some(wl_surface) = window.wl_surface() {
+            // Map the X11 resize edge to our internal `ResizeEdge`. The bit
+            // values aren't identical between protocols but the semantics are.
+            use crate::resize::ResizeEdge as RE;
+            let our_edges = match edges {
+                X11ResizeEdge::Top => RE::North,
+                X11ResizeEdge::Bottom => RE::South,
+                X11ResizeEdge::Left => RE::West,
+                X11ResizeEdge::Right => RE::East,
+                X11ResizeEdge::TopLeft => RE::NorthWest,
+                X11ResizeEdge::TopRight => RE::NorthEast,
+                X11ResizeEdge::BottomLeft => RE::SouthWest,
+                X11ResizeEdge::BottomRight => RE::SouthEast,
+            };
+            self.pending_xdg_resize.push((wl_surface, our_edges));
+        }
     }
 
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
-        // TODO: route to WindowManager move machinery (PointerMoveGrab).
         debug!("X11: move_request id={:?}", window.window_id());
+        if let Some(wl_surface) = window.wl_surface() {
+            self.pending_xdg_move.push(wl_surface);
+        }
     }
 
     fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Push the WM action onto the same queue xdg-shell uses so the
+        // renderer-side `WindowManager::start_maximize` is invoked.
         let _ = window.set_maximized(true);
+        if let Some(wl_surface) = window.wl_surface() {
+            self.pending_xdg_maximize.push((wl_surface, true));
+        }
     }
 
     fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_maximized(false);
+        if let Some(wl_surface) = window.wl_surface() {
+            self.pending_xdg_maximize.push((wl_surface, false));
+        }
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_fullscreen(true);
+        if let Some(wl_surface) = window.wl_surface() {
+            self.pending_xdg_fullscreen.push((wl_surface, true));
+        }
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_fullscreen(false);
+        if let Some(wl_surface) = window.wl_surface() {
+            self.pending_xdg_fullscreen.push((wl_surface, false));
+        }
     }
 
     fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_hidden(true);
+        if let Some(wl_surface) = window.wl_surface() {
+            self.pending_xdg_minimize.push(wl_surface);
+        }
     }
 
     fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
