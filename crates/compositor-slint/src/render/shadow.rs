@@ -13,7 +13,6 @@ use wgpu;
 
 use super::common::{
     blend_src_over_premul, make_pipeline, ChromeUniforms, Shared,
-    UNIFORM_STRIDE,
 };
 
 const SHADER_SRC: &str = include_str!("../../shaders/shadow.wgsl");
@@ -273,13 +272,3 @@ pub fn uniforms_for_layer(
     }
 }
 
-/// Drop-call descriptor for one shadow layer the coordinator needs to render.
-pub struct ShadowDraw {
-    pub uniforms:        ChromeUniforms,
-    pub dynamic_offset:  u32,
-}
-
-/// Compute the dynamic-buffer slot index → byte offset.
-pub fn slot_offset(slot: u32) -> u32 {
-    (slot as u64 * UNIFORM_STRIDE) as u32
-}
