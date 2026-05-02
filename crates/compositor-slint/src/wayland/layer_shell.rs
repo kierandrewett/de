@@ -14,6 +14,8 @@
 //!   `state.exclusive_keyboard_layer()` — the topmost layer surface (Top or
 //!       Overlay) requesting `Exclusive` keyboard focus, if any.
 
+use std::sync::{Arc, Mutex};
+
 use smithay::{
     delegate_layer_shell,
     reexports::wayland_server::protocol::{wl_output, wl_surface::WlSurface},
@@ -24,7 +26,7 @@ use smithay::{
 };
 use tracing::{info, trace};
 
-use crate::wayland_state::SpikeState;
+use crate::wayland_state::{import_shm_buffer, ClientSurfaceData, SpikeState};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public data exposed to the render side
@@ -64,6 +66,11 @@ pub struct LayerInfo {
     pub y: i32,
     pub w: i32,
     pub h: i32,
+
+    /// Composited pixel buffer for the layer surface tree. Refreshed each
+    /// frame from `refresh_layer_layout` via `import_shm_buffer`. The
+    /// renderer reads it to populate the Slint `layers` model.
+    pub pixels: Arc<Mutex<ClientSurfaceData>>,
 }
 
 impl LayerInfo {
@@ -124,6 +131,7 @@ impl WlrLayerShellHandler for SpikeState {
             y: 0,
             w: 0,
             h: 0,
+            pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
         });
     }
 
@@ -244,6 +252,16 @@ impl SpikeState {
             // Cached `layer` may have been updated by a v2 set_layer request;
             // mirror that so we route z-order and reserved-zone math correctly.
             li.layer = cached.layer;
+
+            // Re-composite the surface tree (root + subsurfaces) into the
+            // per-layer pixel buffer so the renderer can upload it as a
+            // texture this frame. The compositor commit handler bails out
+            // before reaching layer surfaces (it only handles toplevels /
+            // popups / cursor), so we drive the SHM import here. DMA-BUF
+            // layer-shell clients don't currently land here — those are
+            // imported in the commit handler keyed by surface, but layer
+            // surfaces aren't yet wired into that path.
+            let _ = import_shm_buffer(li.surface.wl_surface(), &li.pixels);
         }
 
         // Two-pass arrange.

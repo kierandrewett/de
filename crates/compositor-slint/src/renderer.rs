@@ -3530,9 +3530,45 @@ pub fn run() -> Result<()> {
         // Re-read each layer surface's cached anchor / margin / exclusive_zone
         // and recompute its compositor-space rect. Forward the per-edge
         // exclusive-zone reservation to the WM so toplevels avoid panel/dock.
+        // Then publish the layer surfaces to Slint so Compositor.slint's
+        // background+bottom and top+overlay LayerSurface repeaters render
+        // them at the right rect.
         state.refresh_layer_layout(app.wm.output_w, app.wm.output_h);
         let reserved = state.reserved_zones();
         app.wm.set_reserved_zones(reserved.top, reserved.bottom, reserved.left, reserved.right);
+        if let Some(ui) = app.ui.as_ref() {
+            use smithay::reexports::wayland_server::Resource;
+            use smithay::wayland::shell::wlr_layer::Layer;
+            let mut items: Vec<crate::LayerItem> = Vec::with_capacity(state.layer_surfaces.len());
+            for li in &state.layer_surfaces {
+                let pix = li.pixels.lock().unwrap();
+                if pix.width == 0 || pix.height == 0 || li.w <= 0 || li.h <= 0 {
+                    continue;
+                }
+                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                    &pix.pixels, pix.width, pix.height,
+                );
+                drop(pix);
+                let surface = slint::Image::from_rgba8_premultiplied(buf);
+                let ordinal: i32 = match li.layer {
+                    Layer::Background => 0,
+                    Layer::Bottom => 1,
+                    Layer::Top => 2,
+                    Layer::Overlay => 3,
+                };
+                items.push(crate::LayerItem {
+                    id: li.surface.wl_surface().id().protocol_id() as i32,
+                    surface,
+                    x: li.x,
+                    y: li.y,
+                    w: li.w,
+                    h: li.h,
+                    layer_ordinal: ordinal,
+                });
+            }
+            let model = std::rc::Rc::new(VecModel::from(items));
+            ui.set_layers(slint::ModelRc::from(model));
+        }
         // ── END layer-shell layout block ───────────────────────────────────
 
         // Visibility gate: only frame-callback surfaces the renderer
