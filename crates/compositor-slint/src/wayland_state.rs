@@ -311,9 +311,14 @@ pub struct SpikeState {
     /// Set by `WaylandDndGrabHandler::dnd_requested` when the client supplies
     /// an icon, cleared in `DndGrabHandler::dropped` / `cancelled`. The
     /// renderer composites this surface under the cursor while a DnD is
-    /// active. TODO(renderer): pick this up in the per-frame compose pass
-    /// (see `update_windows`) and draw the icon at `pointer_pos`.
+    /// active.
     pub dnd_icon: Option<WlSurface>,
+
+    /// Composited pixel buffer for the active DnD icon surface. Populated by
+    /// the commit handler each time the icon surface commits (matches the
+    /// `cursor_surface_pixels` pattern). The renderer reads this in
+    /// `update_windows` and blits it onto `final_tex` under the cursor.
+    pub dnd_icon_pixels: Arc<Mutex<ClientSurfaceData>>,
 
     /// All mapped toplevels (multi-window support, insertion-ordered).
     pub toplevels: Vec<ToplevelInfo>,
@@ -507,6 +512,7 @@ impl SpikeState {
             output: None,
             active_surface: None,
             dnd_icon: None,
+            dnd_icon_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             toplevels: Vec::new(),
             popups: Vec::new(),
             layer_surfaces: Vec::new(),
@@ -1107,10 +1113,14 @@ impl DndGrabHandler for SpikeState {
         _location: Point<f64, Logical>,
     ) {
         self.dnd_icon = None;
+        // Clear stale icon pixels so a subsequent drag without an icon doesn't
+        // briefly draw the previous icon under the cursor.
+        *self.dnd_icon_pixels.lock().unwrap() = ClientSurfaceData::default();
     }
 
     fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
         self.dnd_icon = None;
+        *self.dnd_icon_pixels.lock().unwrap() = ClientSurfaceData::default();
     }
 }
 

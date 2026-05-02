@@ -167,6 +167,18 @@ impl CompositorHandler for SpikeState {
             }
         }
 
+        // Same idea for the active DnD icon surface — clients commit pixels
+        // to it like any other surface but we route into a dedicated buffer
+        // because it's a transient overlay drawn by the renderer under the
+        // cursor, not a window the WM tracks.
+        if let Some(icon_surf) = self.dnd_icon.clone() {
+            if icon_surf == *surface || icon_surf == root {
+                let pixels = self.dnd_icon_pixels.clone();
+                let _ = import_shm_buffer(&icon_surf, &pixels);
+                return;
+            }
+        }
+
         // If `root` is a popup surface (or `surface` itself is a popup that
         // has no wl_subsurface parent), import for the popup's pixel buffer
         // and bail before falling through to toplevel handling.

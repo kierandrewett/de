@@ -297,6 +297,26 @@ struct CompositorApp {
     /// We can't fire `presented` from inside `render_frame` directly because
     /// SpikeState isn't reachable there.
     last_present_time: Option<smithay::utils::Time<smithay::utils::Monotonic>>,
+
+    /// Snapshot of the active DnD icon's pixels + cursor pos. Refreshed each
+    /// `update_windows` (where we have `state`); consumed by `render_frame`
+    /// (which doesn't). `None` when no DnD is active or the icon hasn't yet
+    /// committed pixels.
+    dnd_icon_snapshot: Option<DndIconSnapshot>,
+}
+
+/// Per-frame snapshot of the active DnD icon's drawing parameters.
+#[derive(Clone)]
+struct DndIconSnapshot {
+    /// Premultiplied-alpha RGBA8 pixels, tightly packed (width * 4 bytes/row).
+    pixels: Vec<u8>,
+    /// Buffer dimensions in pixels.
+    width: u32,
+    height: u32,
+    /// Cursor position in LOGICAL pixels (matches what slint/WM use). Converted
+    /// to physical when blitting onto `final_tex`.
+    cursor_x: f64,
+    cursor_y: f64,
 }
 
 impl CompositorApp {
@@ -352,6 +372,7 @@ impl CompositorApp {
             pending_snap: None,
             pending_ipc: Arc::new(Mutex::new(Vec::new())),
             last_present_time: None,
+            dnd_icon_snapshot: None,
         }
     }
 
@@ -988,6 +1009,56 @@ impl CompositorApp {
                 }
             }
 
+            // Step 2c — DnD icon: write the icon surface's pixels straight
+            // into final_tex on top of the composited scene at the cursor
+            // position. We use queue.write_texture (no alpha blending) so
+            // translucent icon pixels render as opaque on the icon's
+            // bounding rect — acceptable v1; a textured-quad blend pass can
+            // replace this without touching the wayland_state side.
+            if let Some(snap) = self.dnd_icon_snapshot.as_ref() {
+                let s = self.scale_factor;
+                let cx_phys = (snap.cursor_x as f32 * s).round() as i32;
+                let cy_phys = (snap.cursor_y as f32 * s).round() as i32;
+                // Clip the icon rect to final_tex bounds. Origin (0, 0)
+                // hotspot — anvil uses an offset stored in DndIcon, which
+                // is updated by the wl_surface offset event; we don't track
+                // that yet so the icon's top-left sits at the cursor.
+                let icon_w = snap.width as i32;
+                let icon_h = snap.height as i32;
+                let dst_x0 = cx_phys.max(0);
+                let dst_y0 = cy_phys.max(0);
+                let dst_x1 = (cx_phys + icon_w).min(w as i32).max(dst_x0);
+                let dst_y1 = (cy_phys + icon_h).min(h as i32).max(dst_y0);
+                let copy_w = (dst_x1 - dst_x0) as u32;
+                let copy_h = (dst_y1 - dst_y0) as u32;
+                if copy_w > 0 && copy_h > 0 {
+                    // Source-rect offset accounts for clipping at the left/top edge.
+                    let src_x = (dst_x0 - cx_phys) as u32;
+                    let src_y = (dst_y0 - cy_phys) as u32;
+                    let bytes_per_row = snap.width * 4;
+                    let offset = (src_y * bytes_per_row + src_x * 4) as usize;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: final_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: dst_x0 as u32,
+                                y: dst_y0 as u32,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &snap.pixels[offset..],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: Some(snap.height),
+                        },
+                        wgpu::Extent3d { width: copy_w, height: copy_h, depth_or_array_layers: 1 },
+                    );
+                }
+            }
+
             // Step 3 — final_tex → swapchain.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -1500,6 +1571,35 @@ impl CompositorApp {
             self.update_windows(state);
             if any_dirty {
                 debug!("SHM client texture updated → windows property refreshed");
+            }
+        }
+
+        // Refresh the DnD icon snapshot every loop. The icon surface is
+        // committed by the source client at the same cadence as any other
+        // surface; we mirror its pixels into a renderer-side buffer here
+        // because `render_frame` runs without `state` access. Force a
+        // redraw whenever the icon is actively drawn so cursor motion
+        // updates the on-screen position without waiting for slint dirty.
+        let prev_active = self.dnd_icon_snapshot.is_some();
+        self.dnd_icon_snapshot = if state.dnd_icon.is_some() {
+            let p = state.dnd_icon_pixels.lock().unwrap();
+            if p.width > 0 && p.height > 0 {
+                Some(DndIconSnapshot {
+                    pixels: p.pixels.clone(),
+                    width: p.width,
+                    height: p.height,
+                    cursor_x: state.pointer_pos.0,
+                    cursor_y: state.pointer_pos.1,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if self.dnd_icon_snapshot.is_some() || prev_active {
+            if let Some(gpu_window) = self.gpu_window.as_ref() {
+                gpu_window.mark_dirty();
             }
         }
     }
