@@ -3399,7 +3399,36 @@ pub fn run() -> Result<()> {
 
         if state.should_exit { break; }
 
-        state.send_frame_callbacks(&output);
+        // Visibility gate: only frame-callback surfaces the renderer
+        // actually consumed this frame. Anvil derives this from the damage
+        // tracker's RenderOutputResult.states; we don't run a damage
+        // tracker yet, so the cheapest correct gate is "windows the WM
+        // considers mapped + non-minimised + non-closing AND with a
+        // non-zero client buffer", plus all layer surfaces (always
+        // visible if mapped). Without this gate every mapped client gets
+        // driven at full output framerate even when invisible.
+        let mut visible_surfaces: Vec<WlSurface> = Vec::with_capacity(
+            app.wm.windows.len() + state.layer_surfaces.len()
+        );
+        for win in app.wm.windows_sorted() {
+            if win.minimized || win.closing { continue; }
+            // Look up the toplevel's pixel buffer to skip windows that
+            // haven't committed any frame yet (zero-sized buffer = nothing
+            // to present, so nothing for the client to react to).
+            if let Some(tl) = state.toplevels.iter().find(|t| t.surface == win.surface) {
+                let (bw, bh) = {
+                    let p = tl.pixels.lock().unwrap();
+                    (p.width, p.height)
+                };
+                if bw == 0 || bh == 0 { continue; }
+                visible_surfaces.push(tl.surface.clone());
+            }
+        }
+        for li in &state.layer_surfaces {
+            visible_surfaces.push(li.surface.wl_surface().clone());
+        }
+
+        state.send_frame_callbacks_for(&output, &visible_surfaces);
         state.pre_render_drive_clients();
 
         state.display_handle.flush_clients().ok();

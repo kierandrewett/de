@@ -30,26 +30,27 @@ delegate_commit_timing!(SpikeState);
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl SpikeState {
-    /// Send wl_surface.frame callbacks to ALL mapped toplevels + layer
-    /// surfaces. Must be called once per rendered frame. Unfocused windows
-    /// also need callbacks — clients like simple-shm gate their next commit
-    /// on the previous frame callback, so skipping them freezes their
-    /// rendering the moment focus moves elsewhere.
-    pub fn send_frame_callbacks(&self, output: &Output) {
+    /// Send wl_surface.frame callbacks to the supplied list of root surfaces.
+    ///
+    /// The renderer is the only thing that knows which surfaces it actually
+    /// composited this frame (i.e. which windows are NOT minimised, NOT
+    /// in their close-settle phase, AND have a non-zero buffer). Walking the
+    /// full `toplevels` list here would fire frame callbacks on invisible
+    /// clients and drive them at full output framerate even when nothing
+    /// they render reaches the screen — battery + idle CPU win is material.
+    pub fn send_frame_callbacks_for(&self, output: &Output, surfaces: &[WlSurface]) {
         use smithay::desktop::utils::send_frames_surface_tree;
         use std::time::Duration;
 
         let time: Duration = self.clock.now().into();
 
-        let mut surfaces: Vec<WlSurface> = Vec::new();
-        for tl in &self.toplevels {
-            surfaces.push(tl.surface.clone());
-        }
-        for li in &self.layer_surfaces {
-            surfaces.push(li.surface.wl_surface().clone());
-        }
-
-        for surface in &surfaces {
+        for surface in surfaces {
+            // The closure unconditionally returns `Some(output)`: we treat
+            // every surface in this list as on-output since the renderer
+            // already filtered for visibility before passing it in.
+            // Throttle of 1s lets clients with no recently-sent callback
+            // still receive one even if they momentarily fail the visibility
+            // gate (e.g. mid-resize buffer-size dip to zero).
             send_frames_surface_tree(
                 surface,
                 output,
@@ -59,7 +60,7 @@ impl SpikeState {
             );
         }
 
-        debug!("send_frame_callbacks: sent to {} surfaces", surfaces.len());
+        debug!("send_frame_callbacks_for: sent to {} surfaces", surfaces.len());
     }
 
     /// Signal wp_fifo barriers and drain blocked transaction queues.
