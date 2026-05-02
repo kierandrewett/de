@@ -128,6 +128,48 @@ impl XWaylandShellHandler for SpikeState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
     }
+
+    fn surface_associated(
+        &mut self,
+        _xwm: XwmId,
+        wl_surface: WlSurface,
+        x11_surface: X11Surface,
+    ) {
+        // The wl_surface for this X11 window has just been resolved. If we
+        // saw `map_window_request` first (no wl_surface available) we
+        // never registered the toplevel; do it now.
+        let already_tracked = self.toplevels.iter().any(|t| t.surface == wl_surface);
+        if already_tracked {
+            return;
+        }
+        if !x11_surface.is_mapped() {
+            return;
+        }
+
+        let cascade = self.toplevels.len() as i32;
+        let x = 100 + cascade * 40;
+        let y = 100 + cascade * 40;
+        self.toplevels.push(ToplevelInfo {
+            surface: wl_surface.clone(),
+            toplevel: None,
+            x11_surface: Some(x11_surface.clone()),
+            x,
+            y,
+            pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            csd: !x11_surface.is_decorated(),
+        });
+        self.active_surface = Some(wl_surface.clone());
+        if let Some(kb) = self.seat.get_keyboard() {
+            kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+        }
+        let _ = x11_surface.set_activated(true);
+        info!(
+            "X11: associated + registered toplevel id={:?} class={:?} title={:?}",
+            x11_surface.window_id(),
+            x11_surface.class(),
+            x11_surface.title()
+        );
+    }
 }
 
 delegate_xwayland_shell!(SpikeState);
