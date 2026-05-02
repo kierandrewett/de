@@ -24,8 +24,10 @@
 //!   * Watcher service registers on the session bus.
 //!   * Items are tracked by `(service_name, object_path)`.
 //!   * Item Title is read once at registration.
-//!   * Click/right-click activation are stubbed (TODO: call Activate /
-//!     ContextMenu / fetch DBusMenu).
+//!   * Left-click → `Activate(x, y)` (`activate()` worker fn).
+//!   * Right-click → `ContextMenu(x, y)` (`context_menu()` worker fn).
+//!   * DBusMenu fetch + popup rendering not yet wired (clients open
+//!     their own popup in response to ContextMenu for now).
 
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
