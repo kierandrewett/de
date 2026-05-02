@@ -52,6 +52,7 @@ mod backdrop;
 mod ipc_server;
 mod tray;
 mod render;
+mod screencopy;
 pub mod wm;
 
 fn main() -> Result<()> {

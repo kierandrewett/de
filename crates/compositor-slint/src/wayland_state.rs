@@ -282,11 +282,15 @@ pub struct SpikeState {
     /// `capture_constraints` can recover the size/format on demand.
     pub output_capture_source_state: OutputCaptureSourceState,
     /// Backs `ext-image-copy-capture-manager-v1` — manages capture sessions
-    /// and frames. We currently fail every frame request via
-    /// `frame.fail(Unknown)` since wgpu-side framebuffer readback is not
-    /// wired yet, but the global must still bind so `grim` /
-    /// `xdg-desktop-portal-wlr` / OBS don't error out at startup.
+    /// and frames. The actual readback runs from the renderer after each
+    /// `render_frame`, draining `pending_capture_frames` below.
     pub image_copy_capture_state: ImageCopyCaptureState,
+    /// Frames whose capture has been requested but not yet serviced. The
+    /// `frame()` handler enqueues them (instead of doing readback inline,
+    /// which would need the renderer's wgpu device + final_tex); the main
+    /// loop drains them after `render_frame` and performs a sync GPU
+    /// readback into each frame's wl_buffer.
+    pub pending_capture_frames: Vec<Frame>,
 
     // ── XWayland ─────────────────────────────────────────────────────────
     /// The xwayland_shell_v1 global state — needed for the Xwayland process to
@@ -311,9 +315,14 @@ pub struct SpikeState {
     /// Set by `WaylandDndGrabHandler::dnd_requested` when the client supplies
     /// an icon, cleared in `DndGrabHandler::dropped` / `cancelled`. The
     /// renderer composites this surface under the cursor while a DnD is
-    /// active. TODO(renderer): pick this up in the per-frame compose pass
-    /// (see `update_windows`) and draw the icon at `pointer_pos`.
+    /// active.
     pub dnd_icon: Option<WlSurface>,
+
+    /// Composited pixel buffer for the active DnD icon surface. Populated by
+    /// the commit handler each time the icon surface commits (matches the
+    /// `cursor_surface_pixels` pattern). The renderer reads this in
+    /// `update_windows` and blits it onto `final_tex` under the cursor.
+    pub dnd_icon_pixels: Arc<Mutex<ClientSurfaceData>>,
 
     /// All mapped toplevels (multi-window support, insertion-ordered).
     pub toplevels: Vec<ToplevelInfo>,
@@ -501,12 +510,14 @@ impl SpikeState {
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
+            pending_capture_frames: Vec::new(),
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
             output: None,
             active_surface: None,
             dnd_icon: None,
+            dnd_icon_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             toplevels: Vec::new(),
             popups: Vec::new(),
             layer_surfaces: Vec::new(),
@@ -1107,10 +1118,14 @@ impl DndGrabHandler for SpikeState {
         _location: Point<f64, Logical>,
     ) {
         self.dnd_icon = None;
+        // Clear stale icon pixels so a subsequent drag without an icon doesn't
+        // briefly draw the previous icon under the cursor.
+        *self.dnd_icon_pixels.lock().unwrap() = ClientSurfaceData::default();
     }
 
     fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
         self.dnd_icon = None;
+        *self.dnd_icon_pixels.lock().unwrap() = ClientSurfaceData::default();
     }
 }
 
@@ -1213,9 +1228,10 @@ impl ImageCopyCaptureHandler for SpikeState {
     fn new_session(&mut self, _session: Session) {}
 
     fn frame(&mut self, _session: &SessionRef, frame: Frame) {
-        // Stub: framebuffer readback isn't wired yet, fail gracefully so
-        // clients see a defined error rather than a hung capture.
-        frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+        // Defer: the wgpu device + final_tex live in the renderer, not on
+        // SpikeState. The main loop drains this vec right after each
+        // `render_frame` so the readback samples the just-presented frame.
+        self.pending_capture_frames.push(frame);
     }
 }
 
