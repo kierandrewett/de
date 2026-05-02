@@ -11,6 +11,7 @@ pub mod input;
 pub mod layer_shell;
 pub mod misc;
 pub mod outputs;
+pub mod presentation;
 pub mod scaling;
 pub mod session_lock;
 pub mod timing;

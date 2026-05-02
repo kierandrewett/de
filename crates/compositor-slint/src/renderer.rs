@@ -290,6 +290,13 @@ struct CompositorApp {
     /// Queue of IPC commands posted by the unix-socket server thread. Drained
     /// in the main loop on each iteration.
     pending_ipc: PendingIpc,
+
+    /// Monotonic timestamp captured immediately after `frame.present()`. Read
+    /// (and cleared) by the main loop body to fire wp_presentation_feedback
+    /// `presented` events. None until the first frame has been presented.
+    /// We can't fire `presented` from inside `render_frame` directly because
+    /// SpikeState isn't reachable there.
+    last_present_time: Option<smithay::utils::Time<smithay::utils::Monotonic>>,
 }
 
 impl CompositorApp {
@@ -344,6 +351,7 @@ impl CompositorApp {
             last_fps_count: 0,
             pending_snap: None,
             pending_ipc: Arc::new(Mutex::new(Vec::new())),
+            last_present_time: None,
         }
     }
 
@@ -1001,6 +1009,16 @@ impl CompositorApp {
         }
 
         frame.present();
+
+        // Capture the post-present monotonic timestamp so the main loop can
+        // fire wp_presentation_feedback. Without a real DRM page-flip event
+        // this is "fake vsync" — the actual scanout happens at some point
+        // after the swapchain submit returns, but the delta is sub-frame for
+        // mailbox/fifo presentation modes and good enough for clients that
+        // just need monotonic increments (mpv, Chrome's vsync sync).
+        let clock: smithay::utils::Clock<smithay::utils::Monotonic> =
+            smithay::utils::Clock::new();
+        self.last_present_time = Some(clock.now());
     }
 
     /// Build the Slint `WindowItem` list from `WM` state + toplevel pixel buffers,
@@ -3508,7 +3526,45 @@ pub fn run() -> Result<()> {
         // every protocol entry point individually.
         state.bind_surfaces_to_output();
 
-        state.send_frame_callbacks(&output);
+        // Visibility gate: only frame-callback surfaces the renderer
+        // actually consumed this frame. Anvil derives this from the
+        // damage tracker's RenderOutputResult.states; without one we use
+        // "windows the WM considers mapped + non-minimised + non-closing
+        // AND with a non-zero client buffer", plus all layer surfaces
+        // (always visible if mapped). Without this gate every mapped
+        // client gets driven at full output framerate even when invisible.
+        let mut visible_surfaces: Vec<WlSurface> = Vec::with_capacity(
+            app.wm.windows.len() + state.layer_surfaces.len()
+        );
+        for win in app.wm.windows_sorted() {
+            if win.minimized || win.closing { continue; }
+            if let Some(tl) = state.toplevels.iter().find(|t| t.surface == win.surface) {
+                let (bw, bh) = {
+                    let p = tl.pixels.lock().unwrap();
+                    (p.width, p.height)
+                };
+                if bw == 0 || bh == 0 { continue; }
+                visible_surfaces.push(tl.surface.clone());
+            }
+        }
+        for li in &state.layer_surfaces {
+            visible_surfaces.push(li.surface.wl_surface().clone());
+        }
+
+        state.send_frame_callbacks_for(&output, &visible_surfaces);
+
+        // wp_presentation_feedback: fire `presented` with the timestamp
+        // captured immediately after `frame.present()`. Skip if no frame
+        // has presented yet this run (first iteration).
+        if let Some(present_time) = app.last_present_time.take() {
+            state.send_presentation_feedback_for(
+                &output,
+                &visible_surfaces,
+                present_time,
+                app.frame_count,
+            );
+        }
+
         state.pre_render_drive_clients();
 
         state.display_handle.flush_clients().ok();
