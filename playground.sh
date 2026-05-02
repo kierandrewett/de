@@ -6,9 +6,8 @@
 #   down              Kill all playground processes + remove sockets.
 #   status            Show pids, wayland socket, log sizes.
 #   restart           down + up.
-#   logs [name]       Tail a process log (default: compositor).
-#                     Names: compositor | shell-panel | shell-dock |
-#                     notification | portal | client.
+#   logs [name]       Tail a process log (default: compositor-slint).
+#                     Names: compositor-slint | notification | portal | client.
 #   screenshot [out]  grim screenshot of the host display (default: out.png
 #                     under playground/).
 #   watch [interval]  Take screenshots + tail logs every <interval> sec
@@ -33,10 +32,10 @@ mkdir -p "$DIR" "$PIDS" "$LOGS" "$SHOTS"
 CMD="${1:-status}"
 shift || true
 
-PROCS=(compositor shell-panel shell-dock notification portal)
+PROCS=(compositor-slint notification portal)
 
 socket_name() {
-    grep -oE 'Wayland socket: wayland-[0-9]+' "$LOGS/compositor.log" 2>/dev/null \
+    grep -oE 'Wayland socket: wayland-[0-9]+' "$LOGS/compositor-slint.log" 2>/dev/null \
         | tail -1 | awk '{print $3}'
 }
 
@@ -62,19 +61,18 @@ case "$CMD" in
 
         echo "[playground] building binaries..."
         cargo build --message-format=short \
-            -p compositor -p shell-panel -p shell-dock \
-            -p notification -p portal 2>&1 | tail -3
+            -p compositor-slint -p notification -p portal 2>&1 | tail -3
 
         echo "[playground] launching compositor..."
-        stdbuf -oL ./target/debug/compositor --winit \
-            > "$LOGS/compositor.log" 2>&1 &
-        echo $! > "$PIDS/compositor.pid"
+        stdbuf -oL ./target/debug/compositor-slint \
+            > "$LOGS/compositor-slint.log" 2>&1 &
+        echo $! > "$PIDS/compositor-slint.pid"
 
         echo -n "[playground] waiting for wayland socket"
         for _ in $(seq 1 80); do
-            if ! is_alive "$(cat "$PIDS/compositor.pid")"; then
+            if ! is_alive "$(cat "$PIDS/compositor-slint.pid")"; then
                 echo " — DEAD"
-                tail -20 "$LOGS/compositor.log"
+                tail -20 "$LOGS/compositor-slint.log"
                 exit 1
             fi
             local_sock=$(socket_name)
@@ -89,24 +87,15 @@ case "$CMD" in
         local_sock=$(socket_name)
         if [[ -z "${local_sock:-}" ]]; then
             echo "[playground] ERROR: socket never appeared. Last log:"
-            tail -20 "$LOGS/compositor.log"
+            tail -20 "$LOGS/compositor-slint.log"
             exit 1
         fi
 
         export WAYLAND_DISPLAY="$local_sock"
         echo "[playground] WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
 
-        for proc in shell-panel shell-dock notification portal; do
-            extra_env=""
-            if [[ "$proc" == "shell-panel" ]]; then
-                # Force tiny-skia (CPU/wl_shm) backend — wgpu+mesa-vk's wp_fifo
-                # path stalls our nested smithay compositor after ~3 commits.
-                extra_env="ICED_BACKEND=tiny-skia"
-                if [[ -n "${PANEL_WAYLAND_DEBUG:-}" ]]; then
-                    extra_env="$extra_env WAYLAND_DEBUG=1"
-                fi
-            fi
-            stdbuf -oL env $extra_env "./target/debug/$proc" \
+        for proc in notification portal; do
+            stdbuf -oL "./target/debug/$proc" \
                 > "$LOGS/$proc.log" 2>&1 &
             echo $! > "$PIDS/$proc.pid"
             echo "[playground] $proc pid=$(cat $PIDS/$proc.pid)"
@@ -137,11 +126,9 @@ case "$CMD" in
             fi
         done
         # Belt-and-braces — kill any stragglers from prior crashes.
-        pkill -f "target/debug/compositor"   2>/dev/null || true
-        pkill -f "target/debug/shell-panel"  2>/dev/null || true
-        pkill -f "target/debug/shell-dock"   2>/dev/null || true
-        pkill -f "target/debug/notification" 2>/dev/null || true
-        pkill -f "target/debug/portal"       2>/dev/null || true
+        pkill -f "target/debug/compositor-slint" 2>/dev/null || true
+        pkill -f "target/debug/notification"     2>/dev/null || true
+        pkill -f "target/debug/portal"           2>/dev/null || true
         rm -f "${XDG_RUNTIME_DIR:-/tmp}/myDE.sock"
         echo "[playground] stopped."
         ;;
@@ -183,7 +170,7 @@ case "$CMD" in
         ;;
 
     logs)
-        name="${1:-compositor}"
+        name="${1:-compositor-slint}"
         log="$LOGS/$name.log"
         if [[ ! -f "$log" ]]; then
             echo "no log at $log"; exit 1

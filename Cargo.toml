@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    # Foundation crates — backend-agnostic, used by both legacy and slint
+    # Foundation crates — backend-agnostic.
     "crates/rounding",
     "crates/animation",
     "crates/cursor",
@@ -9,25 +9,13 @@ members = [
     "crates/ipc",
     "crates/text-render",
 
-    # Standalone D-Bus services — no iced
+    # Standalone D-Bus services.
     "crates/notification",
     "crates/status-notifier",
     "crates/portal",
 
-    # Slint-based compositor (the new home; replaces crates/compositor)
+    # Slint-based compositor.
     "crates/compositor-slint",
-]
-# Retired (kept on disk under crates/ but excluded from the workspace build)
-# pending the Slint port — they all depend on iced 0.13/0.14 which is on its
-# way out. Re-add to `members` if you need to revive any of them, or delete
-# the directory once their replacement lands in compositor-slint or beside it.
-exclude = [
-    "crates/compositor",        # legacy iced+smithay compositor
-    "crates/shell-panel",       # iced_layershell panel — replaced by Compositor.slint Panel
-    "crates/shell-dock",        # iced_layershell dock — replaced by Compositor.slint Dock
-    "crates/shell-launcher",    # iced_layershell launcher — to be reborn in compositor-slint
-    "crates/shell-devtools",    # iced devtools — to be reborn in compositor-slint
-    "crates/portal-ui",         # iced file picker — needs a Slint reimplementation
 ]
 
 [workspace.package]
@@ -55,10 +43,3 @@ strip = true
 
 [profile.dev]
 opt-level = 1
-
-# Note: the workspace previously carried a `[patch.crates-io]` entry for a
-# vendored iced_tiny_skia fork (`vendor/iced_tiny_skia/`) with an always-
-# full-damage patch to work around a softbuffer/wl_shm bug that made the
-# iced panel/dock fade to black on hover. With iced retired from the active
-# workspace there is no consumer, so the patch is removed. The vendor
-# directory is kept on disk for reference; delete it whenever.
