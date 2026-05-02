@@ -2451,7 +2451,7 @@ impl CompositorApp {
         if let Some(drag) = self.active_drag.clone() {
             match &drag {
                 ActiveDrag::Resize { toplevel_idx, edge, start_geom, .. } => {
-                    if let Some((mut nx, mut ny, mut nw, mut nh)) = resize::compute_resize(&drag, x, y) {
+                    if let Some((nx, mut ny, nw, mut nh)) = resize::compute_resize(&drag, x, y) {
                         // ── Top-edge constraint ───────────────────────────
                         // Block the top edge from sliding under the panel.
                         // Adjust height so the bottom edge stays where the
@@ -3781,7 +3781,7 @@ pub fn run() -> Result<()> {
     info!("Slint GPU platform ready — production Compositor UI");
 
     // 4. Wayland display + socket.
-    let mut display = Display::<SpikeState>::new()
+    let display = Display::<SpikeState>::new()
         .context("failed to create wayland display")?;
     let display_handle = display.handle();
 
