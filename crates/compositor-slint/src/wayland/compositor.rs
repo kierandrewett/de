@@ -179,6 +179,32 @@ impl CompositorHandler for SpikeState {
             }
         }
 
+        // Lock surface (ext-session-lock-v1): import the buffer for the
+        // matching LockSurfaceInfo, then — on the FIRST committed lock
+        // surface — take the pending SessionLocker and call `.lock()` to
+        // flip the protocol to "locked". The renderer's gate consumes
+        // `session_locked` next frame and stops rendering everything
+        // else.
+        let lock_idx = self.lock_surfaces.iter()
+            .position(|li| li.surface.wl_surface() == &root);
+        if let Some(lidx) = lock_idx {
+            let pixels_arc = self.lock_surfaces[lidx].pixels.clone();
+            let _ = import_shm_buffer(&root, &pixels_arc);
+            if let Some(data) = self.dmabuf_pending.remove(&root.id()) {
+                *pixels_arc.lock().unwrap() = data;
+            }
+            if let Some(locker) = self.pending_session_lock.take() {
+                if pixels_arc.lock().unwrap().width > 0 {
+                    locker.lock();
+                    self.session_locked = true;
+                    debug!("session lock confirmed: first lock surface committed pixels");
+                } else {
+                    self.pending_session_lock = Some(locker);
+                }
+            }
+            return;
+        }
+
         // If `root` is a popup surface (or `surface` itself is a popup that
         // has no wl_subsurface parent), import for the popup's pixel buffer
         // and bail before falling through to toplevel handling.

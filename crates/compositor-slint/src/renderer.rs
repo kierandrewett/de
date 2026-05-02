@@ -303,6 +303,21 @@ struct CompositorApp {
     /// (which doesn't). `None` when no DnD is active or the icon hasn't yet
     /// committed pixels.
     dnd_icon_snapshot: Option<DndIconSnapshot>,
+
+    /// Snapshot of the first ext-session-lock-v1 lock surface's pixels.
+    /// Refreshed each `update_windows`; consumed by `render_frame` to
+    /// overwrite the entire `final_tex` whenever `session_locked` is set.
+    /// Multi-output not yet supported; we only render the first lock
+    /// surface.
+    lock_surface_snapshot: Option<LockSurfaceSnapshot>,
+}
+
+/// Per-frame snapshot of the active lock surface for the renderer.
+#[derive(Clone)]
+struct LockSurfaceSnapshot {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 /// Per-frame snapshot of the active DnD icon's drawing parameters.
@@ -373,6 +388,7 @@ impl CompositorApp {
             pending_ipc: Arc::new(Mutex::new(Vec::new())),
             last_present_time: None,
             dnd_icon_snapshot: None,
+            lock_surface_snapshot: None,
         }
     }
 
@@ -1059,6 +1075,36 @@ impl CompositorApp {
                 }
             }
 
+            // Step 2d — Session lock: overwrite final_tex entirely with
+            // the lock surface pixels. This runs AFTER all other passes
+            // so chrome/dock/panel/etc are clobbered (the locker owns
+            // the screen). Wasteful from a GPU-time PoV — the chrome
+            // passes ran for nothing — but correctness > optimisation
+            // for a security feature; a future refactor can short-
+            // circuit the chrome pipeline when locked.
+            if let Some(snap) = self.lock_surface_snapshot.as_ref() {
+                let copy_w = snap.width.min(w);
+                let copy_h = snap.height.min(h);
+                if copy_w > 0 && copy_h > 0 {
+                    let bytes_per_row = snap.width * 4;
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: final_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &snap.pixels,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: Some(snap.height),
+                        },
+                        wgpu::Extent3d { width: copy_w, height: copy_h, depth_or_array_layers: 1 },
+                    );
+                }
+            }
+
             // Step 3 — final_tex → swapchain.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -1708,6 +1754,28 @@ impl CompositorApp {
                 gpu_window.mark_dirty();
             }
         }
+
+        // Lock-surface snapshot: same pattern as DnD. While locked the
+        // renderer overwrites final_tex with the lock surface pixels, so
+        // it needs a state-free copy each frame.
+        let prev_locked = self.lock_surface_snapshot.is_some();
+        self.lock_surface_snapshot = if state.session_locked {
+            state.lock_surfaces.first().and_then(|li| {
+                let p = li.pixels.lock().unwrap();
+                (p.width > 0 && p.height > 0).then(|| LockSurfaceSnapshot {
+                    pixels: p.pixels.clone(),
+                    width: p.width,
+                    height: p.height,
+                })
+            })
+        } else {
+            None
+        };
+        if self.lock_surface_snapshot.is_some() || prev_locked {
+            if let Some(gpu_window) = self.gpu_window.as_ref() {
+                gpu_window.mark_dirty();
+            }
+        }
     }
 
     /// Process pending WM actions (close, minimize, maximize, activate) queued
@@ -2069,8 +2137,15 @@ impl CompositorApp {
         let serial = SERIAL_COUNTER.next_serial();
         let time = state.clock.now().as_millis() as u32;
 
-        // Use WM surface_under for correct z-order hit testing.
-        let hit = self.wm.surface_under(x, y);
+        // Session-lock gate: while locked, the only valid pointer focus is
+        // the lock surface for this output. WM surfaces are completely
+        // hidden — sending events there would leak input across the lock
+        // boundary.
+        let hit = if state.session_locked {
+            state.lock_surfaces.first().map(|li| (li.surface.wl_surface().clone(), x, y))
+        } else {
+            self.wm.surface_under(x, y)
+        };
 
         if let Some((surface, local_x, local_y)) = hit {
             pointer.motion(
@@ -2105,6 +2180,23 @@ impl CompositorApp {
             Some(p) => p,
             None => return,
         };
+
+        // Session-lock gate: forward the button event so the lock surface
+        // can react (swaylock toggles password-field focus on click etc),
+        // but skip the WM-focus / desktop-menu / drag-init bookkeeping
+        // that would otherwise leak interaction to hidden windows.
+        if state.session_locked {
+            let serial = SERIAL_COUNTER.next_serial();
+            let time = state.clock.now().as_millis() as u32;
+            let button_state = if pressed {
+                smithay::backend::input::ButtonState::Pressed
+            } else {
+                smithay::backend::input::ButtonState::Released
+            };
+            pointer.button(state, &ButtonEvent { serial, time, button, state: button_state });
+            pointer.frame(state);
+            return;
+        }
 
         // On left press: update WM focus.
         // - Click on a window  → focus it (existing behaviour).
@@ -4055,17 +4147,25 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
 
 fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
     use smithay::{backend::input::KeyState, input::keyboard::Keycode, utils::SERIAL_COUNTER};
-    // ── BEGIN layer-shell keyboard-routing block ───────────────────────────
-    // A mapped Top/Overlay layer surface with KeyboardInteractivity::Exclusive
-    // (lock screens, password prompts, app launchers like fuzzel) wins over
-    // the WM's focused toplevel. OnDemand layer surfaces still rely on
-    // active_surface being set by click-to-focus. None layer surfaces never
-    // receive keys.
-    let surface = state
-        .exclusive_keyboard_layer()
-        .cloned()
-        .or_else(|| state.active_surface.clone());
-    // ── END layer-shell keyboard-routing block ─────────────────────────────
+
+    // Session-lock gate: keys go ONLY to the lock surface. Without this,
+    // the user could keep typing into a focused toplevel that's hidden
+    // behind the lock — a textbook lock-screen bypass.
+    let surface = if state.session_locked {
+        state.lock_surfaces.first().map(|li| li.surface.wl_surface().clone())
+    } else {
+        // ── BEGIN layer-shell keyboard-routing block ───────────────────
+        // A mapped Top/Overlay layer surface with
+        // KeyboardInteractivity::Exclusive (lock screens, password
+        // prompts, app launchers like fuzzel) wins over the WM's
+        // focused toplevel. OnDemand layer surfaces still rely on
+        // active_surface being set by click-to-focus. None layer
+        // surfaces never receive keys.
+        state.exclusive_keyboard_layer()
+            .cloned()
+            .or_else(|| state.active_surface.clone())
+        // ── END layer-shell keyboard-routing block ─────────────────────
+    };
     let Some(surface) = surface else { return };
     let Some(keyboard) = state.seat.get_keyboard() else { return };
     keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());

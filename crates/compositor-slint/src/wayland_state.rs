@@ -201,6 +201,16 @@ pub struct PopupInfo {
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
 }
 
+/// One ext-session-lock-v1 surface (one per output the locker covers).
+/// Stored on `SpikeState::lock_surfaces`; the renderer composites these
+/// fullscreen and skips everything else while a lock is active.
+#[derive(Clone)]
+pub struct LockSurfaceInfo {
+    pub surface: smithay::wayland::session_lock::LockSurface,
+    pub output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    pub pixels: Arc<Mutex<ClientSurfaceData>>,
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Compositor state
 // ──────────────────────────────────────────────────────────────────────────────
@@ -301,6 +311,18 @@ pub struct SpikeState {
     pub xwm: Option<X11Wm>,
     /// X11 display number Xwayland is listening on (for `DISPLAY=:N`).
     pub xdisplay: Option<u32>,
+
+    // ── Session lock (ext-session-lock-v1) ────────────────────────────────
+    /// `Some(_)` between `lock()` and confirmation. Held until the first
+    /// lock surface commits a buffer; we then take it and call `.lock()`
+    /// to flip the protocol to "locked" so the client knows to render.
+    pub pending_session_lock: Option<smithay::wayland::session_lock::SessionLocker>,
+    /// True while a lock is active. Drives the renderer's gate (skip all
+    /// non-lock content) and the input gate (drop pointer/keyboard
+    /// events for non-lock surfaces).
+    pub session_locked: bool,
+    /// Per-output lock surface + its committed pixel buffer.
+    pub lock_surfaces: Vec<LockSurfaceInfo>,
 
     // ── Bookkeeping ───────────────────────────────────────────────────────
     /// The single virtual output for this compositor. Stored here so the
@@ -514,6 +536,9 @@ impl SpikeState {
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
+            pending_session_lock: None,
+            session_locked: false,
+            lock_surfaces: Vec::new(),
             output: None,
             active_surface: None,
             dnd_icon: None,
