@@ -3526,6 +3526,15 @@ pub fn run() -> Result<()> {
         // every protocol entry point individually.
         state.bind_surfaces_to_output();
 
+        // ── BEGIN layer-shell layout block ─────────────────────────────────
+        // Re-read each layer surface's cached anchor / margin / exclusive_zone
+        // and recompute its compositor-space rect. Forward the per-edge
+        // exclusive-zone reservation to the WM so toplevels avoid panel/dock.
+        state.refresh_layer_layout(app.wm.output_w, app.wm.output_h);
+        let reserved = state.reserved_zones();
+        app.wm.set_reserved_zones(reserved.top, reserved.bottom, reserved.left, reserved.right);
+        // ── END layer-shell layout block ───────────────────────────────────
+
         // Visibility gate: only frame-callback surfaces the renderer
         // actually consumed this frame. Anvil derives this from the
         // damage tracker's RenderOutputResult.states; without one we use
