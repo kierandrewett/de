@@ -281,6 +281,11 @@ pub struct SpikeState {
     // ── P1 Idle / lock ────────────────────────────────────────────────────
     pub idle_notifier_state: IdleNotifierState<Self>,
     pub idle_inhibit_manager_state: IdleInhibitManagerState,
+    /// Surfaces with an active idle-inhibit-v1 inhibitor. We don't try
+    /// to gate on visibility (the spec allows ignoring) — any active
+    /// inhibitor flips `idle_notifier.set_is_inhibited(true)` so video
+    /// players, presentations, etc. keep the screen-saver away.
+    pub idle_inhibitors: std::collections::HashSet<WlSurface>,
     pub session_lock_manager_state: SessionLockManagerState,
 
     // ── P2 Misc ───────────────────────────────────────────────────────────
@@ -540,6 +545,7 @@ impl SpikeState {
             virtual_keyboard_state,
             idle_notifier_state,
             idle_inhibit_manager_state,
+            idle_inhibitors: std::collections::HashSet::new(),
             session_lock_manager_state,
             activation_state,
             content_type_state,

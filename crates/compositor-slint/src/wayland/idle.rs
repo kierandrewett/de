@@ -25,12 +25,21 @@ delegate_idle_notify!(SpikeState);
 // ─── IdleInhibit ──────────────────────────────────────────────────────────────
 
 impl IdleInhibitHandler for SpikeState {
-    fn inhibit(&mut self, _surface: WlSurface) {
-        debug!("idle inhibit activated");
+    fn inhibit(&mut self, surface: WlSurface) {
+        let was_empty = self.idle_inhibitors.is_empty();
+        self.idle_inhibitors.insert(surface);
+        if was_empty {
+            self.idle_notifier_state.set_is_inhibited(true);
+            debug!("idle inhibit activated");
+        }
     }
 
-    fn uninhibit(&mut self, _surface: WlSurface) {
-        debug!("idle inhibit deactivated");
+    fn uninhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibitors.remove(&surface);
+        if self.idle_inhibitors.is_empty() {
+            self.idle_notifier_state.set_is_inhibited(false);
+            debug!("idle inhibit deactivated");
+        }
     }
 }
 
