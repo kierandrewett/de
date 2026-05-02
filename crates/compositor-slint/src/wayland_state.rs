@@ -1094,10 +1094,11 @@ impl SeatHandler for SpikeState {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        // Honour `wl_pointer.set_cursor` — primarily so clients that hide
-        // their cursor (e.g. video players in fullscreen, drawing apps) get
-        // the cursor to disappear. Surface cursors aren't rendered yet (TODO);
-        // we treat them as "default" so the user still sees something.
+        // Honour `wl_pointer.set_cursor`. The renderer maps each variant:
+        // Hidden → hide the cursor; Named → load from the system Xcursor
+        // theme; Surface → upload the client's surface pixels and use
+        // them as the cursor image (commit hook in wayland/compositor.rs
+        // imports the pixels; renderer reads `cursor_surface_pixels`).
         self.cursor_status = image;
     }
 }
@@ -1232,12 +1233,10 @@ smithay::delegate_data_control!(SpikeState);
 //     `capture_constraints` can recover the output's mode.
 //   - capture_constraints reports the current output's pixel size + ARGB/XRGB
 //     SHM formats so well-behaved clients see a "compatible" path.
-//   - frame() fails immediately with `Unknown` — we don't have a wgpu
-//     readback path yet. This satisfies the protocol contract: the client
-//     gets a clean failure instead of a hang or a missing-global error.
-//     TODO(renderer): implement actual readback by hooking into the
-//     post-present submit on the wgpu queue and copying the output texture
-//     into the client-supplied wl_buffer (SHM today, dmabuf later).
+//   - frame() pushes the Frame onto `pending_capture_frames`; the main
+//     loop drains it right after each `render_frame` so the readback
+//     reads the just-presented final_tex (see `screencopy.rs`).
+//     dmabuf-backed capture is not yet supported; SHM only.
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl ImageCaptureSourceHandler for SpikeState {
