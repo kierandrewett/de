@@ -3606,18 +3606,102 @@ pub fn run() -> Result<()> {
             }
         });
     }
+    // Right-click on a tray icon: kick off an async DBusMenu GetLayout
+    // fetch on a worker thread. Once the layout returns, hop back to the
+    // Slint event loop, populate `tray-menu-items` and flip
+    // `tray-menu-open = true` so the ContextMenu pops near the cursor.
     {
         let weak = ui.as_weak();
         ui.on_tray_right_clicked(move |id| {
             let Some(ui) = weak.upgrade() else { return };
             let model = ui.get_tray_items();
+            let mut endpoint: Option<(String, String, f32, f32)> = None;
             for i in 0..model.row_count() {
                 if let Some(it) = model.row_data(i) {
                     if it.id == id {
-                        crate::tray::context_menu(
+                        endpoint = Some((
                             it.service.to_string(),
                             it.object_path.to_string(),
-                            0, 0,
+                            ui.get_cursor_x(),
+                            ui.get_cursor_y(),
+                        ));
+                        break;
+                    }
+                }
+            }
+            let Some((service, object_path, cx, cy)) = endpoint else { return };
+            let weak2 = weak.clone();
+            crate::dbusmenu::fetch_layout(service, object_path, move |items| {
+                let weak3 = weak2.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak3.upgrade() else { return };
+                    use crate::MenuItem;
+                    let mut row_id: i32 = 1_000_000;
+                    let menu_items: Vec<MenuItem> = items.into_iter().map(|it| {
+                        if it.separator {
+                            MenuItem {
+                                id: -1,
+                                label: SharedString::default(),
+                                accelerator: SharedString::default(),
+                                separator: true,
+                                enabled: false,
+                            }
+                        } else {
+                            // The DBusMenu item id can be 0 (synthetic
+                            // root has 0; some apps reuse it). MenuItem
+                            // requires non-(-1) for clickable rows so
+                            // shift positive ids by an offset and stash
+                            // the real id in a side table — but we can
+                            // just trust the numeric id here as long as
+                            // it's not -1, which dbusmenu uses for "no
+                            // id". Map any negative or zero ids onto a
+                            // monotonically growing fallback so the
+                            // ContextMenu doesn't think they're separators.
+                            let id = if it.id <= 0 { row_id += 1; row_id - 1 } else { it.id };
+                            MenuItem {
+                                id,
+                                label: SharedString::from(it.label),
+                                accelerator: SharedString::default(),
+                                separator: false,
+                                enabled: it.enabled,
+                            }
+                        }
+                    }).collect();
+                    let model = std::rc::Rc::new(VecModel::from(menu_items));
+                    ui.set_tray_menu_items(slint::ModelRc::from(model));
+                    // Position the popup just below + slightly right of
+                    // the cursor. ContextMenu is 220 px wide and sizes
+                    // its height to fit; clamp so it doesn't fall off
+                    // the right edge of the screen.
+                    let menu_w = 220.0_f64;
+                    let pad = 8.0_f64;
+                    let screen_w = ui.window().size().width as f64;
+                    let max_x = (screen_w - menu_w - pad).max(pad);
+                    let x = (cx as f64 - 10.0).clamp(pad, max_x);
+                    let y = (cy as f64 + 6.0).max(pad);
+                    ui.set_tray_menu_x(x as i32);
+                    ui.set_tray_menu_y(y as i32);
+                    ui.set_tray_menu_id(id);
+                    ui.set_tray_menu_open(true);
+                });
+            });
+        });
+    }
+    // Click on a tray-menu row → send `Event(item_id, "clicked", ...)` to
+    // the DBusMenu service. We look up the SNI endpoint by the tray id we
+    // stashed in `tray-menu-id` when the menu opened.
+    {
+        let weak = ui.as_weak();
+        ui.on_tray_menu_clicked(move |sni_id, item_id| {
+            let Some(ui) = weak.upgrade() else { return };
+            let model = ui.get_tray_items();
+            for i in 0..model.row_count() {
+                if let Some(it) = model.row_data(i) {
+                    if it.id == sni_id {
+                        crate::dbusmenu::send_clicked(
+                            it.service.to_string(),
+                            it.object_path.to_string(),
+                            item_id,
                         );
                         break;
                     }

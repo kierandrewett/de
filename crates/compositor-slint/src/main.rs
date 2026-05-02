@@ -51,6 +51,7 @@ mod snap;
 mod backdrop;
 mod ipc_server;
 mod tray;
+mod dbusmenu;
 mod render;
 mod screencopy;
 pub mod wm;

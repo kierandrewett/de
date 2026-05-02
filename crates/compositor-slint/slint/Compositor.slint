@@ -164,6 +164,19 @@ export component Compositor inherits Window {
     in property      <[MenuItem]>    dock-menu-items;
     callback dock-menu-clicked(string, int);
 
+    // ── Tray (StatusNotifierItem / DBusMenu) per-icon menu ──────────────────
+    // The tray-row right-clicks a tray icon → Rust kicks off a DBusMenu
+    // GetLayout fetch on a worker thread, then populates `tray-menu-items`
+    // + flips `tray-menu-open` on the next event-loop tick. `tray-menu-id`
+    // is the SNI item id so `tray-menu-clicked` can route the Event call
+    // back to the right service without a separate lookup table.
+    in-out property <bool>           tray-menu-open: false;
+    in-out property <int>            tray-menu-x: 0;
+    in-out property <int>            tray-menu-y: 0;
+    in-out property <int>            tray-menu-id: 0;
+    in property      <[MenuItem]>    tray-menu-items;
+    callback tray-menu-clicked(int, int);
+
     // ── Snap preview overlay ─────────────────────────────────────────────────
     in property <bool>          snap-preview-visible: false;
     in property <int>           snap-preview-x:  0;
@@ -394,6 +407,27 @@ export component Compositor inherits Window {
             root.dock-menu-clicked(root.dock-menu-app-id, id);
         }
         dismiss => { root.dock-menu-open = false; }
+    }
+
+    // ── Tray DBusMenu popup (separate ContextMenu instance) ─────────────────
+    if root.tray-menu-open: TouchArea {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        z: 83;
+        clicked => { root.tray-menu-open = false; }
+    }
+    tray-menu := ContextMenu {
+        x: root.tray-menu-x * 1px;
+        y: root.tray-menu-y * 1px;
+        z: 84;
+        items: root.tray-menu-items;
+        open: root.tray-menu-open;
+        item-clicked(id) => {
+            root.tray-menu-open = false;
+            root.tray-menu-clicked(root.tray-menu-id, id);
+        }
+        dismiss => { root.tray-menu-open = false; }
     }
 
     // ── Layer 5b: xdg_popup surfaces (context menus, dropdowns) ─────────────
