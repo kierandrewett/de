@@ -56,7 +56,7 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::{wl_buffer::WlBuffer, wl_shm, wl_surface::WlSurface},
-            Client, DisplayHandle, Resource,
+            DisplayHandle, Resource,
         },
     },
     utils::{Clock, Logical, Monotonic, Point, Serial},
@@ -667,7 +667,7 @@ impl SpikeState {
         let size = dmabuf.size();
         let (w, h) = (size.w as u32, size.h as u32);
 
-        let region = smithay::utils::Rectangle::from_loc_and_size(
+        let region = smithay::utils::Rectangle::new(
             smithay::utils::Point::from((0, 0)),
             smithay::utils::Size::from((size.w, size.h)),
         );

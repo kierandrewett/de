@@ -202,34 +202,6 @@ pub fn activate(bus: String, path: String, x: i32, y: i32) {
     });
 }
 
-/// Send `ContextMenu(x, y)` to a StatusNotifierItem — right-click.
-pub fn context_menu(bus: String, path: String, x: i32, y: i32) {
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all().build()
-        {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        rt.block_on(async move {
-            if let Ok(conn) = Connection::session().await {
-                if let Ok(bus_name) = BusName::try_from(bus) {
-                    if let Ok(obj_path) = OwnedObjectPath::try_from(path.as_str()) {
-                        if let Ok(proxy) = zbus::Proxy::new(
-                            &conn, bus_name, obj_path,
-                            "org.kde.StatusNotifierItem",
-                        ).await {
-                            let _ = proxy.call::<&str, (i32, i32), ()>(
-                                "ContextMenu", &(x, y),
-                            ).await;
-                        }
-                    }
-                }
-            }
-        });
-    });
-}
-
 /// Read a single string property off a StatusNotifierItem at `(bus, path)`.
 async fn read_str_property(bus: &str, path: &str, prop: &str)
     -> zbus::Result<String>

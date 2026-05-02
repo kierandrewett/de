@@ -14,7 +14,6 @@ use smithay::{
     },
     utils::Point,
     wayland::{
-        foreign_toplevel_list::ForeignToplevelListState,
         security_context::{
             SecurityContext, SecurityContextHandler, SecurityContextListenerSource,
         },
