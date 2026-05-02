@@ -290,6 +290,13 @@ struct CompositorApp {
     /// Queue of IPC commands posted by the unix-socket server thread. Drained
     /// in the main loop on each iteration.
     pending_ipc: PendingIpc,
+
+    /// Monotonic timestamp captured immediately after `frame.present()`. Read
+    /// (and cleared) by the main loop body to fire wp_presentation_feedback
+    /// `presented` events. None until the first frame has been presented.
+    /// We can't fire `presented` from inside `render_frame` directly because
+    /// SpikeState isn't reachable there.
+    last_present_time: Option<smithay::utils::Time<smithay::utils::Monotonic>>,
 }
 
 impl CompositorApp {
@@ -344,6 +351,7 @@ impl CompositorApp {
             last_fps_count: 0,
             pending_snap: None,
             pending_ipc: Arc::new(Mutex::new(Vec::new())),
+            last_present_time: None,
         }
     }
 
@@ -1001,6 +1009,16 @@ impl CompositorApp {
         }
 
         frame.present();
+
+        // Capture the post-present monotonic timestamp so the main loop can
+        // fire wp_presentation_feedback. Without a real DRM page-flip event
+        // this is "fake vsync" — the actual scanout happens at some point
+        // after the swapchain submit returns, but the delta is sub-frame for
+        // mailbox/fifo presentation modes and good enough for clients that
+        // just need monotonic increments (mpv, Chrome's vsync sync).
+        let clock: smithay::utils::Clock<smithay::utils::Monotonic> =
+            smithay::utils::Clock::new();
+        self.last_present_time = Some(clock.now());
     }
 
     /// Build the Slint `WindowItem` list from `WM` state + toplevel pixel buffers,
@@ -3429,6 +3447,20 @@ pub fn run() -> Result<()> {
         }
 
         state.send_frame_callbacks_for(&output, &visible_surfaces);
+
+        // wp_presentation_feedback: drain pending feedback callbacks for
+        // the surfaces we just composited and fire `presented` with the
+        // timestamp captured immediately after `frame.present()`. Skip if
+        // no frame has presented yet this run (first iteration).
+        if let Some(present_time) = app.last_present_time.take() {
+            state.send_presentation_feedback_for(
+                &output,
+                &visible_surfaces,
+                present_time,
+                app.frame_count,
+            );
+        }
+
         state.pre_render_drive_clients();
 
         state.display_handle.flush_clients().ok();
