@@ -1093,6 +1093,18 @@ impl CompositorApp {
         }
         let mut metas: Vec<ToplevelMeta> = Vec::with_capacity(state.toplevels.len());
         for (i, tl) in state.toplevels.iter().enumerate() {
+            // Override-redirect X11 windows live in `state.toplevels` so the
+            // SHM/dmabuf import path fills their pixel buffer, but they're
+            // routed through the popup pipeline (built later in this fn) —
+            // skip the WM/CSD bookkeeping for them.
+            if tl
+                .x11_surface
+                .as_ref()
+                .map(|x| x.user_data().get::<crate::wayland::xwayland::X11OverrideRedirect>().is_some())
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let (gx_xdg, gy_xdg, gw_xdg, gh_xdg, app_id) = with_states(&tl.surface, |states| {
                 let mut guard = states.cached_state.get::<SurfaceCachedState>();
                 let geom = guard.current().geometry
@@ -1430,6 +1442,51 @@ impl CompositorApp {
                 id: pi as i32,
                 x: abs_x,
                 y: abs_y,
+                w,
+                h,
+                texture,
+            });
+        }
+
+        // ── X11 override-redirect windows (menus / tooltips / drag indicators)
+        //     piggyback on the popup pipeline. They're tracked in
+        //     `state.toplevels` so SHM/dmabuf import lands in `tl.pixels`,
+        //     positioned at absolute screen coords by the X11 client itself
+        //     (we re-read X11Surface::geometry every frame because the client
+        //     can move them at any time without a configure round-trip).
+        //
+        //     IDs use a high offset to avoid collision with xdg_popup ids
+        //     (which are indices into `state.popups`, well below 1<<20).
+        const X11_OR_ID_BASE: i32 = 1 << 20;
+        for (oi, tl) in state.toplevels.iter().enumerate() {
+            let Some(x11) = tl.x11_surface.as_ref() else { continue };
+            if x11
+                .user_data()
+                .get::<crate::wayland::xwayland::X11OverrideRedirect>()
+                .is_none()
+            {
+                continue;
+            }
+            let (bw, bh, has_pixels) = {
+                let p = tl.pixels.lock().unwrap();
+                (p.width as i32, p.height as i32, p.width > 0)
+            };
+            if !has_pixels {
+                continue;
+            }
+            let geo = x11.geometry();
+            let p = tl.pixels.lock().unwrap();
+            let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                &p.pixels, p.width, p.height,
+            );
+            let texture = slint::Image::from_rgba8_premultiplied(pixel_buf);
+            drop(p);
+            let w = if geo.size.w > 0 { geo.size.w } else { bw };
+            let h = if geo.size.h > 0 { geo.size.h } else { bh };
+            popup_items.push(crate::PopupItem {
+                id: X11_OR_ID_BASE + oi as i32,
+                x: geo.loc.x,
+                y: geo.loc.y,
                 w,
                 h,
                 texture,
@@ -3742,6 +3799,19 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
 
     // Register new toplevels.
     for toplevel in &state.toplevels {
+        // OR windows are popup-like and never managed by the WM.
+        if toplevel
+            .x11_surface
+            .as_ref()
+            .map(|x| {
+                x.user_data()
+                    .get::<crate::wayland::xwayland::X11OverrideRedirect>()
+                    .is_some()
+            })
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let key = toplevel.surface.id().protocol_id() as usize;
         if !wm.windows.contains_key(&key) {
             // Register the toplevel with the WM (starts open animation).
