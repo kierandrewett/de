@@ -6,30 +6,13 @@
 use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration,
     reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
-    wayland::{
-        compositor::with_states,
-        shell::{
-            kde::decoration::{KdeDecorationHandler, KdeDecorationState},
-            xdg::{decoration::XdgDecorationHandler, ToplevelSurface, XdgToplevelSurfaceData},
-        },
+    wayland::shell::{
+        kde::decoration::{KdeDecorationHandler, KdeDecorationState},
+        xdg::{decoration::XdgDecorationHandler, ToplevelSurface},
     },
 };
 
 use crate::wayland_state::SpikeState;
-
-/// True iff the toplevel has already had its first `send_configure()`
-/// fire. We use this to suppress mid-init `send_configure()` calls from
-/// the decoration handler — those would prematurely fire the deferred
-/// initial configure (see `wayland/xdg_shell.rs` for why we defer).
-fn initial_configure_sent(toplevel: &ToplevelSurface) -> bool {
-    with_states(toplevel.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .map(|d| d.lock().unwrap().initial_configure_sent)
-            .unwrap_or(false)
-    })
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // xdg-decoration (standard protocol)
@@ -50,7 +33,7 @@ impl XdgDecorationHandler for SpikeState {
         // pick up our pending-state change and emit the first configure
         // with the decoration mode already populated. Firing here would
         // race the toplevel's app_id/title setup.
-        if initial_configure_sent(&toplevel) {
+        if toplevel.is_initial_configure_sent() {
             toplevel.send_configure();
         }
     }
@@ -60,7 +43,7 @@ impl XdgDecorationHandler for SpikeState {
         toplevel.with_pending_state(|s| {
             s.decoration_mode = Some(if csd { Mode::ClientSide } else { Mode::ServerSide });
         });
-        if initial_configure_sent(&toplevel) {
+        if toplevel.is_initial_configure_sent() {
             toplevel.send_configure();
         }
 
@@ -74,7 +57,7 @@ impl XdgDecorationHandler for SpikeState {
         toplevel.with_pending_state(|s| {
             s.decoration_mode = Some(Mode::ServerSide);
         });
-        if initial_configure_sent(&toplevel) {
+        if toplevel.is_initial_configure_sent() {
             toplevel.send_configure();
         }
         let wl = toplevel.wl_surface();
