@@ -1541,6 +1541,55 @@ impl CompositorApp {
         }
     }
 
+    /// Drain `state.pending_capture_frames` and service each via a sync GPU
+    /// readback of `final_tex`. Called from the main loop right after
+    /// `render_frame` so the captured pixels reflect the frame the client
+    /// just saw on screen. Skipped silently when the renderer hasn't yet
+    /// populated `final_tex` — clients re-request next vsync.
+    fn process_capture_frames(&mut self, state: &mut SpikeState) {
+        if state.pending_capture_frames.is_empty() {
+            return;
+        }
+        let Some(gpu_window) = self.gpu_window.as_ref() else {
+            // Renderer not initialised — fail every queued frame so clients
+            // don't hang waiting for a never-arriving response.
+            for frame in state.pending_capture_frames.drain(..) {
+                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+            }
+            return;
+        };
+        let Some(final_tex) = self.final_texture.as_ref() else {
+            for frame in state.pending_capture_frames.drain(..) {
+                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+            }
+            return;
+        };
+        let (width, height) = self.render_texture_size;
+        if width == 0 || height == 0 {
+            for frame in state.pending_capture_frames.drain(..) {
+                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+            }
+            return;
+        }
+        let device = &gpu_window.wgpu_device;
+        let queue = &gpu_window.wgpu_queue;
+        let presented = self
+            .last_present_time
+            .map(std::time::Duration::from)
+            .unwrap_or(std::time::Duration::ZERO);
+        let ctx = crate::screencopy::CaptureContext {
+            device,
+            queue,
+            final_tex,
+            width,
+            height,
+        };
+        let frames: Vec<_> = state.pending_capture_frames.drain(..).collect();
+        for frame in frames {
+            crate::screencopy::process_frame(&ctx, frame, presented);
+        }
+    }
+
     /// Poll all toplevels for dirty SHM buffers and update Slint if any changed.
     fn update_client_texture(&mut self, state: &mut SpikeState) {
         let mut any_dirty = false;
@@ -3745,6 +3794,11 @@ pub fn run() -> Result<()> {
         app.process_wm_actions(&mut state);
 
         app.update_client_texture(&mut state);
+        // Service ext-image-copy-capture-v1 frames the calloop dispatch above
+        // queued. Has to run AFTER render_frame (which already happened in
+        // pump_app_events) so the readback samples the just-presented
+        // final_tex, not the previous frame's contents.
+        app.process_capture_frames(&mut state);
         app.update_dock_running(&state);
         // Throttled CPU backdrop synth (samples wallpaper + window content).
         app.refresh_backdrop(&state);

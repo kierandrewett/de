@@ -282,11 +282,15 @@ pub struct SpikeState {
     /// `capture_constraints` can recover the size/format on demand.
     pub output_capture_source_state: OutputCaptureSourceState,
     /// Backs `ext-image-copy-capture-manager-v1` — manages capture sessions
-    /// and frames. We currently fail every frame request via
-    /// `frame.fail(Unknown)` since wgpu-side framebuffer readback is not
-    /// wired yet, but the global must still bind so `grim` /
-    /// `xdg-desktop-portal-wlr` / OBS don't error out at startup.
+    /// and frames. The actual readback runs from the renderer after each
+    /// `render_frame`, draining `pending_capture_frames` below.
     pub image_copy_capture_state: ImageCopyCaptureState,
+    /// Frames whose capture has been requested but not yet serviced. The
+    /// `frame()` handler enqueues them (instead of doing readback inline,
+    /// which would need the renderer's wgpu device + final_tex); the main
+    /// loop drains them after `render_frame` and performs a sync GPU
+    /// readback into each frame's wl_buffer.
+    pub pending_capture_frames: Vec<Frame>,
 
     // ── XWayland ─────────────────────────────────────────────────────────
     /// The xwayland_shell_v1 global state — needed for the Xwayland process to
@@ -506,6 +510,7 @@ impl SpikeState {
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
+            pending_capture_frames: Vec::new(),
             xwayland_shell_state,
             xwm: None,
             xdisplay: None,
@@ -1223,9 +1228,10 @@ impl ImageCopyCaptureHandler for SpikeState {
     fn new_session(&mut self, _session: Session) {}
 
     fn frame(&mut self, _session: &SessionRef, frame: Frame) {
-        // Stub: framebuffer readback isn't wired yet, fail gracefully so
-        // clients see a defined error rather than a hung capture.
-        frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+        // Defer: the wgpu device + final_tex live in the renderer, not on
+        // SpikeState. The main loop drains this vec right after each
+        // `render_frame` so the readback samples the just-presented frame.
+        self.pending_capture_frames.push(frame);
     }
 }
 
