@@ -46,6 +46,7 @@ use smithay::{
     },
     delegate_dmabuf, delegate_seat, delegate_shm,
     input::{pointer::CursorImageStatus, Seat, SeatHandler, SeatState},
+    output::Output,
     reexports::{
         calloop::{LoopHandle, LoopSignal},
         wayland_server::{
@@ -79,6 +80,7 @@ use smithay::{
         selection::{
             data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
             primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
+            wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler,
         },
         session_lock::SessionLockManagerState,
@@ -206,6 +208,9 @@ pub struct SpikeState {
     // ── P1 Clipboard / selections ─────────────────────────────────────────
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    // wlr-data-control powers wl-clipboard / cliphist / wl-paste — without it
+    // those tools can't observe or write the selection at all.
+    pub data_control_state: DataControlState,
 
     // ── P1 Scaling ────────────────────────────────────────────────────────
     pub fractional_scale_manager_state: FractionalScaleManagerState,
@@ -245,6 +250,11 @@ pub struct SpikeState {
     pub xdg_toplevel_tag_manager: XdgToplevelTagManager,
 
     // ── Bookkeeping ───────────────────────────────────────────────────────
+    /// The single virtual output for this compositor. Stored here so the
+    /// surface enter/leave bookkeeping (which drives wl_output binding and
+    /// preferred_buffer_scale emission) can find it from any handler.
+    pub output: Option<Output>,
+
     /// Currently-focused xdg toplevel surface.
     pub active_surface: Option<WlSurface>,
 
@@ -325,6 +335,10 @@ impl SpikeState {
 
         let data_device_state = DataDeviceState::new::<Self>(dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(dh);
+        // Bridge wlr-data-control to primary selection so wl-paste --primary
+        // works the same way wl-paste does for the regular clipboard.
+        let data_control_state =
+            DataControlState::new::<Self, _>(dh, Some(&primary_selection_state), |_| true);
 
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(dh);
         let viewporter_state = ViewporterState::new::<Self>(dh);
@@ -376,6 +390,7 @@ impl SpikeState {
             kde_decoration_state,
             data_device_state,
             primary_selection_state,
+            data_control_state,
             fractional_scale_manager_state,
             viewporter_state,
             fifo_state,
@@ -401,6 +416,7 @@ impl SpikeState {
             xdg_system_bell_state,
             xdg_toplevel_icon_manager,
             xdg_toplevel_tag_manager,
+            output: None,
             active_surface: None,
             toplevels: Vec::new(),
             popups: Vec::new(),
@@ -960,3 +976,18 @@ impl PrimarySelectionHandler for SpikeState {
 }
 
 smithay::delegate_primary_selection!(SpikeState);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Agent block: wlr-data-control + xdg-output + preferred_buffer_scale wiring.
+// xdg-output globals are advertised by `OutputManagerState::new_with_xdg_output`
+// + `delegate_output!` (in `wayland/outputs.rs`); no separate delegate exists
+// because the same `delegate_output!` macro registers the xdg-output dispatch.
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl DataControlHandler for SpikeState {
+    fn data_control_state(&mut self) -> &mut DataControlState {
+        &mut self.data_control_state
+    }
+}
+
+smithay::delegate_data_control!(SpikeState);

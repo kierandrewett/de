@@ -3296,6 +3296,10 @@ pub fn run() -> Result<()> {
     output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
     output.set_preferred(mode);
     output.create_global::<SpikeState>(&display_handle);
+    // Stash the output on the compositor state so handlers can drive
+    // surface↔output binding (which is what triggers smithay to emit
+    // wl_surface.preferred_buffer_scale / preferred_buffer_transform).
+    state.output = Some(output.clone());
 
     // 6. winit event loop.
     let mut winit_event_loop = WinitEventLoop::new().context("failed to create winit event loop")?;
@@ -3398,6 +3402,12 @@ pub fn run() -> Result<()> {
         }
 
         if state.should_exit { break; }
+
+        // Refresh surface↔output bindings once per frame so newly-mapped
+        // surfaces get a wl_surface.enter (and the matching
+        // preferred_buffer_scale on v6 clients) without us having to hook
+        // every protocol entry point individually.
+        state.bind_surfaces_to_output();
 
         state.send_frame_callbacks(&output);
         state.pre_render_drive_clients();
