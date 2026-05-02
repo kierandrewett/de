@@ -3709,7 +3709,18 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
 
 fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
     use smithay::{backend::input::KeyState, input::keyboard::Keycode, utils::SERIAL_COUNTER};
-    let Some(surface) = state.active_surface.clone() else { return };
+    // ── BEGIN layer-shell keyboard-routing block ───────────────────────────
+    // A mapped Top/Overlay layer surface with KeyboardInteractivity::Exclusive
+    // (lock screens, password prompts, app launchers like fuzzel) wins over
+    // the WM's focused toplevel. OnDemand layer surfaces still rely on
+    // active_surface being set by click-to-focus. None layer surfaces never
+    // receive keys.
+    let surface = state
+        .exclusive_keyboard_layer()
+        .cloned()
+        .or_else(|| state.active_surface.clone());
+    // ── END layer-shell keyboard-routing block ─────────────────────────────
+    let Some(surface) = surface else { return };
     let Some(keyboard) = state.seat.get_keyboard() else { return };
     keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
     let serial = SERIAL_COUNTER.next_serial();
