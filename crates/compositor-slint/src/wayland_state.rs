@@ -148,8 +148,13 @@ pub struct ClientSurfaceData {
 pub struct ToplevelInfo {
     /// The wayland surface for this toplevel.
     pub surface: WlSurface,
-    /// The ToplevelSurface handle (for sending configure / close to the client).
-    pub toplevel: ToplevelSurface,
+    /// The xdg `ToplevelSurface` handle for native wayland clients. `None`
+    /// for X11/Xwayland toplevels — those use `x11_surface` for configure /
+    /// close round-trips instead.
+    pub toplevel: Option<ToplevelSurface>,
+    /// `Some(_)` when this toplevel is backed by an X11 window (i.e. the
+    /// client is an Xwayland app). Mutually exclusive with `toplevel`.
+    pub x11_surface: Option<smithay::xwayland::X11Surface>,
     /// Cascaded compositor-space position.
     pub x: i32,
     pub y: i32,

@@ -108,7 +108,9 @@ impl CompositorHandler for SpikeState {
                     .unwrap_or(true)
             });
             if !initial_sent {
-                toplevel.toplevel.send_configure();
+                if let Some(t) = toplevel.toplevel.as_ref() {
+                    t.send_configure();
+                }
             }
         }
         if let Some(popup) = self.popups.iter().find(|p| &p.surface == surface) {

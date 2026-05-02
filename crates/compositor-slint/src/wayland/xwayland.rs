@@ -28,11 +28,12 @@
 
 use std::os::unix::io::OwnedFd;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use smithay::{
     delegate_xwayland_keyboard_grab, delegate_xwayland_shell,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Rectangle},
+    utils::{Logical, Rectangle, SERIAL_COUNTER},
     wayland::{
         selection::{
             data_device::{
@@ -55,7 +56,7 @@ use smithay::{
 };
 use tracing::{debug, info, warn};
 
-use crate::wayland_state::SpikeState;
+use crate::wayland_state::{ClientSurfaceData, SpikeState, ToplevelInfo};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Process lifecycle
@@ -174,11 +175,6 @@ impl XwmHandler for SpikeState {
     }
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        // Tell the X11 client we accept the map. Anvil places the window via
-        // its space machinery here; we use the geometry the client requested
-        // (or its existing geometry if it didn't specify one) — the
-        // `WindowManager` will lay it out properly once the underlying
-        // wl_surface gets a buffer and our existing toplevel-tracking kicks in.
         if let Err(e) = window.set_mapped(true) {
             warn!("X11: set_mapped(true) failed: {e}");
             return;
@@ -187,7 +183,52 @@ impl XwmHandler for SpikeState {
         if let Err(e) = window.configure(Some(geo)) {
             warn!("X11: configure on map failed: {e}");
         }
-        debug!("X11: map_window_request id={:?} geo={:?}", window.window_id(), geo);
+
+        // Bridge into the same `toplevels` list our xdg-shell handler uses
+        // so the rest of the compositor (buffer import on commit, focus,
+        // chrome rendering) treats the X11 window like a native toplevel.
+        // The wl_surface is what XWayland creates for us once the X11
+        // client paints — it may not exist yet at the moment of
+        // map_window_request, in which case we'll skip and re-try in
+        // `mapped_override_redirect_window` / on first commit. For a
+        // managed window with a known wl_surface we go ahead and track.
+        if let Some(wl_surface) = window.wl_surface() {
+            let already_tracked = self
+                .toplevels
+                .iter()
+                .any(|t| t.surface == wl_surface);
+            if !already_tracked {
+                let cascade = self.toplevels.len() as i32;
+                let x = 100 + cascade * 40;
+                let y = 100 + cascade * 40;
+                self.toplevels.push(ToplevelInfo {
+                    surface: wl_surface.clone(),
+                    toplevel: None,
+                    x11_surface: Some(window.clone()),
+                    x,
+                    y,
+                    pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+                    csd: !window.is_decorated(),
+                });
+                self.active_surface = Some(wl_surface.clone());
+                if let Some(kb) = self.seat.get_keyboard() {
+                    kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+                }
+                let _ = window.set_activated(true);
+                info!(
+                    "X11: registered toplevel id={:?} class={:?} title={:?} at ({x},{y})",
+                    window.window_id(),
+                    window.class(),
+                    window.title()
+                );
+            }
+        } else {
+            debug!(
+                "X11: map_window_request id={:?} geo={:?} (no wl_surface yet)",
+                window.window_id(),
+                geo
+            );
+        }
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -200,6 +241,16 @@ impl XwmHandler for SpikeState {
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
         debug!("X11: unmapped id={:?}", window.window_id());
+        if let Some(wl_surface) = window.wl_surface() {
+            self.destroyed_surfaces.push(wl_surface.clone());
+            self.toplevels.retain(|t| t.surface != wl_surface);
+            if self.active_surface.as_ref() == Some(&wl_surface) {
+                self.active_surface = self
+                    .toplevels
+                    .last()
+                    .map(|t| t.surface.clone());
+            }
+        }
         if !window.is_override_redirect() {
             let _ = window.set_mapped(false);
         }
@@ -207,6 +258,16 @@ impl XwmHandler for SpikeState {
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
         debug!("X11: destroyed id={:?}", window.window_id());
+        if let Some(wl_surface) = window.wl_surface() {
+            self.destroyed_surfaces.push(wl_surface.clone());
+            self.toplevels.retain(|t| t.surface != wl_surface);
+            if self.active_surface.as_ref() == Some(&wl_surface) {
+                self.active_surface = self
+                    .toplevels
+                    .last()
+                    .map(|t| t.surface.clone());
+            }
+        }
     }
 
     fn configure_request(

@@ -1751,26 +1751,43 @@ impl CompositorApp {
         }
     }
 
-    /// Send an xdg_toplevel.close request to the client.
+    /// Send a close request to the client backing `surface`. Routes to
+    /// `xdg_toplevel.send_close` for native wayland clients, or to
+    /// `WM_DELETE_WINDOW` via the X11 window for Xwayland clients.
     fn send_xdg_close(&self, surface: &WlSurface, state: &mut SpikeState) {
         for toplevel in &state.toplevels {
             if &toplevel.surface == surface {
-                debug!("WM: sending xdg_toplevel.close to client");
-                toplevel.toplevel.send_close();
+                if let Some(t) = toplevel.toplevel.as_ref() {
+                    debug!("WM: sending xdg_toplevel.close to client");
+                    t.send_close();
+                } else if let Some(x) = toplevel.x11_surface.as_ref() {
+                    debug!("WM: sending X11 close to xwayland client");
+                    let _ = x.close();
+                }
                 break;
             }
         }
     }
 
-    /// Send xdg_toplevel configure with a new size to the client.
+    /// Send a configure with a new size to the client. xdg toplevels get
+    /// a real `xdg_toplevel.configure`; Xwayland windows get an X11
+    /// `ConfigureNotify` via `X11Surface::configure`.
     fn send_configure(&self, surface: &WlSurface, w: i32, h: i32, state: &mut SpikeState) {
         for toplevel in &state.toplevels {
             if &toplevel.surface == surface {
-                debug!("WM: sending xdg_toplevel configure {}x{}", w, h);
-                toplevel.toplevel.with_pending_state(|s| {
-                    s.size = Some((w, h).into());
-                });
-                toplevel.toplevel.send_configure();
+                if let Some(t) = toplevel.toplevel.as_ref() {
+                    debug!("WM: sending xdg_toplevel configure {}x{}", w, h);
+                    t.with_pending_state(|s| {
+                        s.size = Some((w, h).into());
+                    });
+                    t.send_configure();
+                } else if let Some(x) = toplevel.x11_surface.as_ref() {
+                    debug!("WM: sending X11 configure {}x{}", w, h);
+                    let mut geo = x.geometry();
+                    geo.size.w = w;
+                    geo.size.h = h;
+                    let _ = x.configure(Some(geo));
+                }
                 break;
             }
         }

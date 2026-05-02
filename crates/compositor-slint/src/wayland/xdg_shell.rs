@@ -56,7 +56,8 @@ impl XdgShellHandler for SpikeState {
         // Add to toplevels list.
         self.toplevels.push(ToplevelInfo {
             surface: wl_surface.clone(),
-            toplevel: surface.clone(),
+            toplevel: Some(surface.clone()),
+            x11_surface: None,
             x,
             y,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
