@@ -45,17 +45,21 @@ use smithay::{
         },
     },
     delegate_dmabuf, delegate_seat, delegate_shm,
-    input::{pointer::CursorImageStatus, Seat, SeatHandler, SeatState},
+    input::{
+        dnd::{DnDGrab, DndGrabHandler, DndTarget, GrabType, Source},
+        pointer::{CursorImageStatus, Focus},
+        Seat, SeatHandler, SeatState,
+    },
     output::Output,
     reexports::{
         calloop::{LoopHandle, LoopSignal},
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
-            protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+            protocol::{wl_buffer::WlBuffer, wl_shm, wl_surface::WlSurface},
             Client, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Monotonic},
+    utils::{Clock, Logical, Monotonic, Point, Serial},
     wayland::{
         alpha_modifier::AlphaModifierState,
         buffer::BufferHandler,
@@ -69,6 +73,14 @@ use smithay::{
         fractional_scale::FractionalScaleManagerState,
         idle_inhibit::IdleInhibitManagerState,
         idle_notify::IdleNotifierState,
+        image_capture_source::{
+            ImageCaptureSource, ImageCaptureSourceHandler, ImageCaptureSourceState,
+            OutputCaptureSourceHandler, OutputCaptureSourceState,
+        },
+        image_copy_capture::{
+            BufferConstraints, Frame, ImageCopyCaptureHandler, ImageCopyCaptureState, Session,
+            SessionRef,
+        },
         input_method::InputMethodManagerState,
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
         output::OutputManagerState,
@@ -78,8 +90,12 @@ use smithay::{
         relative_pointer::RelativePointerManagerState,
         security_context::SecurityContextState,
         selection::{
-            data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
-            primary_selection::{PrimarySelectionHandler, PrimarySelectionState},
+            data_device::{
+                set_data_device_focus, DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+            },
+            primary_selection::{
+                set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
+            },
             wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler,
         },
@@ -249,6 +265,21 @@ pub struct SpikeState {
     pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
     pub xdg_toplevel_tag_manager: XdgToplevelTagManager,
 
+    // ── P2 Screen capture (ext-image-copy-capture-v1) ─────────────────────
+    /// Stateless registry of `ext-image-capture-source` objects (the protocol
+    /// side that lets a client say "I want to capture this output / toplevel").
+    pub image_capture_source_state: ImageCaptureSourceState,
+    /// Backs `ext-output-image-capture-source-manager-v1` — vends per-output
+    /// capture sources and stores a `WeakOutput` in the source's user data so
+    /// `capture_constraints` can recover the size/format on demand.
+    pub output_capture_source_state: OutputCaptureSourceState,
+    /// Backs `ext-image-copy-capture-manager-v1` — manages capture sessions
+    /// and frames. We currently fail every frame request via
+    /// `frame.fail(Unknown)` since wgpu-side framebuffer readback is not
+    /// wired yet, but the global must still bind so `grim` /
+    /// `xdg-desktop-portal-wlr` / OBS don't error out at startup.
+    pub image_copy_capture_state: ImageCopyCaptureState,
+
     // ── Bookkeeping ───────────────────────────────────────────────────────
     /// The single virtual output for this compositor. Stored here so the
     /// surface enter/leave bookkeeping (which drives wl_output binding and
@@ -257,6 +288,14 @@ pub struct SpikeState {
 
     /// Currently-focused xdg toplevel surface.
     pub active_surface: Option<WlSurface>,
+
+    /// Drag-and-drop icon surface for the active client-initiated DnD grab.
+    /// Set by `WaylandDndGrabHandler::dnd_requested` when the client supplies
+    /// an icon, cleared in `DndGrabHandler::dropped` / `cancelled`. The
+    /// renderer composites this surface under the cursor while a DnD is
+    /// active. TODO(renderer): pick this up in the per-frame compose pass
+    /// (see `update_windows`) and draw the icon at `pointer_pos`.
+    pub dnd_icon: Option<WlSurface>,
 
     /// All mapped toplevels (multi-window support, insertion-ordered).
     pub toplevels: Vec<ToplevelInfo>,
@@ -389,6 +428,10 @@ impl SpikeState {
         let xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(dh);
         let xdg_toplevel_tag_manager = XdgToplevelTagManager::new::<Self>(dh);
 
+        let image_capture_source_state = ImageCaptureSourceState::new();
+        let output_capture_source_state = OutputCaptureSourceState::new::<Self>(dh);
+        let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(dh);
+
         let mut state = Self {
             display_handle,
             loop_handle,
@@ -434,8 +477,12 @@ impl SpikeState {
             xdg_system_bell_state,
             xdg_toplevel_icon_manager,
             xdg_toplevel_tag_manager,
+            image_capture_source_state,
+            output_capture_source_state,
+            image_copy_capture_state,
             output: None,
             active_surface: None,
+            dnd_icon: None,
             toplevels: Vec::new(),
             popups: Vec::new(),
             layer_surfaces: Vec::new(),
@@ -953,7 +1000,17 @@ impl SeatHandler for SpikeState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Self::KeyboardFocus>) {
+        // Anvil pattern: route the new keyboard focus's owning client into the
+        // selection sub-states so wl_data_device.selection /
+        // primary_selection.selection events fire on focus transitions.
+        // Without this, copy-paste between apps "works" only by accident
+        // (the previous focus's offer leaks until something else clears it).
+        let dh = &self.display_handle;
+        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client.clone());
+        set_primary_focus(dh, seat, client);
+    }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         // Honour `wl_pointer.set_cursor` — primarily so clients that hide
@@ -978,7 +1035,60 @@ impl SelectionHandler for SpikeState {
 // DataDeviceHandler
 // ──────────────────────────────────────────────────────────────────────────────
 
-impl WaylandDndGrabHandler for SpikeState {}
+impl WaylandDndGrabHandler for SpikeState {
+    fn dnd_requested<S: Source>(
+        &mut self,
+        source: S,
+        icon: Option<WlSurface>,
+        seat: Seat<Self>,
+        serial: Serial,
+        type_: GrabType,
+    ) {
+        // Capture the icon so the renderer can composite it under the cursor
+        // while the drag is active. Cleared in `DndGrabHandler::dropped` and
+        // `cancelled`. (Anvil tracks an offset alongside the surface; we
+        // don't have a hotspot story yet so origin-anchor is fine.)
+        self.dnd_icon = icon;
+
+        match type_ {
+            GrabType::Pointer => {
+                let Some(pointer) = seat.get_pointer() else { return };
+                let Some(start_data) = pointer.grab_start_data() else { return };
+                pointer.set_grab(
+                    self,
+                    DnDGrab::new_pointer(&self.display_handle, start_data, source, seat),
+                    serial,
+                    Focus::Keep,
+                );
+            }
+            GrabType::Touch => {
+                let Some(touch) = seat.get_touch() else { return };
+                let Some(start_data) = touch.grab_start_data() else { return };
+                touch.set_grab(
+                    self,
+                    DnDGrab::new_touch(&self.display_handle, start_data, source, seat),
+                    serial,
+                );
+            }
+        }
+    }
+}
+
+impl DndGrabHandler for SpikeState {
+    fn dropped(
+        &mut self,
+        _target: Option<DndTarget<'_, Self>>,
+        _validated: bool,
+        _seat: Seat<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        self.dnd_icon = None;
+    }
+
+    fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
+        self.dnd_icon = None;
+    }
+}
 
 impl DataDeviceHandler for SpikeState {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
@@ -1014,3 +1124,70 @@ impl DataControlHandler for SpikeState {
 }
 
 smithay::delegate_data_control!(SpikeState);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ext-image-capture-source-v1 + ext-image-copy-capture-v1
+//
+// These three globals are advertised in the constructor; the handlers below
+// are minimal stubs:
+//   - source_destroyed / new_session do nothing (we don't track sessions yet).
+//   - output_source_created stores a WeakOutput in the source's user data so
+//     `capture_constraints` can recover the output's mode.
+//   - capture_constraints reports the current output's pixel size + ARGB/XRGB
+//     SHM formats so well-behaved clients see a "compatible" path.
+//   - frame() fails immediately with `Unknown` — we don't have a wgpu
+//     readback path yet. This satisfies the protocol contract: the client
+//     gets a clean failure instead of a hang or a missing-global error.
+//     TODO(renderer): implement actual readback by hooking into the
+//     post-present submit on the wgpu queue and copying the output texture
+//     into the client-supplied wl_buffer (SHM today, dmabuf later).
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl ImageCaptureSourceHandler for SpikeState {
+    fn source_destroyed(&mut self, _source: ImageCaptureSource) {}
+}
+
+smithay::delegate_image_capture_source!(SpikeState);
+
+impl OutputCaptureSourceHandler for SpikeState {
+    fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
+        &mut self.output_capture_source_state
+    }
+
+    fn output_source_created(&mut self, source: ImageCaptureSource, output: &Output) {
+        source.user_data().insert_if_missing(|| output.downgrade());
+    }
+}
+
+smithay::delegate_output_capture_source!(SpikeState);
+
+impl ImageCopyCaptureHandler for SpikeState {
+    fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
+        &mut self.image_copy_capture_state
+    }
+
+    fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
+        use smithay::output::WeakOutput;
+        let weak_output = source.user_data().get::<WeakOutput>()?;
+        let output = weak_output.upgrade()?;
+        let mode = output.current_mode()?;
+        Some(BufferConstraints {
+            size: mode
+                .size
+                .to_logical(1)
+                .to_buffer(1, smithay::utils::Transform::Normal),
+            shm: vec![wl_shm::Format::Argb8888, wl_shm::Format::Xrgb8888],
+            dma: None,
+        })
+    }
+
+    fn new_session(&mut self, _session: Session) {}
+
+    fn frame(&mut self, _session: &SessionRef, frame: Frame) {
+        // Stub: framebuffer readback isn't wired yet, fail gracefully so
+        // clients see a defined error rather than a hung capture.
+        frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+    }
+}
+
+smithay::delegate_image_copy_capture!(SpikeState);
