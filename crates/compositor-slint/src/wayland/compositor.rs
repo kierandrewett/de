@@ -26,6 +26,7 @@ use smithay::{
         dmabuf::get_dmabuf,
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
+    xwayland::XWaylandClientData,
 };
 use tracing::debug;
 
@@ -38,6 +39,12 @@ impl CompositorHandler for SpikeState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        // XWayland's wayland-side client has its own ClientData type; check
+        // for it before falling back to our regular ClientState. Without
+        // this branch the unwrap below blows up the moment Xwayland connects.
+        if let Some(state) = client.get_data::<XWaylandClientData>() {
+            return &state.compositor_state;
+        }
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 

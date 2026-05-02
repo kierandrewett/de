@@ -3418,6 +3418,12 @@ pub fn run() -> Result<()> {
     // wl_surface.preferred_buffer_scale / preferred_buffer_transform).
     state.output = Some(output.clone());
 
+    // 5b. XWayland — spawn the Xwayland binary so X11 clients can connect
+    // through us. The X11Wm + X11 display number land on `state` via the
+    // `XWaylandEvent::Ready` callback. Failure is logged but non-fatal —
+    // wayland-native clients keep working without it.
+    crate::wayland::xwayland::start_xwayland(&mut state);
+
     // 6. winit event loop.
     let mut winit_event_loop = WinitEventLoop::new().context("failed to create winit event loop")?;
     winit_event_loop.set_control_flow(ControlFlow::Poll);

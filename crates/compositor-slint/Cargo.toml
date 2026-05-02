@@ -19,9 +19,6 @@ smithay = { git = "https://github.com/Smithay/smithay.git", features = [
     "xwayland",
     "x11rb_event_source",
 ] }
-# X11 protocol bindings — used to talk to the Xwayland server through the
-# X11 socket smithay hands us in `XWaylandEvent::Ready`.
-x11rb = { version = "0.13", default-features = false, features = ["composite"] }
 calloop = "0.13"
 wayland-server = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }

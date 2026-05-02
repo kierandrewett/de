@@ -100,7 +100,10 @@ use smithay::{
         xdg_system_bell::XdgSystemBellState,
         xdg_toplevel_icon::XdgToplevelIconManager,
         xdg_toplevel_tag::XdgToplevelTagManager,
+        xwayland_keyboard_grab::XWaylandKeyboardGrabState,
+        xwayland_shell::XWaylandShellState,
     },
+    xwayland::X11Wm,
 };
 use tracing::{debug, info, warn};
 
@@ -249,6 +252,16 @@ pub struct SpikeState {
     pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
     pub xdg_toplevel_tag_manager: XdgToplevelTagManager,
 
+    // ── XWayland ─────────────────────────────────────────────────────────
+    /// The xwayland_shell_v1 global state — needed for the Xwayland process to
+    /// associate a wl_surface with the X11 window it represents.
+    pub xwayland_shell_state: XWaylandShellState,
+    /// The X11 window manager attached to the running Xwayland instance.
+    /// `None` until `XWaylandEvent::Ready` fires (or after Xwayland exits).
+    pub xwm: Option<X11Wm>,
+    /// X11 display number Xwayland is listening on (for `DISPLAY=:N`).
+    pub xdisplay: Option<u32>,
+
     // ── Bookkeeping ───────────────────────────────────────────────────────
     /// The single virtual output for this compositor. Stored here so the
     /// surface enter/leave bookkeeping (which drives wl_output binding and
@@ -389,6 +402,9 @@ impl SpikeState {
         let xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(dh);
         let xdg_toplevel_tag_manager = XdgToplevelTagManager::new::<Self>(dh);
 
+        let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
+        XWaylandKeyboardGrabState::new::<Self>(dh);
+
         let mut state = Self {
             display_handle,
             loop_handle,
@@ -434,6 +450,9 @@ impl SpikeState {
             xdg_system_bell_state,
             xdg_toplevel_icon_manager,
             xdg_toplevel_tag_manager,
+            xwayland_shell_state,
+            xwm: None,
+            xdisplay: None,
             output: None,
             active_surface: None,
             toplevels: Vec::new(),
@@ -979,6 +998,11 @@ impl SelectionHandler for SpikeState {
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl WaylandDndGrabHandler for SpikeState {}
+
+// Required by X11Wm::start_wm — XWayland's DnD bridge needs a handler on
+// the wayland side. We don't drive DnD specially yet, so accept the
+// defaults (which drop the icon and do nothing on cancel).
+impl smithay::input::dnd::DndGrabHandler for SpikeState {}
 
 impl DataDeviceHandler for SpikeState {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
