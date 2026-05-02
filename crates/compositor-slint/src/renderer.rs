@@ -309,6 +309,15 @@ struct CompositorApp {
     /// committed pixels.
     dnd_icon_snapshot: Option<DndIconSnapshot>,
 
+    /// When the host's window scale_factor changes (HiDPI hot-plug, monitor
+    /// drag, Hyprland fractional toggle), we update our wgpu/wm/etc. on
+    /// the spot but the wl_output's advertised scale lives behind
+    /// `state.output` which isn't reachable from the winit handler.
+    /// Stash the value here; drain it inside `update_windows` (where we
+    /// have `state`) and call `output.change_current_state(scale)` so
+    /// clients see fresh `preferred_buffer_scale` events.
+    pending_output_scale: Option<f64>,
+
     /// Snapshot of the first ext-session-lock-v1 lock surface's pixels.
     /// Refreshed each `update_windows`; consumed by `render_frame` to
     /// overwrite the entire `final_tex` whenever `session_locked` is set.
@@ -399,6 +408,7 @@ impl CompositorApp {
             pending_ipc: Arc::new(Mutex::new(Vec::new())),
             last_present_time: None,
             dnd_icon_snapshot: None,
+            pending_output_scale: None,
             lock_surface_snapshot: None,
         }
     }
@@ -477,6 +487,14 @@ impl ApplicationHandler for CompositorApp {
         let initial_phys_w = (WIDTH  as f32 * initial_scale).round() as u32;
         let initial_phys_h = (HEIGHT as f32 * initial_scale).round() as u32;
         self.scale_factor = initial_scale;
+        // Output is created in main() before winit knows the host's
+        // scale; push the value through to the wl_output on the next
+        // update_windows tick so fractional-scale-v1 + per-surface
+        // preferred_buffer_scale fire with the right value at startup
+        // rather than waiting for the first scale change.
+        if (initial_scale - 1.0).abs() > 0.001 {
+            self.pending_output_scale = Some(initial_scale as f64);
+        }
         info!(
             "compositor window opened: logical={}x{} physical={}x{} scale_factor={}",
             WIDTH, HEIGHT, initial_phys_w, initial_phys_h, initial_scale,
@@ -533,6 +551,9 @@ impl ApplicationHandler for CompositorApp {
                     .max(0.0001);
                 let prev_scale = self.scale_factor;
                 self.scale_factor = scale as f32;
+                if (prev_scale as f64 - scale).abs() > 0.001 {
+                    self.pending_output_scale = Some(scale);
+                }
                 let logical_w = ((size.width  as f64 / scale).round() as u32).max(1);
                 let logical_h = ((size.height as f64 / scale).round() as u32).max(1);
                 info!(
@@ -1144,6 +1165,21 @@ impl CompositorApp {
         use smithay::wayland::shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData};
 
         let Some(ui) = self.ui.as_ref() else { return };
+
+        // If the host's scale_factor changed since the last tick, flush
+        // the new value into the wl_output. Smithay walks every surface
+        // bound to this output and (re)fires preferred_buffer_scale, so
+        // clients adapt without a per-surface push from us.
+        if let Some(scale) = self.pending_output_scale.take() {
+            if let Some(out) = state.output.as_ref() {
+                out.change_current_state(
+                    None,
+                    None,
+                    Some(smithay::output::Scale::Fractional(scale)),
+                    None,
+                );
+            }
+        }
 
         // Tick the WM animations.
         self.wm.tick_auto();
