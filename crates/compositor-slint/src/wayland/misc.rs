@@ -55,16 +55,23 @@ impl XdgActivationHandler for SpikeState {
 
     fn request_activation(
         &mut self,
-        _token: XdgActivationToken,
-        _token_data: XdgActivationTokenData,
+        token: XdgActivationToken,
+        token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        // Honour the activation request unconditionally for now — anvil
-        // does the same. A focus-stealing-prevention pass would gate on
-        // `token_data.user_data` (a recent user-interaction serial); we
-        // don't yet track that. Without this handler doing anything,
-        // "open from terminal" / "click notification action" workflows
-        // never raise the new window.
+        // Focus-stealing prevention: an activation token minted without
+        // a `(serial, seat)` from a recent user input event is "blind"
+        // — programmatic, no user intent behind it. Drop it on the
+        // floor. Tokens with a serial pass through and raise/focus the
+        // requested surface (terminal launches that pass
+        // XDG_ACTIVATION_TOKEN, notification action clicks, etc).
+        if token_data.serial.is_none() {
+            tracing::debug!(
+                "xdg-activation: dropping blind token (no input serial) for app_id={:?} token={:?}",
+                token_data.app_id, token,
+            );
+            return;
+        }
         self.active_surface = Some(surface.clone());
         if let Some(kb) = self.seat.get_keyboard() {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
