@@ -34,12 +34,9 @@ async fn read_menu_property(bus: &str, sni_path: &str) -> Option<String> {
     let conn = Connection::session().await.ok()?;
     let bus_name = BusName::try_from(bus.to_string()).ok()?;
     let obj_path = ObjectPath::try_from(sni_path).ok()?;
-    let proxy = Proxy::new(
-        &conn,
-        bus_name,
-        obj_path,
-        "org.kde.StatusNotifierItem",
-    ).await.ok()?;
+    let proxy = Proxy::new(&conn, bus_name, obj_path, "org.kde.StatusNotifierItem")
+        .await
+        .ok()?;
     let v: OwnedValue = proxy.get_property("Menu").await.ok()?;
     let val: Value<'_> = v.into();
     match val {
@@ -62,9 +59,13 @@ fn prop<T: TryFrom<OwnedValue>>(props: &HashMap<String, OwnedValue>, key: &str) 
 /// is skipped; everything else with a non-empty label or `type=separator`
 /// is appended in document order.
 fn flatten_node(node_value: &Value<'_>, out: &mut Vec<DbusMenuItem>) {
-    let Value::Structure(s) = node_value else { return };
+    let Value::Structure(s) = node_value else {
+        return;
+    };
     let fields = s.fields();
-    if fields.len() < 3 { return; }
+    if fields.len() < 3 {
+        return;
+    }
 
     let id: i32 = match &fields[0] {
         Value::I32(i) => *i,
@@ -91,7 +92,13 @@ fn flatten_node(node_value: &Value<'_>, out: &mut Vec<DbusMenuItem>) {
     let visible: bool = prop(&props, "visible").unwrap_or(true);
 
     if id != 0 && visible && (separator || !label.is_empty()) {
-        out.push(DbusMenuItem { id, label, enabled, visible, separator });
+        out.push(DbusMenuItem {
+            id,
+            label,
+            enabled,
+            visible,
+            separator,
+        });
     }
 
     // children: array of variants, each variant wraps a recursive
@@ -116,7 +123,10 @@ where
     std::thread::spawn(move || {
         let rt = match Builder::new_current_thread().enable_all().build() {
             Ok(r) => r,
-            Err(_) => { done(Vec::new()); return; }
+            Err(_) => {
+                done(Vec::new());
+                return;
+            }
         };
         let items = rt.block_on(async move {
             let menu_path = match read_menu_property(&bus, &sni_path).await {
@@ -135,19 +145,21 @@ where
                 Ok(p) => p,
                 Err(_) => return Vec::new(),
             };
-            let proxy = match Proxy::new(
-                &conn, bus_name, obj_path, "com.canonical.dbusmenu",
-            ).await {
+            let proxy = match Proxy::new(&conn, bus_name, obj_path, "com.canonical.dbusmenu").await
+            {
                 Ok(p) => p,
                 Err(_) => return Vec::new(),
             };
             // Tell the client we're about to show the menu — some apps
             // populate state lazily in response.
             let _ = proxy.call::<_, _, bool>("AboutToShow", &(0i32)).await;
-            let response: (u32, OwnedValue) = match proxy.call(
-                "GetLayout",
-                &(0i32, 1i32, vec!["label", "type", "enabled", "visible"]),
-            ).await {
+            let response: (u32, OwnedValue) = match proxy
+                .call(
+                    "GetLayout",
+                    &(0i32, 1i32, vec!["label", "type", "enabled", "visible"]),
+                )
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::debug!("dbusmenu GetLayout failed: {e}");
@@ -176,24 +188,30 @@ pub fn send_clicked(bus: String, sni_path: String, item_id: i32) {
                 Some(p) => p,
                 None => return,
             };
-            let conn = match Connection::session().await { Ok(c) => c, Err(_) => return };
-            let bus_name = match BusName::try_from(bus) { Ok(b) => b, Err(_) => return };
+            let conn = match Connection::session().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let bus_name = match BusName::try_from(bus) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
             let obj_path = match ObjectPath::try_from(menu_path.as_str()) {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let proxy = match Proxy::new(
-                &conn, bus_name, obj_path, "com.canonical.dbusmenu",
-            ).await {
+            let proxy = match Proxy::new(&conn, bus_name, obj_path, "com.canonical.dbusmenu").await
+            {
                 Ok(p) => p,
                 Err(_) => return,
             };
             let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
-            let _ = proxy.call::<_, _, ()>(
-                "Event",
-                &(item_id, "clicked", Value::U32(0), timestamp),
-            ).await;
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            let _ = proxy
+                .call::<_, _, ()>("Event", &(item_id, "clicked", Value::U32(0), timestamp))
+                .await;
         });
     });
 }

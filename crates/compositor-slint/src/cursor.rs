@@ -62,10 +62,18 @@ pub enum HitZone {
     EdgeEast,
     EdgeWest,
     /// Resize corners — carry the rotation angle offset (radians) for the cursor icon.
-    CornerNW { angle_offset: f64 },
-    CornerNE { angle_offset: f64 },
-    CornerSW { angle_offset: f64 },
-    CornerSE { angle_offset: f64 },
+    CornerNW {
+        angle_offset: f64,
+    },
+    CornerNE {
+        angle_offset: f64,
+    },
+    CornerSW {
+        angle_offset: f64,
+    },
+    CornerSE {
+        angle_offset: f64,
+    },
 }
 
 /// Resolved cursor shape for the current pointer position.
@@ -79,9 +87,13 @@ pub enum CursorKind {
     ResizeE,
     ResizeW,
     /// Diagonal NW/SE resize, rotated by `angle_offset` radians from its natural diagonal.
-    ResizeNWSE { angle_offset: f64 },
+    ResizeNWSE {
+        angle_offset: f64,
+    },
     /// Diagonal NE/SW resize, rotated by `angle_offset` radians.
-    ResizeNESW { angle_offset: f64 },
+    ResizeNESW {
+        angle_offset: f64,
+    },
 }
 
 /// Window geometry used by the hit-tester.
@@ -92,6 +104,12 @@ pub struct WindowRect {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// True when the client paints its own header bar (xdg-decoration
+    /// ClientSide). The top `TITLEBAR_HEIGHT` band is then part of the
+    /// client's own UI and must NOT be treated as our SSD titlebar drag
+    /// zone — otherwise every click on the GTK header eats into a Move
+    /// drag instead of reaching the close / menu / search buttons.
+    pub csd: bool,
 }
 
 /// Describes where the pointer is relative to a window.
@@ -136,8 +154,12 @@ fn corner_angle_offset(
     let mut delta = angle - natural_rad;
 
     // Normalise delta to [-π, π].
-    while delta > PI { delta -= 2.0 * PI; }
-    while delta < -PI { delta += 2.0 * PI; }
+    while delta > PI {
+        delta -= 2.0 * PI;
+    }
+    while delta < -PI {
+        delta += 2.0 * PI;
+    }
 
     // Clamp to ±45° (π/4) — outside the arc we use the neutral angle.
     let max = PI / 4.0;
@@ -158,13 +180,15 @@ pub fn hit_test(ptr_x: f64, ptr_y: f64, windows: &[WindowRect]) -> Option<HitRes
             && ptr_y >= wy - EDGE_ZONE
             && ptr_y < wy + wh + EDGE_ZONE;
 
-        if !in_outer { continue; }
+        if !in_outer {
+            continue;
+        }
 
         // ── Corner zones (checked first — highest priority) ─────────────────
         // Each corner zone is a CORNER_ZONE × CORNER_ZONE square at each corner.
-        let near_left   = ptr_x < wx + CORNER_ZONE;
-        let near_right  = ptr_x >= wx + ww - CORNER_ZONE;
-        let near_top    = ptr_y < wy + CORNER_ZONE;
+        let near_left = ptr_x < wx + CORNER_ZONE;
+        let near_right = ptr_x >= wx + ww - CORNER_ZONE;
+        let near_top = ptr_y < wy + CORNER_ZONE;
         let near_bottom = ptr_y >= wy + wh - CORNER_ZONE;
 
         if near_top && near_left {
@@ -173,7 +197,9 @@ pub fn hit_test(ptr_x: f64, ptr_y: f64, windows: &[WindowRect]) -> Option<HitRes
             let offset = corner_angle_offset(ptr_x, ptr_y, wx, wy, 1.0, 1.0, 225.0);
             return Some(HitResult {
                 window_id: win.id,
-                zone: HitZone::CornerNW { angle_offset: offset },
+                zone: HitZone::CornerNW {
+                    angle_offset: offset,
+                },
             });
         }
         if near_top && near_right {
@@ -181,7 +207,9 @@ pub fn hit_test(ptr_x: f64, ptr_y: f64, windows: &[WindowRect]) -> Option<HitRes
             let offset = corner_angle_offset(ptr_x, ptr_y, wx + ww, wy, -1.0, 1.0, 315.0);
             return Some(HitResult {
                 window_id: win.id,
-                zone: HitZone::CornerNE { angle_offset: offset },
+                zone: HitZone::CornerNE {
+                    angle_offset: offset,
+                },
             });
         }
         if near_bottom && near_left {
@@ -189,7 +217,9 @@ pub fn hit_test(ptr_x: f64, ptr_y: f64, windows: &[WindowRect]) -> Option<HitRes
             let offset = corner_angle_offset(ptr_x, ptr_y, wx, wy + wh, 1.0, -1.0, 135.0);
             return Some(HitResult {
                 window_id: win.id,
-                zone: HitZone::CornerSW { angle_offset: offset },
+                zone: HitZone::CornerSW {
+                    angle_offset: offset,
+                },
             });
         }
         if near_bottom && near_right {
@@ -197,27 +227,45 @@ pub fn hit_test(ptr_x: f64, ptr_y: f64, windows: &[WindowRect]) -> Option<HitRes
             let offset = corner_angle_offset(ptr_x, ptr_y, wx + ww, wy + wh, -1.0, -1.0, 45.0);
             return Some(HitResult {
                 window_id: win.id,
-                zone: HitZone::CornerSE { angle_offset: offset },
+                zone: HitZone::CornerSE {
+                    angle_offset: offset,
+                },
             });
         }
 
         // ── Edge zones ──────────────────────────────────────────────────────
         if ptr_y < wy + EDGE_ZONE {
-            return Some(HitResult { window_id: win.id, zone: HitZone::EdgeNorth });
+            return Some(HitResult {
+                window_id: win.id,
+                zone: HitZone::EdgeNorth,
+            });
         }
         if ptr_y >= wy + wh - EDGE_ZONE {
-            return Some(HitResult { window_id: win.id, zone: HitZone::EdgeSouth });
+            return Some(HitResult {
+                window_id: win.id,
+                zone: HitZone::EdgeSouth,
+            });
         }
         if ptr_x < wx + EDGE_ZONE {
-            return Some(HitResult { window_id: win.id, zone: HitZone::EdgeWest });
+            return Some(HitResult {
+                window_id: win.id,
+                zone: HitZone::EdgeWest,
+            });
         }
         if ptr_x >= wx + ww - EDGE_ZONE {
-            return Some(HitResult { window_id: win.id, zone: HitZone::EdgeEast });
+            return Some(HitResult {
+                window_id: win.id,
+                zone: HitZone::EdgeEast,
+            });
         }
 
         // ── Inside window interior ───────────────────────────────────────────
-        // Check if pointer is in the title bar region.
-        if ptr_y >= wy && ptr_y < wy + TITLEBAR_HEIGHT {
+        // For CSD windows the client owns the entire chrome including the top
+        // band, so we skip the SSD titlebar / control-button zones entirely
+        // and treat the whole interior as Content. That lets pointer events
+        // (clicks on the GTK header's close / menu / search) flow through
+        // to the wayland client instead of being captured as a Move drag.
+        if !win.csd && ptr_y >= wy && ptr_y < wy + TITLEBAR_HEIGHT {
             // Check control buttons (right-to-left: minimize, maximize, close).
             let controls_x = wx + ww - CONTROLS_BLOCK_WIDTH - CONTROL_INSET;
             let controls_y = wy + CONTROL_INSET;
@@ -226,24 +274,39 @@ pub fn hit_test(ptr_x: f64, ptr_y: f64, windows: &[WindowRect]) -> Option<HitRes
                 // Minimize (leftmost).
                 let min_x = controls_x;
                 if ptr_x >= min_x && ptr_x < min_x + CONTROL_SIZE {
-                    return Some(HitResult { window_id: win.id, zone: HitZone::MinimizeButton });
+                    return Some(HitResult {
+                        window_id: win.id,
+                        zone: HitZone::MinimizeButton,
+                    });
                 }
                 // Maximize (middle).
                 let max_x = controls_x + CONTROL_SIZE + CONTROL_GAP;
                 if ptr_x >= max_x && ptr_x < max_x + CONTROL_SIZE {
-                    return Some(HitResult { window_id: win.id, zone: HitZone::MaximizeButton });
+                    return Some(HitResult {
+                        window_id: win.id,
+                        zone: HitZone::MaximizeButton,
+                    });
                 }
                 // Close (rightmost).
                 let close_x = controls_x + (CONTROL_SIZE + CONTROL_GAP) * 2.0;
                 if ptr_x >= close_x && ptr_x < close_x + CONTROL_SIZE {
-                    return Some(HitResult { window_id: win.id, zone: HitZone::CloseButton });
+                    return Some(HitResult {
+                        window_id: win.id,
+                        zone: HitZone::CloseButton,
+                    });
                 }
             }
-            return Some(HitResult { window_id: win.id, zone: HitZone::TitleBar });
+            return Some(HitResult {
+                window_id: win.id,
+                zone: HitZone::TitleBar,
+            });
         }
 
         // Content area.
-        return Some(HitResult { window_id: win.id, zone: HitZone::Content });
+        return Some(HitResult {
+            window_id: win.id,
+            zone: HitZone::Content,
+        });
     }
 
     None
@@ -252,16 +315,19 @@ pub fn hit_test(ptr_x: f64, ptr_y: f64, windows: &[WindowRect]) -> Option<HitRes
 /// Map a `HitZone` to the `CursorKind` to display.
 pub fn zone_to_cursor(zone: HitZone) -> CursorKind {
     match zone {
-        HitZone::None              => CursorKind::Arrow,
-        HitZone::TitleBar          => CursorKind::Move,
-        HitZone::CloseButton       => CursorKind::Hand,
-        HitZone::MinimizeButton    => CursorKind::Hand,
-        HitZone::MaximizeButton    => CursorKind::Hand,
-        HitZone::Content           => CursorKind::Arrow,
-        HitZone::EdgeNorth         => CursorKind::ResizeN,
-        HitZone::EdgeSouth         => CursorKind::ResizeS,
-        HitZone::EdgeEast          => CursorKind::ResizeE,
-        HitZone::EdgeWest          => CursorKind::ResizeW,
+        HitZone::None => CursorKind::Arrow,
+        HitZone::TitleBar => CursorKind::Move,
+        // Window controls keep the default arrow cursor — the
+        // hand/pointer felt heavy and macOS / GNOME don't use it for
+        // chrome buttons either.
+        HitZone::CloseButton => CursorKind::Arrow,
+        HitZone::MinimizeButton => CursorKind::Arrow,
+        HitZone::MaximizeButton => CursorKind::Arrow,
+        HitZone::Content => CursorKind::Arrow,
+        HitZone::EdgeNorth => CursorKind::ResizeN,
+        HitZone::EdgeSouth => CursorKind::ResizeS,
+        HitZone::EdgeEast => CursorKind::ResizeE,
+        HitZone::EdgeWest => CursorKind::ResizeW,
         HitZone::CornerNW { angle_offset } => CursorKind::ResizeNWSE { angle_offset },
         HitZone::CornerSE { angle_offset } => CursorKind::ResizeNWSE { angle_offset },
         HitZone::CornerNE { angle_offset } => CursorKind::ResizeNESW { angle_offset },
@@ -274,7 +340,14 @@ mod tests {
     use super::*;
 
     fn make_win(x: f64, y: f64, w: f64, h: f64) -> WindowRect {
-        WindowRect { id: 1, x, y, w, h }
+        WindowRect {
+            id: 1,
+            x,
+            y,
+            w,
+            h,
+            csd: false,
+        }
     }
 
     #[test]

@@ -6,7 +6,224 @@
 // soft drop-shadow. They animate in/out via opacity + translate-y; Rust
 // drives the "open" boolean on Compositor.slint.
 
-import { Tokens, Theme, TokenMode } from "./Tokens.slint";
+import { Tokens, Theme, TokenMode, CcPalette } from "./Tokens.slint";
+
+// ────────────────────────────────────────────────────────────────────────────
+// Control-centre helper components.
+//
+// Defined here as private components used only by ControlCentrePopout. They
+// take care of consistent sizing/colours so the popout body can be a clean
+// VerticalLayout / HorizontalLayout tree rather than a mountain of
+// hardcoded x/y offsets — when alignment is enforced by the layout system,
+// rows can't drift relative to each other.
+// ────────────────────────────────────────────────────────────────────────────
+
+// Round 32×32 icon button (the four header buttons: account / settings /
+// lock / power, and any future "system action" cluster).
+component CcRoundBtn inherits Rectangle {
+    in property <image> icon;
+    in property <bool>  btn-enabled: true;
+    callback clicked();
+
+    width:  32px;
+    height: 32px;
+    border-radius: self.height / 2;
+    background: ta.has-hover ? CcPalette.tile-bg-hover : CcPalette.tile-bg;
+    animate background { duration: 100ms; easing: ease-out; }
+
+    ta := TouchArea {
+        x: 0; y: 0;
+        width: parent.width; height: parent.height;
+        enabled: root.btn-enabled;
+        clicked => { root.clicked(); }
+    }
+    Image {
+        x: (parent.width  - 18px) / 2;
+        y: (parent.height - 18px) / 2;
+        width: 18px; height: 18px;
+        source: root.icon;
+        colorize: CcPalette.fg;
+    }
+}
+
+// Slider row: leading icon + 6 px-tall track with thumb-less rounded fill +
+// trailing chevron (opens a fuller settings page in the real shell).
+component CcSliderRow inherits Rectangle {
+    in property <image>     icon;
+    in-out property <float> value;
+    in property <bool>      sld-enabled: true;
+    callback changed(float);
+    callback chevron-clicked();
+
+    height: 28px;
+
+    Image {
+        x: 0;
+        y: (parent.height - 22px) / 2;
+        width: 22px; height: 22px;
+        source: root.icon;
+        colorize: CcPalette.fg;
+    }
+
+    track-ta := TouchArea {
+        x: 30px;
+        y: 0;
+        // Track stretches between leading icon and trailing chevron.
+        width:  parent.width - 30px - 28px;
+        height: parent.height;
+        enabled: root.sld-enabled;
+        moved => {
+            if (self.pressed) {
+                root.value = clamp(self.mouse-x / self.width, 0.0, 1.0);
+                root.changed(root.value);
+            }
+        }
+        clicked => {
+            root.value = clamp(self.mouse-x / self.width, 0.0, 1.0);
+            root.changed(root.value);
+        }
+    }
+    Rectangle {
+        x: track-ta.x;
+        y: (parent.height - 6px) / 2;
+        width:  track-ta.width;
+        height: 6px;
+        border-radius: 3px;
+        background: CcPalette.tile-bg;
+        Rectangle {
+            x: 0; y: 0;
+            width:  parent.width * root.value;
+            height: parent.height;
+            border-radius: 3px;
+            background: CcPalette.accent;
+            animate width { duration: 60ms; easing: ease-out; }
+        }
+    }
+
+    chev-ta := TouchArea {
+        x: parent.width - 22px;
+        y: 0;
+        width: 22px; height: parent.height;
+        enabled: root.sld-enabled;
+        clicked => { root.chevron-clicked(); }
+    }
+    Image {
+        x: parent.width - 18px;
+        y: (parent.height - 14px) / 2;
+        width: 14px; height: 14px;
+        source: @image-url("../assets/icons/chevron-right.svg");
+        colorize: CcPalette.fg-secondary;
+    }
+}
+
+// Capsule tile: icon-circle + title + optional subtitle + optional chevron.
+// `compact: true` shrinks for the secondary toggle row (Night Light, etc.).
+component CcTile inherits Rectangle {
+    in property <image>  icon;
+    in property <string> title;
+    in property <string> subtitle: "";
+    in property <bool>   active: false;
+    in property <bool>   show-chevron: true;
+    in property <bool>   tile-enabled: true;
+    in property <bool>   compact: false;
+    callback clicked();
+
+    height: root.compact ? 44px : 56px;
+    // Stretch to fill available width inside a HorizontalLayout — without
+    // this `Rectangle`-based components default to zero stretch and the
+    // tiles collapse to their content's preferred width (~0 since the
+    // children are absolutely positioned).
+    min-width: 100px;
+    horizontal-stretch: 1;
+    border-radius: self.height / 2;
+    background: ta.has-hover ? CcPalette.tile-bg-hover : CcPalette.tile-bg;
+    animate background { duration: 100ms; easing: ease-out; }
+
+    // Icon-circle dimensions derive from `compact` flag — bigger tiles
+    // get a 36 px circle with 22 px glyph; small ones a 32 px circle
+    // with 20 px glyph.
+    property <length> circle-size: root.compact ? 32px : 36px;
+    property <length> glyph-size:  root.compact ? 20px : 22px;
+    property <length> chev-pad:    root.show-chevron ? 28px : 8px;
+    // Inset from the tile's left/right edge to the icon circle / chevron.
+    property <length> edge-pad:    8px;
+    // Vertical positions for title-only vs title+subtitle. Centred as
+    // a block so its visual centre aligns with the icon-circle's centre.
+    property <length> title-h:     18px;
+    property <length> sub-h:       14px;
+    property <length> block-h:     root.subtitle == "" ? title-h
+                                                       : (title-h + sub-h);
+    property <length> block-y:     (root.height - block-h) / 2;
+
+    ta := TouchArea {
+        x: 0; y: 0;
+        width: parent.width; height: parent.height;
+        enabled: root.tile-enabled;
+        clicked => { root.clicked(); }
+    }
+
+    // Icon circle.
+    Rectangle {
+        x: parent.edge-pad;
+        y: (parent.height - parent.circle-size) / 2;
+        width:  parent.circle-size;
+        height: parent.circle-size;
+        border-radius: self.height / 2;
+        background: root.active ? CcPalette.accent : CcPalette.icon-bg-inactive;
+        animate background { duration: 120ms; easing: ease-out; }
+        Image {
+            x: (parent.width  - root.glyph-size) / 2;
+            y: (parent.height - root.glyph-size) / 2;
+            width:  root.glyph-size;
+            height: root.glyph-size;
+            source: root.icon;
+            colorize: root.active ? CcPalette.icon-on-active : CcPalette.fg;
+        }
+    }
+
+    // Title (and subtitle if non-empty). Both anchored relative to the
+    // icon-circle's right edge so spacing is consistent regardless of
+    // tile size or chevron presence.
+    Text {
+        x: parent.edge-pad + parent.circle-size + 8px;
+        y: parent.block-y;
+        width:  parent.width - parent.edge-pad - parent.circle-size - 8px - parent.chev-pad;
+        height: parent.title-h;
+        text: root.title;
+        color: CcPalette.fg;
+        font-family: Tokens.font-family;
+        font-size: 14px;
+        font-weight: 600;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Text {
+        x: parent.edge-pad + parent.circle-size + 8px;
+        y: parent.block-y + parent.title-h;
+        width:  parent.width - parent.edge-pad - parent.circle-size - 8px - parent.chev-pad;
+        height: parent.sub-h;
+        text: root.subtitle;
+        color: CcPalette.fg-secondary;
+        font-family: Tokens.font-family;
+        font-size: root.compact ? 10px : 11px;
+        font-weight: 500;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+        overflow: elide;
+        visible: root.subtitle != "";
+    }
+
+    // Trailing chevron.
+    Image {
+        x: parent.width - 22px;
+        y: (parent.height - 14px) / 2;
+        width: 14px; height: 14px;
+        source: @image-url("../assets/icons/chevron-right.svg");
+        colorize: CcPalette.fg-secondary;
+        visible: root.show-chevron;
+    }
+}
 
 // ── Calendar cell — single day in the grid. day-num=0 means "blank
 //    cell" (out-of-month padding); we render those at reduced opacity so the
@@ -31,6 +248,27 @@ export component DatetimePopout {
     /// 42-cell flat grid (6 rows × 7 columns) covering the visible month
     /// plus prev/next-month trail cells. Populated once per day from Rust.
     in property <[CalendarDay]> calendar-days;
+    /// Transform-origin for the scale animation, in local coords.
+    /// Default: top-left (clock sits at the left of the panel).
+    in property <length>        origin-x: 0px;
+    in property <length>        origin-y: 0px;
+
+    // ── Backdrop blur — same scheme as the dock pill ──────────────────
+    // Full-screen blurred wallpaper image plus the popout's screen
+    // position; the inner Image samples the slice of the wallpaper
+    // that sits directly behind the popout. Without these, callers
+    // get a solid theme-tint surface instead of glass.
+    in property <image>   backdrop;
+    in property <length>  backdrop-screen-w: 1px;
+    in property <length>  backdrop-screen-h: 1px;
+    in property <length>  popout-x: 0px;
+    in property <length>  popout-y: 0px;
+
+    // Calendar navigation. Rust handles `month-offset` accounting and
+    // re-publishes `calendar-days` + `calendar-month-text`.
+    callback prev-month();
+    callback next-month();
+    callback day-clicked(int);  // day-num within the displayed month
 
     // Sized + positioned by the parent.
     width: 320px;
@@ -55,24 +293,69 @@ export component DatetimePopout {
     animate resolved-fg-secondary  { duration: 200ms; easing: ease-in-out; }
     animate resolved-border        { duration: 200ms; easing: ease-in-out; }
 
-    // Open/close transition. We drive a single `vis` property and bind
-    // both opacity and y-offset to it so a single `animate` block carries
-    // the whole transition. Slint will play the animation reliably this way
-    // (binding `opacity: open ? 1 : 0` + `visible:` together can race).
-    property <float> vis: open ? 1.0 : 0.0;
-    animate vis { duration: 200ms; easing: ease-out; }
+    // Open/close transition. Direction-conditional easing via states +
+    // transitions: open uses the "decelerate" curve (slow start →
+    // smooth ramp into 1.0) so the scale + opacity ramp is visible;
+    // close uses the "spring" (fast start → soft tail) for a snappy
+    // dismiss. Real CSS-style `transform: scale(...)` via
+    // `transform-scale-*` so the whole subtree (chrome + text + tiles)
+    // shrinks together. Stays drawn during close (`visible: vis > 0.001`)
+    // so the fade-out is actually painted.
+    // Asymmetric easing via states — open ramps visibly via the
+    // ease-in-out "in" curve, close snaps via the spring "out" curve.
+    property <float> vis: 0.0;
+    states [
+        is-open when root.open: {
+            vis: 1.0;
+            in {
+                animate vis {
+                    duration: Tokens.motion-overlay-duration;
+                    easing:   Tokens.motion-overlay-curve-in;
+                }
+            }
+            out {
+                animate vis {
+                    duration: Tokens.motion-overlay-duration;
+                    easing:   Tokens.motion-overlay-curve-out;
+                }
+            }
+        }
+    ]
+    // Always visible to keep the GPU pipeline warm — see ContextMenu.
+    visible: true;
+    opacity: root.vis;
+    property <float> scale-t: Tokens.motion-overlay-scale-from
+        + (1.0 - Tokens.motion-overlay-scale-from) * root.vis;
 
-    opacity: vis;
-    // Slide down 8px as it fades in.
-    property <length> y-offset: -8px * (1.0 - vis);
+    // Wrapper Rectangle exists solely to host `transform-scale-*` so
+    // the click-absorber + chrome scale together as a unit. Background
+    // is transparent — actual visuals are on the inner chrome rect.
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        transform-scale-x: root.scale-t;
+        transform-scale-y: root.scale-t;
+        transform-origin: { x: root.origin-x, y: root.origin-y };
+
+    // Click-absorber covering the popout's chrome rect. Without this,
+    // clicks on the bg between tiles fall through to the full-screen
+    // dismiss TouchArea at z=55 in Compositor.slint and the popout
+    // closes mid-click.
+    TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.open;
+    }
 
     Rectangle {
         x: 0;
-        y: parent.y-offset;
+        y: 0;
         width: parent.width;
         height: parent.height;
 
-        background: root.resolved-bg;
+        background: transparent;
         border-radius: 14px;
         border-width: 1px;
         border-color: root.resolved-border;
@@ -80,6 +363,26 @@ export component DatetimePopout {
         drop-shadow-offset-y: 8px;
         drop-shadow-color: rgba(0, 0, 0, 0.45);
         clip: true;
+
+        // Backdrop layer — blurred wallpaper sliced to show only the
+        // pixels behind the popout. Image is full-screen size; we
+        // offset by the popout's screen position so the slice that
+        // shows through the rounded clip is the slice that's actually
+        // behind us on screen.
+        Image {
+            x: -root.popout-x;
+            y: -root.popout-y;
+            width: root.backdrop-screen-w;
+            height: root.backdrop-screen-h;
+            source: root.backdrop;
+            image-fit: fill;
+        }
+        // Theme tint over the backdrop (translucent so the blur shows).
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: root.resolved-bg;
+        }
 
         // Day label (top).
         Text {
@@ -135,12 +438,14 @@ export component DatetimePopout {
             background: root.resolved-border;
         }
 
-        // Calendar header — month + year.
+        // Calendar header row — prev arrow / month title / next arrow.
+        // Buttons are 24×24 rounded squares with a chevron drawn as
+        // text (no extra SVG asset). Hover bumps the bg.
         Text {
             x: 16px;
             y: 134px;
-            width: parent.width - 32px;
-            height: 20px;
+            width: parent.width - 32px - 60px;
+            height: 24px;
             text: root.calendar-month-text;
             color: root.resolved-fg;
             font-family: Tokens.font-family;
@@ -148,6 +453,56 @@ export component DatetimePopout {
             font-weight: 600;
             horizontal-alignment: left;
             vertical-alignment: center;
+        }
+        prev-ta := TouchArea {
+            x: parent.width - 16px - 56px;
+            y: 134px;
+            width: 24px;
+            height: 24px;
+            enabled: root.open;
+            clicked => { root.prev-month(); }
+        }
+        Rectangle {
+            x: prev-ta.x; y: prev-ta.y;
+            width: prev-ta.width; height: prev-ta.height;
+            background: prev-ta.has-hover
+                ? (Theme.mode == TokenMode.Dark ? rgba(255,255,255,0.08) : rgba(0,0,0,0.06))
+                : transparent;
+            border-radius: 6px;
+            animate background { duration: 100ms; easing: ease-out; }
+            // Left chevron — flip the right-chevron SVG horizontally
+            // via negative width (slint Image scales source).
+            Image {
+                x: (parent.width + 12px) / 2;
+                y: (parent.height - 12px) / 2;
+                width: -12px; height: 12px;
+                source: @image-url("../assets/icons/chevron-right.svg");
+                colorize: root.resolved-fg;
+            }
+        }
+        next-ta := TouchArea {
+            x: parent.width - 16px - 24px;
+            y: 134px;
+            width: 24px;
+            height: 24px;
+            enabled: root.open;
+            clicked => { root.next-month(); }
+        }
+        Rectangle {
+            x: next-ta.x; y: next-ta.y;
+            width: next-ta.width; height: next-ta.height;
+            background: next-ta.has-hover
+                ? (Theme.mode == TokenMode.Dark ? rgba(255,255,255,0.08) : rgba(0,0,0,0.06))
+                : transparent;
+            border-radius: 6px;
+            animate background { duration: 100ms; easing: ease-out; }
+            Image {
+                x: (parent.width - 12px) / 2;
+                y: (parent.height - 12px) / 2;
+                width: 12px; height: 12px;
+                source: @image-url("../assets/icons/chevron-right.svg");
+                colorize: root.resolved-fg;
+            }
         }
 
         // Weekday header row (M T W T F S S — UK convention).
@@ -170,16 +525,35 @@ export component DatetimePopout {
             vertical-alignment: center;
         }
 
-        // 42-cell grid (6 rows × 7 cols).
+        // 42-cell grid (6 rows × 7 cols). Each cell wraps a TouchArea
+        // so dates are clickable + show a hover ring; today's date
+        // gets a solid blue chip; out-of-month dates dim out.
         for d[i] in root.calendar-days: Rectangle {
             x: parent.grid-x + mod(i, 7) * parent.cell-w;
             y: parent.grid-y + parent.cell-h + floor(i / 7) * parent.cell-h;
             width: parent.cell-w;
             height: parent.cell-h;
-            background: d.is-today
-                ? rgba(96, 165, 250, 0.85)
-                : transparent;
-            border-radius: parent.cell-h / 2;
+            day-ta := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                enabled: root.open && d.day-num > 0 && !d.is-other-month;
+                clicked => { root.day-clicked(d.day-num); }
+            }
+            Rectangle {
+                x: (parent.width - parent.height) / 2;
+                y: 0;
+                width: parent.height;
+                height: parent.height;
+                background: d.is-today
+                    ? rgba(96, 165, 250, 0.85)
+                    : (day-ta.has-hover
+                        ? (Theme.mode == TokenMode.Dark
+                            ? rgba(255, 255, 255, 0.08)
+                            : rgba(0, 0, 0, 0.06))
+                        : transparent);
+                border-radius: parent.height / 2;
+                animate background { duration: 80ms; easing: ease-out; }
+            }
             Text {
                 x: 0; y: 0;
                 width: parent.width;
@@ -198,16 +572,74 @@ export component DatetimePopout {
             }
         }
     }
+    }
 }
 
 // ── Control-centre popout ────────────────────────────────────────────────────
+// GNOME Shell-style quick-settings panel. Layout, top-to-bottom:
+//   header row    — 4 round icon-buttons (account, settings, lock, power)
+//   volume slider — headphones + slider + ›
+//   mic slider    — mic + slider + ›
+//   big tiles 1   — Wired   | Wi-Fi
+//   big tiles 2   — Bluetooth (subtitle) | Power Mode (subtitle)
+//   small tiles 1 — Night Light | Dark Style
+//   small tiles 2 — Do Not Disturb | Tailscale (subtitle)
+//   action row    — GSConnect (single half-width tile)
+//   footer        — N Background Apps  ›
+//
+// Most callbacks are stubs until Rust wires the real subsystems
+// (NM, BlueZ, Tailscale daemon, GSConnect DBus, etc.).
 export component ControlCentrePopout {
     in property <bool> open;
+    in property <length> origin-x: 400px;
+    in property <length> origin-y: 0px;
 
+    // Backdrop blur (mirror of DatetimePopout).
+    in property <image>   backdrop;
+    in property <length>  backdrop-screen-w: 1px;
+    in property <length>  backdrop-screen-h: 1px;
+    in property <length>  popout-x: 0px;
+    in property <length>  popout-y: 0px;
+
+    // Sliders (0..1).
+    in-out property <float> volume-value: 0.6;
+    in-out property <float> mic-value:    0.5;
+    callback volume-changed(float);
+    callback mic-changed(float);
+
+    // Tile state — most are placeholders the renderer can update later.
+    in property <bool>   wired-active:    false;
+    in property <bool>   wifi-active:     false;
+    in property <string> wifi-name:       "Wi-Fi";
+    in property <bool>   bt-active:       false;
+    in property <string> bt-device:       "";
+    in property <string> power-mode:      "Balanced";
+    in property <bool>   night-light:     false;
+    in property <bool>   dnd-active:      false;
+    in property <bool>   tailscale-active:false;
+    in property <string> tailscale-host:  "";
+    in property <bool>   gsconnect-active:false;
+    in property <int>    background-apps: 0;
+
+    callback account-clicked();
+    callback settings-clicked();
+    callback lock-clicked();
+    callback power-clicked();
+    callback wired-clicked();
+    callback wifi-clicked();
+    callback bt-clicked();
+    callback power-mode-clicked();
+    callback night-light-clicked();
     callback theme-toggle-clicked();
+    callback dnd-clicked();
+    callback tailscale-clicked();
+    callback gsconnect-clicked();
+    callback background-apps-clicked();
 
-    width: 300px;
-    height: 220px;
+    width: 360px;
+    // Height = sum of every row + gap, +12 px tail padding. See the
+    // big chunk of `y-*` calculations below; this matches them.
+    height: 500px;
 
     property <color> resolved-bg: Theme.mode == TokenMode.Dark
         ? rgba(20, 22, 28, 0.92)
@@ -227,28 +659,89 @@ export component ControlCentrePopout {
     property <color> resolved-tile-bg-hover: Theme.mode == TokenMode.Dark
         ? rgba(255, 255, 255, 0.14)
         : rgba(0, 0, 0, 0.09);
+    // Accent + icon-circle colours used by every active toggle. At
+    // root level so child tile rectangles can read `root.accent` etc.
+    // Inactive circles want to recede but not vanish — at 0.06 they
+    // disappeared into the backdrop blur, making icons look "lost"
+    // (notably wifi-none reading as a single dot). Bumped back up so
+    // the circle reads as a deliberate chip.
+    property <color> accent:           rgba(53, 132, 228, 1.0);
+    property <color> icon-on-active:   rgba(255, 255, 255, 0.95);
+    property <color> icon-bg-inactive: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.08)
+        : rgba(0, 0, 0, 0.06);
+    // Footer hairline — slightly more visible than `resolved-border`
+    // (which is calibrated for outer-frame edges); the footer divider
+    // needs to read against the panel bg, not at the chrome edge.
+    property <color> footer-divider: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.12)
+        : rgba(0, 0, 0, 0.12);
 
-    animate resolved-bg            { duration: 200ms; easing: ease-in-out; }
-    animate resolved-fg            { duration: 200ms; easing: ease-in-out; }
-    animate resolved-fg-secondary  { duration: 200ms; easing: ease-in-out; }
-    animate resolved-border        { duration: 200ms; easing: ease-in-out; }
-    animate resolved-tile-bg       { duration: 200ms; easing: ease-in-out; }
-    animate resolved-tile-bg-hover { duration: 200ms; easing: ease-in-out; }
+    animate resolved-bg            { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+    animate resolved-fg            { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+    animate resolved-fg-secondary  { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+    animate resolved-border        { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+    animate resolved-tile-bg       { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+    animate resolved-tile-bg-hover { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+    animate icon-bg-inactive       { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
 
-    property <float> vis: open ? 1.0 : 0.0;
-    animate vis { duration: 200ms; easing: ease-out; }
+    // Standardised overlay motion (see Tokens.motion-overlay-*).
+    // Direction-conditional easing for a visible open ramp + snappy
+    // close. Real CSS-style scale via `transform-scale-*` on a wrapper —
+    // the whole subtree (chrome + tiles + text) shrinks together.
+    // Asymmetric easing via states — open ramps visibly via the
+    // ease-in-out "in" curve, close snaps via the spring "out" curve.
+    property <float> vis: 0.0;
+    states [
+        is-open when root.open: {
+            vis: 1.0;
+            in {
+                animate vis {
+                    duration: Tokens.motion-overlay-duration;
+                    easing:   Tokens.motion-overlay-curve-in;
+                }
+            }
+            out {
+                animate vis {
+                    duration: Tokens.motion-overlay-duration;
+                    easing:   Tokens.motion-overlay-curve-out;
+                }
+            }
+        }
+    ]
+    // Always visible to keep the GPU pipeline warm — see ContextMenu.
+    visible: true;
+    opacity: root.vis;
+    property <float>  scale-t: Tokens.motion-overlay-scale-from
+        + (1.0 - Tokens.motion-overlay-scale-from) * root.vis;
 
-    opacity: vis;
-    property <length> y-offset: -8px * (1.0 - vis);
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        transform-scale-x: root.scale-t;
+        transform-scale-y: root.scale-t;
+        transform-origin: { x: root.origin-x, y: root.origin-y };
+
+    // Click-absorber covering the popout's chrome rect. Without this,
+    // clicks on the bg between tiles fall through to the full-screen
+    // dismiss TouchArea at z=55 in Compositor.slint and the popout
+    // closes mid-click.
+    TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.open;
+    }
 
     Rectangle {
         x: 0;
-        y: parent.y-offset;
+        y: 0;
         width: parent.width;
         height: parent.height;
 
-        background: root.resolved-bg;
-        border-radius: 14px;
+        background: transparent;
+        border-radius: 18px;
         border-width: 1px;
         border-color: root.resolved-border;
         drop-shadow-blur: 24px;
@@ -256,133 +749,224 @@ export component ControlCentrePopout {
         drop-shadow-color: rgba(0, 0, 0, 0.45);
         clip: true;
 
-        Text {
-            x: 16px;
-            y: 14px;
-            width: parent.width - 32px;
-            height: 18px;
-            text: "Control Centre";
-            color: root.resolved-fg-secondary;
-            font-family: Tokens.font-family;
-            font-size: 12px;
-            font-weight: 500;
-            horizontal-alignment: left;
-            vertical-alignment: center;
-        }
-
-        // 2×2 grid of placeholder tiles.
-        property <length> grid-x: 14px;
-        property <length> grid-y: 40px;
-        property <length> tile-w: (parent.width - 14px * 2 - 10px) / 2;
-        property <length> tile-h: 64px;
-        property <length> gap: 10px;
-
-        // Wifi tile (top-left).
-        wifi-ta := TouchArea {
-            x: parent.grid-x;
-            y: parent.grid-y;
-            width: parent.tile-w;
-            height: parent.tile-h;
+        // ── Backdrop blur (slice of the screen-blurred wallpaper) ────
+        Image {
+            x: -root.popout-x;
+            y: -root.popout-y;
+            width: root.backdrop-screen-w;
+            height: root.backdrop-screen-h;
+            source: root.backdrop;
+            image-fit: fill;
         }
         Rectangle {
-            x: wifi-ta.x; y: wifi-ta.y; width: wifi-ta.width; height: wifi-ta.height;
-            background: wifi-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
-            border-radius: 10px;
-            animate background { duration: 100ms; easing: ease-out; }
-            Image {
-                x: 12px; y: (parent.height - self.height) / 2;
-                width: 22px; height: 22px;
-                source: @image-url("../assets/icons/wifi.svg");
-                colorize: root.resolved-fg;
-            }
-            Text {
-                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
-                text: "Wi-Fi"; color: root.resolved-fg;
-                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
-                horizontal-alignment: left; vertical-alignment: center;
-            }
+            width: parent.width;
+            height: parent.height;
+            background: root.resolved-bg;
         }
 
-        // Bluetooth tile (top-right).
-        bt-ta := TouchArea {
-            x: parent.grid-x + parent.tile-w + parent.gap;
-            y: parent.grid-y;
-            width: parent.tile-w;
-            height: parent.tile-h;
-        }
-        Rectangle {
-            x: bt-ta.x; y: bt-ta.y; width: bt-ta.width; height: bt-ta.height;
-            background: bt-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
-            border-radius: 10px;
-            animate background { duration: 100ms; easing: ease-out; }
-            Image {
-                x: 12px; y: (parent.height - self.height) / 2;
-                width: 22px; height: 22px;
-                source: @image-url("../assets/icons/bluetooth.svg");
-                colorize: root.resolved-fg;
-            }
-            Text {
-                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
-                text: "Bluetooth"; color: root.resolved-fg;
-                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
-                horizontal-alignment: left; vertical-alignment: center;
-            }
-        }
+        // ── Body ─────────────────────────────────────────────────────
+        // One VerticalLayout owns every row's Y-position. No more
+        // `y-section` arithmetic strewn across the file: the layout
+        // system places each row at the previous row's bottom +
+        // `spacing`, so a tweak to any tile height cascades cleanly.
+        // Cross-axis (horizontal) alignment is forced by nested
+        // HorizontalLayouts so half-width tiles always line up.
+        VerticalLayout {
+            x: 14px; y: 14px;
+            width:  parent.width  - 28px;
+            height: parent.height - 28px;
+            spacing: 12px;
+            alignment: start;
 
-        // Display / theme toggle (bottom-left).
-        theme-ta := TouchArea {
-            x: parent.grid-x;
-            y: parent.grid-y + parent.tile-h + parent.gap;
-            width: parent.tile-w;
-            height: parent.tile-h;
-            clicked => { root.theme-toggle-clicked(); }
-        }
-        Rectangle {
-            x: theme-ta.x; y: theme-ta.y; width: theme-ta.width; height: theme-ta.height;
-            background: theme-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
-            border-radius: 10px;
-            animate background { duration: 100ms; easing: ease-out; }
-            Image {
-                x: 12px; y: (parent.height - self.height) / 2;
-                width: 22px; height: 22px;
-                source: Theme.mode == TokenMode.Dark
-                    ? @image-url("../assets/icons/sun.svg")
-                    : @image-url("../assets/icons/moon.svg");
-                colorize: root.resolved-fg;
+            // Header — 4 round buttons in two clusters.
+            HorizontalLayout {
+                height: 32px;
+                alignment: space-between;
+                HorizontalLayout {
+                    spacing: 8px;
+                    CcRoundBtn {
+                        icon: @image-url("../assets/icons/account.svg");
+                        btn-enabled: root.open;
+                        clicked => { root.account-clicked(); }
+                    }
+                    CcRoundBtn {
+                        icon: @image-url("../assets/icons/settings.svg");
+                        btn-enabled: root.open;
+                        clicked => { root.settings-clicked(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    CcRoundBtn {
+                        icon: @image-url("../assets/icons/lock.svg");
+                        btn-enabled: root.open;
+                        clicked => { root.lock-clicked(); }
+                    }
+                    CcRoundBtn {
+                        icon: @image-url("../assets/icons/power.svg");
+                        btn-enabled: root.open;
+                        clicked => { root.power-clicked(); }
+                    }
+                }
             }
-            Text {
-                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
-                text: Theme.mode == TokenMode.Dark ? "Light Mode" : "Dark Mode";
-                color: root.resolved-fg;
-                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
-                horizontal-alignment: left; vertical-alignment: center;
-            }
-        }
 
-        // Sound tile (bottom-right).
-        sound-ta := TouchArea {
-            x: parent.grid-x + parent.tile-w + parent.gap;
-            y: parent.grid-y + parent.tile-h + parent.gap;
-            width: parent.tile-w;
-            height: parent.tile-h;
-        }
-        Rectangle {
-            x: sound-ta.x; y: sound-ta.y; width: sound-ta.width; height: sound-ta.height;
-            background: sound-ta.has-hover ? root.resolved-tile-bg-hover : root.resolved-tile-bg;
-            border-radius: 10px;
-            animate background { duration: 100ms; easing: ease-out; }
-            Image {
-                x: 12px; y: (parent.height - self.height) / 2;
-                width: 22px; height: 22px;
-                source: @image-url("../assets/icons/audio.svg");
-                colorize: root.resolved-fg;
+            // Sliders.
+            VerticalLayout {
+                spacing: 4px;
+                CcSliderRow {
+                    icon: @image-url("../assets/icons/audio.svg");
+                    value <=> root.volume-value;
+                    sld-enabled: root.open;
+                    changed(v) => { root.volume-changed(v); }
+                }
+                CcSliderRow {
+                    icon: @image-url("../assets/icons/mic.svg");
+                    value <=> root.mic-value;
+                    sld-enabled: root.open;
+                    changed(v) => { root.mic-changed(v); }
+                }
             }
-            Text {
-                x: 42px; y: 0; width: parent.width - 54px; height: parent.height;
-                text: "Sound"; color: root.resolved-fg;
-                font-family: Tokens.font-family; font-size: 13px; font-weight: 500;
-                horizontal-alignment: left; vertical-alignment: center;
+
+            // Big tiles row 1 — Wired | Wi-Fi.
+            HorizontalLayout {
+                spacing: 8px;
+                CcTile {
+                    icon: @image-url("../assets/icons/network.svg");
+                    title: "Wired";
+                    active: root.wired-active;
+                    tile-enabled: root.open;
+                    clicked => { root.wired-clicked(); }
+                }
+                CcTile {
+                    icon: root.wifi-active
+                        ? @image-url("../assets/icons/wifi.svg")
+                        : @image-url("../assets/icons/wifi-none.svg");
+                    title: root.wifi-name;
+                    active: root.wifi-active;
+                    tile-enabled: root.open;
+                    clicked => { root.wifi-clicked(); }
+                }
+            }
+
+            // Big tiles row 2 — Bluetooth | Power Mode.
+            HorizontalLayout {
+                spacing: 8px;
+                CcTile {
+                    icon: @image-url("../assets/icons/bluetooth.svg");
+                    title: "Bluetooth";
+                    subtitle: root.bt-device;
+                    active: root.bt-active;
+                    tile-enabled: root.open;
+                    clicked => { root.bt-clicked(); }
+                }
+                CcTile {
+                    icon: @image-url("../assets/icons/battery.svg");
+                    title: "Power Mode";
+                    subtitle: root.power-mode;
+                    active: true;
+                    tile-enabled: root.open;
+                    clicked => { root.power-mode-clicked(); }
+                }
+            }
+
+            // Small toggles row 1 — Night Light | Dark Style.
+            HorizontalLayout {
+                spacing: 8px;
+                CcTile {
+                    compact: true;
+                    show-chevron: false;
+                    icon: @image-url("../assets/icons/moon.svg");
+                    title: "Night Light";
+                    active: root.night-light;
+                    tile-enabled: root.open;
+                    clicked => { root.night-light-clicked(); }
+                }
+                CcTile {
+                    compact: true;
+                    show-chevron: false;
+                    icon: Theme.mode == TokenMode.Dark
+                        ? @image-url("../assets/icons/moon.svg")
+                        : @image-url("../assets/icons/sun.svg");
+                    title: "Dark Style";
+                    active: Theme.mode == TokenMode.Dark;
+                    tile-enabled: root.open;
+                    clicked => { root.theme-toggle-clicked(); }
+                }
+            }
+
+            // Small toggles row 2 — Do Not Disturb | Tailscale.
+            HorizontalLayout {
+                spacing: 8px;
+                CcTile {
+                    compact: true;
+                    show-chevron: false;
+                    icon: @image-url("../assets/icons/bell.svg");
+                    title: "Do Not Disturb";
+                    active: root.dnd-active;
+                    tile-enabled: root.open;
+                    clicked => { root.dnd-clicked(); }
+                }
+                CcTile {
+                    compact: true;
+                    show-chevron: true;
+                    icon: @image-url("../assets/icons/tailscale.svg");
+                    title: "Tailscale";
+                    subtitle: root.tailscale-host;
+                    active: root.tailscale-active;
+                    tile-enabled: root.open;
+                    clicked => { root.tailscale-clicked(); }
+                }
+            }
+
+            // Action — GSConnect, full-width (was awkwardly half-width).
+            CcTile {
+                icon: @image-url("../assets/icons/phone-link.svg");
+                title: "GSConnect";
+                active: root.gsconnect-active;
+                tile-enabled: root.open;
+                clicked => { root.gsconnect-clicked(); }
+            }
+
+            // Footer — N background apps. Hidden when count is 0.
+            if root.background-apps > 0 : Rectangle {
+                height: 1px;
+                background: root.footer-divider;
+            }
+            if root.background-apps > 0 : Rectangle {
+                height: 32px;
+                border-radius: 8px;
+                background: bg-row-ta.has-hover
+                    ? CcPalette.tile-bg-hover
+                    : transparent;
+                animate background { duration: 100ms; easing: ease-out; }
+                bg-row-ta := TouchArea {
+                    x: 0; y: 0;
+                    width: parent.width; height: parent.height;
+                    enabled: root.open;
+                    clicked => { root.background-apps-clicked(); }
+                }
+                Text {
+                    x: 8px; y: 0;
+                    width: parent.width - 30px; height: parent.height;
+                    text: root.background-apps == 1
+                        ? "1 Background App"
+                        : root.background-apps + " Background Apps";
+                    color: CcPalette.fg;
+                    font-family: Tokens.font-family;
+                    font-size: 12px;
+                    font-weight: 500;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                }
+                Image {
+                    x: parent.width - 22px;
+                    y: (parent.height - 14px) / 2;
+                    width: 14px; height: 14px;
+                    source: @image-url("../assets/icons/chevron-right.svg");
+                    colorize: CcPalette.fg-secondary;
+                }
             }
         }
+    }
     }
 }

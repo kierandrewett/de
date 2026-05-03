@@ -14,6 +14,9 @@
 #                     until Ctrl-C. Default 3 s.
 #   client <cmd...>   Launch a wayland client against the compositor
 #                     (e.g. `playground.sh client kitty -e htop`).
+#   wing              Clone+build kierandrewett/wing's input-tracker
+#                     example and run it against the nested compositor
+#                     for live input-routing diagnostics.
 #   ipc <json>        Send a raw ShellRequest line to the compositor IPC
 #                     socket via socat. Example:
 #                       playground.sh ipc '{"type":"GetAllWindows"}'
@@ -35,8 +38,11 @@ shift || true
 PROCS=(compositor-slint notification portal)
 
 socket_name() {
-    grep -oE 'Wayland socket: wayland-[0-9]+' "$LOGS/compositor-slint.log" 2>/dev/null \
-        | tail -1 | awk '{print $3}'
+    # The log line is `Wayland socket: "wayland-N"` (smithay's debug-quoted
+    # OsString form). Grep for the bare `wayland-N` token to skip the
+    # quotes and any tracing colour escapes that wrap the message.
+    grep -oE 'Wayland socket: "?wayland-[0-9]+' "$LOGS/compositor-slint.log" 2>/dev/null \
+        | tail -1 | sed -E 's/.*"?(wayland-[0-9]+)$/\1/'
 }
 
 wayland_display() {
@@ -353,6 +359,44 @@ case "$CMD" in
             move)      shift; ydotool mousemove --absolute "$1" "$2" ;;
             *)         echo "usage: playground.sh click [left|right|middle|move x y]"; exit 1 ;;
         esac
+        ;;
+
+    wing)
+        # Live input-routing diagnostics. Launches kierandrewett/wing's
+        # `input-tracker` example as a wayland client of the nested
+        # compositor. wing prints the surface-local pointer position,
+        # button states, scroll deltas, and held keys it receives; cross-
+        # checking that against compositor-slint's
+        # `pointer.motion → origin=(ox,oy) implied_local=(x,y)` log lines
+        # is the cheapest way to catch input-routing regressions
+        # (smithay's pointer.motion expects focus.1 = surface origin in
+        # compositor space, NOT surface-local — getting that wrong makes
+        # clients receive nonsense coords. We've shipped that bug once.)
+        local_sock=$(socket_name)
+        if [[ -z "${local_sock:-}" ]]; then
+            echo "compositor isn't up — run ./playground.sh up first" >&2
+            exit 1
+        fi
+        WING_DIR="$DIR/wing"
+        if [[ ! -d "$WING_DIR" ]]; then
+            echo "[playground] cloning wing..."
+            git clone --depth 1 https://github.com/kierandrewett/wing "$WING_DIR" \
+                || { echo "[playground] clone failed" >&2; exit 1; }
+        fi
+        BIN="$WING_DIR/target/release/wing-input-tracker"
+        if [[ ! -x "$BIN" ]]; then
+            echo "[playground] building wing-input-tracker (release)..."
+            (cd "$WING_DIR" && cargo build --release -p wing-input-tracker) \
+                || { echo "[playground] build failed" >&2; exit 1; }
+        fi
+        echo "[playground] launching wing under WAYLAND_DISPLAY=$local_sock"
+        WAYLAND_DISPLAY="$local_sock" "$BIN" \
+            > "$LOGS/client.log" 2>&1 &
+        echo $! > "$PIDS/client.pid"
+        echo "[playground] wing pid=$(cat $PIDS/client.pid) — log: $LOGS/client.log"
+        echo "[playground] move the cursor over the wing window, then compare its"
+        echo "             on-screen 'pointer' coordinate against the compositor's"
+        echo "             'pointer.motion → … implied_local=(x,y)' log line."
         ;;
 
     *)

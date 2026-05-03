@@ -29,6 +29,7 @@ import { Wallpaper } from "./Wallpaper.slint";
 import { Panel } from "./Panel.slint";
 import { Dock, DockItem } from "./Dock.slint";
 import { WindowChrome } from "./WindowChrome.slint";
+import { SurfaceItem } from "./SurfaceItem.slint";
 import { LayerSurface } from "./LayerSurface.slint";
 import { DatetimePopout, ControlCentrePopout, CalendarDay } from "./Popouts.slint";
 import { ContextMenu, MenuItem } from "./widgets/ContextMenu.slint";
@@ -55,8 +56,18 @@ export struct WindowItem {
     w:       int,
     h:       int,
     focused: bool,
-    // The client's rendered texture (from SHM or DMA-BUF import).
+    // Legacy single-texture path: the surface tree CPU-composited into
+    // one buffer. Phase 1 of the per-surface rewrite keeps this populated
+    // alongside `surfaces` so we can flip the WindowChrome render path
+    // independently. Once `surfaces` is in use everywhere, this is
+    // removed.
     texture: image,
+    // Per-surface render elements. One entry per wl_surface in this
+    // window's tree, ordered back-to-front (toplevel first, subsurfaces
+    // stacking above). Empty during the transition for windows that
+    // haven't been migrated to the per-surface path yet — readers must
+    // fall back to `texture` when this is empty.
+    surfaces: [SurfaceItem],
     // Optional application icon.
     icon:    image,
     // Animation values driven by the Rust spring engine (0.0–1.0).
@@ -97,7 +108,12 @@ export struct LayerItem {
 
 // A mapped xdg_popup (context menu, dropdown, autocomplete). Position is in
 // compositor-space pixels — Rust resolves parent-relative offsets per-frame
-// in `update_windows`. The texture is the popup's composited surface tree.
+// in `update_windows`.
+//
+// `texture` is the legacy composite (kept while popups transition to the
+// per-surface model — empty when surfaces[] is populated). `surfaces` is
+// the per-surface render-element list, same model as WindowItem; this is
+// what unlocks libadwaita popover transitions / animated subsurfaces.
 export struct PopupItem {
     id:      int,
     x:       int,
@@ -105,6 +121,7 @@ export struct PopupItem {
     w:       int,
     h:       int,
     texture: image,
+    surfaces: [SurfaceItem],
 }
 
 // TrayIconItem now lives in widgets/TrayItem.slint so Panel can import it.
@@ -143,12 +160,55 @@ export component Compositor inherits Window {
     in property <string>        popout-calendar-month-text: "";
     /// 42-cell calendar grid (6 rows × 7 cols).
     in property <[CalendarDay]> popout-calendar-days;
+    /// Calendar navigation — Rust handles the offset accounting.
+    callback popout-calendar-prev();
+    callback popout-calendar-next();
+    callback popout-calendar-day-clicked(int);
+
+    // ── Window (per-titlebar) context menu ───────────────────────────────────
+    // Right-clicking a window's titlebar opens this. Same machinery as the
+    // desktop menu — Rust pushes items + position, slint owns the open
+    // animation + click-absorber + flicker. `window-menu-target-id` is the
+    // WM id of the window the menu was opened for, fed back through
+    // `window-menu-clicked` so Rust can route the action to the right
+    // window without lookup tables.
+    in-out property <bool>           window-menu-open: false;
+    in-out property <int>            window-menu-x: 0;
+    in-out property <int>            window-menu-y: 0;
+    in-out property <int>            window-menu-w: 220;
+    in-out property <int>            window-menu-h: 0;
+    in-out property <int>            window-menu-origin-x: 0;
+    in-out property <int>            window-menu-origin-y: 0;
+    in-out property <int>            window-menu-target-id: -1;
+    in-out property <int>            window-menu-selected: -1;
+    in property      <[MenuItem]>    window-menu-items;
+    callback window-menu-clicked(int, int);  // (target-id, action-id)
 
     // ── Desktop context menu ─────────────────────────────────────────────────
     in-out property <bool>           desktop-menu-open: false;
     in-out property <int>            desktop-menu-x:    0;
     in-out property <int>            desktop-menu-y:    0;
     in property      <[MenuItem]>    desktop-menu-items;
+    /// Keyboard-driven selection index (Up/Down arrows). Rust mutates
+    /// this directly while the menu is open; -1 means "no selection".
+    /// Reset on close.
+    in-out property <int>            desktop-menu-selected: -1;
+    /// True when Rust's right-click handler placed the menu *above* the
+    /// cursor (i.e. cursor was too close to the bottom of the screen).
+    /// Drives `transform-origin`: the scale should grow out of the
+    /// click point, which is bottom-left when flipped, top-left when
+    /// not. Push from Rust the same time as the menu position.
+    /// Scale-origin for the open/close animation, in menu-local coords.
+    /// Rust pushes the cursor's offset *inside* the menu rect — the
+    /// menu itself is clamped to the screen edge (GNOME-style), so
+    /// the cursor sits somewhere within the menu rather than on its
+    /// corner. Scaling outward from there feels like the menu is
+    /// pulled out by the click point.
+    in-out property <int>            desktop-menu-origin-x: 0;
+    in-out property <int>            desktop-menu-origin-y: 0;
+    /// Rendered menu height — Rust pushes it so the dock right-click
+    /// flip-up math has a real number to subtract.
+    in-out property <int>            desktop-menu-h: 0;
     callback desktop-menu-clicked(int);
 
     // ── App launcher overlay (Super+Space) ───────────────────────────────────
@@ -162,6 +222,12 @@ export component Compositor inherits Window {
     in-out property <int>            dock-menu-y: 0;
     in-out property <string>         dock-menu-app-id: "";
     in property      <[MenuItem]>    dock-menu-items;
+    /// Rendered height of the dock context menu, in logical pixels.
+    /// Pushed from Rust (`compute_menu_height`) so the icon-right-click
+    /// flip-up math anchors the menu's BOTTOM at the cursor instead of
+    /// guessing a hardcoded 280 px and leaving a visible gap.
+    in property <int>                dock-menu-h: 0;
+    in-out property <int>            dock-menu-selected: -1;
     callback dock-menu-clicked(string, int);
 
     // ── Tray (StatusNotifierItem / DBusMenu) per-icon menu ──────────────────
@@ -175,6 +241,7 @@ export component Compositor inherits Window {
     in-out property <int>            tray-menu-y: 0;
     in-out property <int>            tray-menu-id: 0;
     in property      <[MenuItem]>    tray-menu-items;
+    in-out property <int>            tray-menu-selected: -1;
     callback tray-menu-clicked(int, int);
 
     // ── Snap preview overlay ─────────────────────────────────────────────────
@@ -187,6 +254,9 @@ export component Compositor inherits Window {
     // ── Debug + help overlays ────────────────────────────────────────────────
     in-out property <bool>      debug-overlay-visible: false;
     in property <string>        debug-text: "";
+    // Sliding window of per-frame render durations (ms). Rust pushes one
+    // sample per render; the debug overlay draws it as a bar chart.
+    in property <[float]>       debug-frame-times: [];
     in-out property <bool>      help-overlay-visible: false;
 
     // ── Cursor overlay (Rust → Slint) ─────────────────────────────────────────
@@ -283,8 +353,19 @@ export component Compositor inherits Window {
             // image-fit stretching → text stays crisp).
             x: win.x * 1px;
             y: win.y * 1px - parent.y;
-            width: max(1px, win.geom-w * 1px);
-            height: max(1px, (win.geom-h + (win.csd ? 0 : 33)) * 1px);
+            // Chrome size tracks the ANIMATED w/h (set instantly during
+            // resize) rather than `geom-w/geom-h` (which only update on
+            // client commit, ~16 ms later). Without this, dragging
+            // a corner whose math anchors the opposite edge — e.g.
+            // SouthWest, where the right edge should stay fixed — the
+            // chrome's right edge would visibly drift right by `dx`
+            // every frame because we used (instant new x) + (lagging
+            // old geom-w). Now the chrome shrinks/grows in lockstep
+            // with the position update; the buffer briefly stretches
+            // by a few percent until the client commits at the new
+            // size, which is far less perceptible than the drift.
+            width: max(1px, win.w * 1px);
+            height: max(1px, (win.h + (win.csd ? 0 : 33)) * 1px);
             title: win.title;
             focused: win.focused;
             content: win.texture;
@@ -292,6 +373,12 @@ export component Compositor inherits Window {
             content-clip-y: win.geom-y;
             content-clip-w: win.geom-w;
             content-clip-h: win.geom-h;
+            // Per-surface render-element list (Phase 4). If empty,
+            // WindowChrome falls back to the legacy single `content`
+            // texture path. As clients commit on the new path, their
+            // surfaces[] list populates and the Repeater inside
+            // WindowChrome takes over.
+            surfaces: win.surfaces;
             anim-opacity: win.anim-opacity;
             anim-scale: win.anim-scale;
             alt-tab-selected: win.alt-tab-selected;
@@ -329,14 +416,17 @@ export component Compositor inherits Window {
         backdrop-offset-y: -(parent.height - self.height);
         icon-clicked(app-id) => { root.launch-app(app-id); }
         icon-right-clicked(app-id) => {
-            // Open the dock context menu above the cursor (220 px wide,
-            // ~280 px tall). Clamps so the menu stays fully on screen even
-            // when the cursor is near the left / right edge of the dock.
+            // Open the dock context menu above the cursor (220 px wide).
+            // The menu's actual height comes from `dock-menu-h` (pushed
+            // by Rust based on the items model) so the bottom edge sits
+            // exactly at the cursor instead of leaving a 60–110 px gap.
+            // 8 px breathing room between the menu bottom and cursor for
+            // visual separation.
             root.dock-menu-app-id = app-id;
             root.dock-menu-x = clamp(root.cursor-x - 110, 8,
                 parent.width / 1px - 228);
-            root.dock-menu-y = clamp(root.cursor-y - 280, 40,
-                parent.height / 1px - 290);
+            root.dock-menu-y = clamp(root.cursor-y - root.dock-menu-h - 8,
+                40, parent.height / 1px - root.dock-menu-h - 10);
             root.dock-menu-open = true;
         }
     }
@@ -368,12 +458,22 @@ export component Compositor inherits Window {
     }
 
     // ── Layer 5c: Desktop / appindicator context menu ────────────────────────
+    // Click-absorber for OUTSIDE clicks. Use `clicked` (left-only,
+    // respects z-order grab) instead of `pointer-event` — the latter
+    // fires for events grabbed by higher-z TouchAreas (like a menu
+    // row), which short-circuits the row's flicker and dismisses the
+    // menu before the click registers. Right-click dismiss is handled
+    // in the winit `MouseInput` pre-dispatch so we don't need this
+    // absorber to catch right-down.
     if root.desktop-menu-open: TouchArea {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height;
         z: 79;
-        clicked => { root.desktop-menu-open = false; }
+        clicked => {
+            root.desktop-menu-open = false;
+            root.desktop-menu-selected = -1;
+        }
     }
     desktop-menu := ContextMenu {
         x: root.desktop-menu-x * 1px;
@@ -381,11 +481,27 @@ export component Compositor inherits Window {
         z: 80;
         items: root.desktop-menu-items;
         open: root.desktop-menu-open;
+        selected-index: root.desktop-menu-selected;
+        // Scale-origin = cursor offset within the menu (Rust pushes it).
+        origin-x: root.desktop-menu-origin-x * 1px;
+        origin-y: root.desktop-menu-origin-y * 1px;
+        // Backdrop blur — full-screen wallpaper image + this menu's
+        // own screen position so the slice inside the rounded clip is
+        // the slice behind it on the actual screen.
+        backdrop: root.wallpaper-blurred;
+        backdrop-screen-w: parent.width;
+        backdrop-screen-h: parent.height;
+        menu-x: root.desktop-menu-x * 1px;
+        menu-y: root.desktop-menu-y * 1px;
         item-clicked(id) => {
             root.desktop-menu-open = false;
+            root.desktop-menu-selected = -1;
             root.desktop-menu-clicked(id);
         }
-        dismiss => { root.desktop-menu-open = false; }
+        dismiss => {
+            root.desktop-menu-open = false;
+            root.desktop-menu-selected = -1;
+        }
     }
 
     // ── Dock per-app context menu (separate so it can have its own items) ─
@@ -394,7 +510,10 @@ export component Compositor inherits Window {
         width: parent.width;
         height: parent.height;
         z: 81;
-        clicked => { root.dock-menu-open = false; }
+        clicked => {
+            root.dock-menu-open = false;
+            root.dock-menu-selected = -1;
+        }
     }
     dock-menu := ContextMenu {
         x: root.dock-menu-x * 1px;
@@ -402,11 +521,26 @@ export component Compositor inherits Window {
         z: 82;
         items: root.dock-menu-items;
         open: root.dock-menu-open;
+        selected-index: root.dock-menu-selected;
+        // Dock menus always flip up out of the icon — origin is
+        // bottom-left so the scale grows out of the icon, not down
+        // from the menu's top edge.
+        origin-x: 0px;
+        origin-y: root.dock-menu-h * 1px;
+        backdrop: root.wallpaper-blurred;
+        backdrop-screen-w: parent.width;
+        backdrop-screen-h: parent.height;
+        menu-x: root.dock-menu-x * 1px;
+        menu-y: root.dock-menu-y * 1px;
         item-clicked(id) => {
             root.dock-menu-open = false;
+            root.dock-menu-selected = -1;
             root.dock-menu-clicked(root.dock-menu-app-id, id);
         }
-        dismiss => { root.dock-menu-open = false; }
+        dismiss => {
+            root.dock-menu-open = false;
+            root.dock-menu-selected = -1;
+        }
     }
 
     // ── Tray DBusMenu popup (separate ContextMenu instance) ─────────────────
@@ -415,19 +549,72 @@ export component Compositor inherits Window {
         width: parent.width;
         height: parent.height;
         z: 83;
-        clicked => { root.tray-menu-open = false; }
+        clicked => {
+            root.tray-menu-open = false;
+            root.tray-menu-selected = -1;
+        }
     }
+    // ── Window (titlebar) context menu ──────────────────────────────────────
+    if root.window-menu-open: TouchArea {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        z: 85;
+        clicked => {
+            root.window-menu-open = false;
+            root.window-menu-selected = -1;
+        }
+    }
+    window-menu := ContextMenu {
+        x: root.window-menu-x * 1px;
+        y: root.window-menu-y * 1px;
+        z: 86;
+        items: root.window-menu-items;
+        open: root.window-menu-open;
+        selected-index: root.window-menu-selected;
+        origin-x: root.window-menu-origin-x * 1px;
+        origin-y: root.window-menu-origin-y * 1px;
+        backdrop: root.wallpaper-blurred;
+        backdrop-screen-w: parent.width;
+        backdrop-screen-h: parent.height;
+        menu-x: root.window-menu-x * 1px;
+        menu-y: root.window-menu-y * 1px;
+        item-clicked(id) => {
+            root.window-menu-open = false;
+            root.window-menu-selected = -1;
+            root.window-menu-clicked(root.window-menu-target-id, id);
+        }
+        dismiss => {
+            root.window-menu-open = false;
+            root.window-menu-selected = -1;
+        }
+    }
+
     tray-menu := ContextMenu {
         x: root.tray-menu-x * 1px;
         y: root.tray-menu-y * 1px;
         z: 84;
         items: root.tray-menu-items;
         open: root.tray-menu-open;
+        selected-index: root.tray-menu-selected;
+        // Tray menu drops out of the panel's right side — origin
+        // top-right so the scale grows out of the tray icon row.
+        origin-x: 220px;
+        origin-y: 0px;
+        backdrop: root.wallpaper-blurred;
+        backdrop-screen-w: parent.width;
+        backdrop-screen-h: parent.height;
+        menu-x: root.tray-menu-x * 1px;
+        menu-y: root.tray-menu-y * 1px;
         item-clicked(id) => {
             root.tray-menu-open = false;
+            root.tray-menu-selected = -1;
             root.tray-menu-clicked(root.tray-menu-id, id);
         }
-        dismiss => { root.tray-menu-open = false; }
+        dismiss => {
+            root.tray-menu-open = false;
+            root.tray-menu-selected = -1;
+        }
     }
 
     // ── Layer 5b: xdg_popup surfaces (context menus, dropdowns) ─────────────
@@ -450,11 +637,30 @@ export component Compositor inherits Window {
         drop-shadow-offset-y: 6px;
         drop-shadow-color: rgba(0, 0, 0, 0.40);
         clip: true;
+        // Legacy single-texture path — used when surfaces[] is empty
+        // (X11 override-redirect popups, or popups before first commit).
         Image {
+            visible: popup.surfaces.length == 0;
             width: parent.width;
             height: parent.height;
             source: popup.texture;
             image-fit: fill;
+        }
+        // Per-surface render path: lets libadwaita / GTK popovers
+        // animate their internal subsurfaces (transitions on dropdown
+        // menus, search results, etc.).
+        for s in popup.surfaces: Image {
+            x: s.x-in-window * 1px;
+            y: s.y-in-window * 1px;
+            width: s.w * 1px;
+            height: s.h * 1px;
+            source: s.texture;
+            source-clip-x:      s.src-x;
+            source-clip-y:      s.src-y;
+            source-clip-width:  s.src-w;
+            source-clip-height: s.src-h;
+            image-fit: fill;
+            image-rendering: pixelated;
         }
     }
 
@@ -495,6 +701,21 @@ export component Compositor inherits Window {
         day-text: root.popout-day-text;
         calendar-month-text: root.popout-calendar-month-text;
         calendar-days: root.popout-calendar-days;
+        // Centred under the clock — scale grows out of the top-centre,
+        // i.e. the panel edge directly above where the clock lives.
+        origin-x: self.width / 2;
+        origin-y: 0px;
+        // Backdrop blur — pass the full-screen blurred wallpaper plus
+        // the popout's own screen position so the inner Image samples
+        // the right slice.
+        backdrop: root.wallpaper-blurred;
+        backdrop-screen-w: parent.width;
+        backdrop-screen-h: parent.height;
+        popout-x: self.x;
+        popout-y: self.y;
+        prev-month => { root.popout-calendar-prev(); }
+        next-month => { root.popout-calendar-next(); }
+        day-clicked(day) => { root.popout-calendar-day-clicked(day); }
     }
 
     control-centre-popout := ControlCentrePopout {
@@ -504,8 +725,18 @@ export component Compositor inherits Window {
         open: root.control-centre-open;
         theme-toggle-clicked => {
             root.toggle-theme();
-            root.control-centre-open = false;
+            // Don't auto-close so the user can immediately see the
+            // accent / icon-bg flip on the Dark Style tile.
         }
+        // Anchored to the panel's right edge (system icons cluster) —
+        // origin top-right so the panel "unfolds out" of the icons.
+        origin-x: self.width;
+        origin-y: 0px;
+        backdrop: root.wallpaper-blurred;
+        backdrop-screen-w: parent.width;
+        backdrop-screen-h: parent.height;
+        popout-x: self.x;
+        popout-y: self.y;
     }
 
     // ── Layer 69: Hit-rect inspector (visual) ────────────────────────────────
@@ -521,11 +752,16 @@ export component Compositor inherits Window {
         background: transparent;
 
         for win in root.windows: Rectangle {
-            // Outer hit-rect (chrome height incl. titlebar for SSD).
+            // Outer hit-rect — must match WindowManager::surface_under and
+            // pointer_click_focus in wm/mod.rs, which gate on geom_w/geom_h
+            // (the visible content rect, excluding any CSD shadow padding).
+            // Drawing using win.w/win.h here would falsely show the buffer
+            // bounds, which can be wider than the rect we actually accept
+            // pointer events inside.
             x: win.x * 1px;
             y: win.y * 1px;
-            width: win.w * 1px;
-            height: (win.h + (win.csd ? 0 : 33)) * 1px;
+            width: win.geom-w * 1px;
+            height: (win.geom-h + (win.csd ? 0 : 33)) * 1px;
             background: transparent;
             border-width: 1px;
             border-color: rgba(255, 220, 0, 0.85);
@@ -533,14 +769,14 @@ export component Compositor inherits Window {
             // Tiny corner label so multiple windows don't overlap text.
             Rectangle {
                 x: 0; y: 0;
-                width: 92px;
+                width: 130px;
                 height: 14px;
                 background: rgba(0, 0, 0, 0.75);
                 Text {
                     x: 4px; y: 0;
                     width: parent.width - 8px;
                     height: parent.height;
-                    text: "WM #" + win.id + "  " + win.w + "×" + win.h
+                    text: "WM #" + win.id + "  " + win.geom-w + "×" + win.geom-h
                           + (win.csd ? " CSD" : " SSD");
                     color: #ffd400;
                     font-family: "monospace";
@@ -662,11 +898,61 @@ export component Compositor inherits Window {
             }
         }
 
-        Text {
+        // ── FPS chart ────────────────────────────────────────────────────
+        // Bars = per-frame render duration. y-axis: 0ms (bottom) → 50ms
+        // (top). Faint horizontal lines mark the 60fps (16.67ms) and 30fps
+        // (33.33ms) thresholds. Bars colour green/yellow/red against those
+        // same thresholds — so spikes pop visually even if the line markers
+        // wash out against the panel background.
+        Rectangle {
             x: 14px;
             y: 40px;
             width: parent.width - 28px;
-            height: parent.height - 52px;
+            height: 64px;
+            background: Theme.mode == TokenMode.Dark
+                ? rgba(0, 0, 0, 0.35)
+                : rgba(0, 0, 0, 0.06);
+            border-radius: 6px;
+            clip: true;
+
+            // 60fps reference line.
+            Rectangle {
+                x: 0; width: parent.width;
+                y: parent.height * (1.0 - 16.67 / 50.0) - 0.5px;
+                height: 1px;
+                background: rgba(120, 220, 140, 0.35);
+            }
+            // 30fps reference line.
+            Rectangle {
+                x: 0; width: parent.width;
+                y: parent.height * (1.0 - 33.34 / 50.0) - 0.5px;
+                height: 1px;
+                background: rgba(220, 200, 80, 0.35);
+            }
+
+            // The bars. Slot width is fixed at chart_w / FRAME_HISTORY_LEN
+            // (120) so partial buffers cluster on the left and the chart
+            // visually scrolls left as new samples arrive.
+            for time[i] in root.debug-frame-times: Rectangle {
+                property <length> slot-w: parent.width / 120;
+                property <float> norm: min(time / 50.0, 1.0);
+                x: i * self.slot-w;
+                width: self.slot-w - 0.5px;
+                height: parent.height * self.norm;
+                y: parent.height - self.height;
+                background: time < 16.67
+                    ? rgba(120, 220, 140, 0.85)
+                    : (time < 33.34
+                        ? rgba(240, 200, 80, 0.9)
+                        : rgba(240, 90, 90, 0.95));
+            }
+        }
+
+        Text {
+            x: 14px;
+            y: 112px;
+            width: parent.width - 28px;
+            height: parent.height - 124px;
             text: root.debug-text;
             color: Theme.mode == TokenMode.Dark
                 ? rgba(255, 255, 255, 0.78)

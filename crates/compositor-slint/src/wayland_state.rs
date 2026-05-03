@@ -39,10 +39,7 @@ use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
         egl::{EGLContext, EGLDisplay},
-        renderer::{
-            gles::GlesRenderer,
-            ExportMem, ImportDma,
-        },
+        renderer::{gles::GlesRenderer, ExportMem, ImportDma},
     },
     delegate_dmabuf, delegate_seat, delegate_shm,
     input::{
@@ -154,6 +151,18 @@ pub struct ClientSurfaceData {
     pub width: u32,
     pub height: u32,
     pub dirty: bool,
+    /// Incremented every time the buffer is rewritten (alongside `dirty`).
+    /// Image caches keyed by surface use this to detect "is the cached
+    /// `slint::Image` still based on the current pixels?" without keeping
+    /// the buffer mutex locked between updates.
+    pub version: u64,
+    /// `RendererSurfaceState::current_commit()` snapshot taken at the
+    /// time this entry was last refreshed. The per-surface SHM importer
+    /// short-circuits when the surface's current commit equals this —
+    /// nothing has changed, so the BGRA→RGBA conversion (and `version`
+    /// bump and downstream slint::Image rebuild) can be skipped. Damage
+    /// tracking in its simplest form.
+    pub last_commit: Option<smithay::backend::renderer::utils::CommitCounter>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -174,8 +183,20 @@ pub struct ToplevelInfo {
     /// Cascaded compositor-space position.
     pub x: i32,
     pub y: i32,
-    /// Pixel buffer — updated by import_shm_buffer on each commit.
+    /// Legacy composite pixel buffer — the toplevel + all subsurfaces
+    /// CPU-blitted into one premultiplied RGBA buffer by
+    /// `import_shm_buffer`'s tree walk. This is the OLD path; per-surface
+    /// rendering uses `surface_pixels` below.
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
+    /// Per-`wl_surface` pixel buffers for the new per-surface render-element
+    /// model. Keyed by `wl_surface.id().protocol_id()` (the toplevel's own
+    /// surface ID is included alongside any subsurfaces). Subsurface
+    /// position / src-crop / dst-size are resolved separately in
+    /// `renderer::update_windows` from `surface_view.{offset,src,dst}`.
+    /// Each entry is a single surface's BUFFER pixels (no compositing).
+    /// During the staged rewrite this populates alongside `pixels`; once
+    /// all readers move over, the legacy composite is removed.
+    pub surface_pixels: Arc<Mutex<std::collections::HashMap<u32, ClientSurfaceData>>>,
     /// Client requested ClientSide decorations (CSD). False = SSD; we draw
     /// our own titlebar above the client surface.
     pub csd: bool,
@@ -197,8 +218,15 @@ pub struct PopupInfo {
     pub rel_y: i32,
     pub w: i32,
     pub h: i32,
-    /// Composited pixel buffer from the popup's surface tree.
+    /// Composited pixel buffer from the popup's surface tree (legacy
+    /// path; kept for backdrop/screencopy parity with toplevels).
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
+    /// Per-`wl_surface` pixel buffers for the per-surface render-element
+    /// model (same shape as `ToplevelInfo.surface_pixels`). Populated on
+    /// commit by `import_shm_per_surface`. The renderer emits one
+    /// `SurfaceItem` per entry so libadwaita-style popovers with
+    /// animated subsurfaces render correctly.
+    pub surface_pixels: Arc<Mutex<std::collections::HashMap<u32, ClientSurfaceData>>>,
 }
 
 /// Active drag-and-drop icon surface paired with the accumulated buffer
@@ -341,10 +369,14 @@ pub struct SpikeState {
     pub lock_surfaces: Vec<LockSurfaceInfo>,
 
     // ── Bookkeeping ───────────────────────────────────────────────────────
-    /// The single virtual output for this compositor. Stored here so the
-    /// surface enter/leave bookkeeping (which drives wl_output binding and
-    /// preferred_buffer_scale emission) can find it from any handler.
+    /// Transitional primary output for the current single-output winit path.
+    /// New backend work should use `outputs` and `primary_output()` instead of
+    /// reaching for this field directly.
     pub output: Option<Output>,
+    /// All registered compositor outputs. The winit backend currently inserts
+    /// one virtual output; the udev backend will populate this from DRM
+    /// connectors and keep `output` as the primary/output-0 compatibility shim.
+    pub outputs: Vec<Output>,
 
     /// Currently-focused xdg toplevel surface.
     pub active_surface: Option<WlSurface>,
@@ -442,7 +474,14 @@ impl SpikeState {
         let clock = Clock::<Monotonic>::new();
         let dh = &display_handle;
 
-        let compositor_state = CompositorState::new::<Self>(dh);
+        // wl_compositor v6 (vs default v5) is required for clients to use
+        // the v6 `set_buffer_scale` / `set_buffer_transform` requests and
+        // to receive `wl_surface.preferred_buffer_scale` /
+        // `preferred_buffer_transform` events. HiDPI clients (Chromium,
+        // Firefox, GNOME apps) gate fractional/integer scale rendering on
+        // these — without v6 they render at scale 1 even when we'd like
+        // them at 2x.
+        let compositor_state = CompositorState::new_v6::<Self>(dh);
         let shm_state = ShmState::new::<Self>(dh, vec![]);
         let mut seat_state = SeatState::new();
         let seat = seat_state.new_wl_seat(dh, "seat-spike");
@@ -567,6 +606,7 @@ impl SpikeState {
             session_locked: false,
             lock_surfaces: Vec::new(),
             output: None,
+            outputs: Vec::new(),
             active_surface: None,
             dnd_icon: None,
             dnd_icon_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
@@ -594,6 +634,19 @@ impl SpikeState {
         state.seat.add_pointer();
 
         state
+    }
+
+    pub fn register_output(&mut self, output: Output) {
+        if self.output.is_none() {
+            self.output = Some(output.clone());
+        }
+        if !self.outputs.iter().any(|existing| existing == &output) {
+            self.outputs.push(output);
+        }
+    }
+
+    pub fn primary_output(&self) -> Option<&Output> {
+        self.output.as_ref().or_else(|| self.outputs.first())
     }
 
     /// Lazily initialise the surfaceless EGL display and GLES renderer used
@@ -656,7 +709,10 @@ impl SpikeState {
         let renderer = match self.gles_renderer.as_mut() {
             Some(r) => r,
             None => {
-                warn!(planes = dmabuf.num_planes(), "DMA-BUF: no GLES renderer at commit");
+                warn!(
+                    planes = dmabuf.num_planes(),
+                    "DMA-BUF: no GLES renderer at commit"
+                );
                 return;
             }
         };
@@ -698,22 +754,54 @@ impl SpikeState {
             }
         };
 
-        // copy_texture with Abgr8888 gives [R, G, B, A] non-premultiplied;
-        // slint::Image::from_rgba8_premultiplied expects premultiplied.
-        let pixel_count = (w * h) as usize;
-        let mut rgba_pm = Vec::with_capacity(pixel_count * 4);
-        for chunk in raw.chunks(4) {
-            let (r, g, b, a) = (chunk[0], chunk[1], chunk[2], chunk[3]);
-            let af = a as f32 / 255.0;
-            rgba_pm.push((r as f32 * af) as u8);
-            rgba_pm.push((g as f32 * af) as u8);
-            rgba_pm.push((b as f32 * af) as u8);
-            rgba_pm.push(a);
+        // copy_texture with Abgr8888 returns bytes in memory order
+        // [R, G, B, A] — what `slint::Image::from_rgba8_premultiplied`
+        // expects.  The buffer's pixel data is already pre-multiplied
+        // (wayland convention), so we don't multiply again.
+        //
+        // Alpha-channel correction for opaque-format buffers:
+        // many wgpu/Vulkan WSI clients (eframe, Chromium with skia-vk,
+        // firefox with webrender-vk) allocate XRGB8888 / XBGR8888 swap-
+        // chain images — *no* alpha channel. The X bits are
+        // *undefined* per spec; on radv they're whatever leftover bits
+        // the driver leaves in memory, often a chequerboard of 0/0xFF
+        // or random per-pixel noise. When we copy_texture into an ABGR
+        // sink we read those X bits *as alpha*, and slint
+        // alpha-blends with garbage — anti-aliased glyph edges,
+        // strokes, and circle outlines silently drop out (see wing's
+        // input-tracker: grid + solid rect_filled survive, text +
+        // circle_filled vanish). The fix is to detect the opaque-
+        // format case and force alpha = 0xFF before handing the
+        // pixels to slint.
+        use smithay::backend::allocator::Fourcc;
+        let src_fourcc = dmabuf.format().code;
+        let opaque_format = matches!(
+            src_fourcc,
+            Fourcc::Xrgb8888
+                | Fourcc::Xbgr8888
+                | Fourcc::Rgbx8888
+                | Fourcc::Bgrx8888
+                | Fourcc::Rgb888
+                | Fourcc::Bgr888
+        );
+        let mut rgba_pm = raw;
+        if opaque_format {
+            for px in rgba_pm.chunks_exact_mut(4) {
+                px[3] = 0xFF;
+            }
+            debug!(
+                "DMA-BUF: forced alpha=0xFF on opaque source format {:?}",
+                src_fourcc
+            );
         }
 
         debug!(
             "DMA-BUF: imported {}x{} ({} planes) for surface {:?} → {} RGBA bytes",
-            w, h, dmabuf.num_planes(), surface.id(), rgba_pm.len()
+            w,
+            h,
+            dmabuf.num_planes(),
+            surface.id(),
+            rgba_pm.len()
         );
 
         self.dmabuf_pending.insert(
@@ -723,6 +811,8 @@ impl SpikeState {
                 width: w,
                 height: h,
                 dirty: true,
+                version: 1,
+                last_commit: None,
             },
         );
     }
@@ -777,7 +867,10 @@ pub fn detect_visible_bbox(pixels: &[u8], width: u32, height: u32) -> Option<(i3
             top = top.min(t);
             found_v = true;
         }
-        if let Some(b) = (0..height).rev().find(|&y| alpha_at(cx, y) > ALPHA_THRESHOLD) {
+        if let Some(b) = (0..height)
+            .rev()
+            .find(|&y| alpha_at(cx, y) > ALPHA_THRESHOLD)
+        {
             bottom = bottom.max(b);
         }
     }
@@ -790,7 +883,10 @@ pub fn detect_visible_bbox(pixels: &[u8], width: u32, height: u32) -> Option<(i3
             left = left.min(l);
             found_h = true;
         }
-        if let Some(r) = (0..width).rev().find(|&x| alpha_at(x, cy) > ALPHA_THRESHOLD) {
+        if let Some(r) = (0..width)
+            .rev()
+            .find(|&x| alpha_at(x, cy) > ALPHA_THRESHOLD)
+        {
             right = right.max(r);
         }
     }
@@ -798,7 +894,8 @@ pub fn detect_visible_bbox(pixels: &[u8], width: u32, height: u32) -> Option<(i3
         return None;
     }
     Some((
-        left as i32, top as i32,
+        left as i32,
+        top as i32,
         (right - left + 1) as i32,
         (bottom - top + 1) as i32,
     ))
@@ -811,22 +908,37 @@ pub fn detect_visible_bbox(pixels: &[u8], width: u32, height: u32) -> Option<(i3
 pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfaceData>>) -> usize {
     use smithay::backend::renderer::utils::with_renderer_surface_state;
     use smithay::reexports::wayland_server::protocol::wl_shm;
-    use smithay::wayland::compositor::{
-        with_surface_tree_downward, SubsurfaceCachedState, TraversalAction,
-    };
+    use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
     use smithay::wayland::shm::with_buffer_contents;
 
-    // ── Pass 1 — walk the tree to collect (surface, offset). DON'T call
-    //              with_renderer_surface_state from inside the walk: smithay's
-    //              tree traversal already holds surface-state locks and a
-    //              nested borrow deadlocks the wayland thread. We read each
-    //              surface's buffer dims later in a separate pass.
+    // ── Pass 1 — walk the tree to collect (surface, offset).
+    //
+    // Offsets accumulate via `surface_view.offset` instead of the raw
+    // `SubsurfaceCachedState.location`. surface_view.offset is what
+    // smithay's reference rendering / `under_from_surface_tree` use; it
+    // composes:
+    //   * subsurface position (`wl_subsurface.set_position`)
+    //   * `wl_surface.offset(dx, dy)` buffer_delta (used by animated
+    //     cursors, sprite-pages, parallax)
+    //   * wp_viewporter dst-rect placement
+    //   * buffer_scale / buffer_transform conversions
+    // Reading only SubsurfaceCachedState.location was the same bug we
+    // already fixed in the input path — animated subsurfaces would render
+    // at the wrong place even though pointer events landed correctly.
+    //
+    // Don't call `with_renderer_surface_state` from inside the walk:
+    // smithay's tree traversal already holds surface-state locks and a
+    // nested borrow deadlocks the wayland thread. Instead we capture
+    // `surface_view.offset` from the SurfaceData passed into the closure
+    // (the lock there is the same that with_renderer_surface_state would
+    // try to take, but smithay's traversal already has it open) and read
+    // buffer dims in a separate pass.
     #[derive(Clone, Copy)]
     struct Node {
         offset_x: i32,
         offset_y: i32,
-        width:    i32,
-        height:   i32,
+        width: i32,
+        height: i32,
     }
     let mut surfaces_and_offsets: Vec<(WlSurface, (i32, i32))> = Vec::new();
 
@@ -834,12 +946,29 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
         surface,
         (0i32, 0i32),
         |sub, states, parent_offset| {
+            use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
             let mut my_offset = *parent_offset;
             if sub != surface {
-                let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
-                let loc = sub_state.current().location;
-                my_offset.0 += loc.x;
-                my_offset.1 += loc.y;
+                // Pull surface_view.offset (the composed offset including
+                // subsurface position, wl_surface.offset, viewporter, etc).
+                let view_off = states
+                    .data_map
+                    .get::<RendererSurfaceStateUserData>()
+                    .and_then(|d| d.lock().ok().and_then(|s| s.view()).map(|v| v.offset));
+                if let Some(o) = view_off {
+                    my_offset.0 += o.x;
+                    my_offset.1 += o.y;
+                } else {
+                    // Fall back to the older accumulator for surfaces that
+                    // never reached the renderer state path yet (typically
+                    // pre-first-commit). Same result for plain subsurfaces
+                    // with buffer_scale=1 and no viewporter.
+                    use smithay::wayland::compositor::SubsurfaceCachedState;
+                    let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
+                    let loc = sub_state.current().location;
+                    my_offset.0 += loc.x;
+                    my_offset.1 += loc.y;
+                }
             }
             surfaces_and_offsets.push((sub.clone(), my_offset));
             TraversalAction::DoChildren(my_offset)
@@ -849,26 +978,41 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
     );
 
     // Resolve buffer dims now that we're out of the surface-tree closure.
-    let nodes: Vec<(WlSurface, Node)> = surfaces_and_offsets.into_iter()
+    let nodes: Vec<(WlSurface, Node)> = surfaces_and_offsets
+        .into_iter()
         .map(|(s, off)| {
             let (w, h) = with_renderer_surface_state(&s, |st| {
                 st.buffer_size().map(|sz| (sz.w, sz.h)).unwrap_or((0, 0))
-            }).unwrap_or((0, 0));
-            (s, Node { offset_x: off.0, offset_y: off.1, width: w, height: h })
+            })
+            .unwrap_or((0, 0));
+            (
+                s,
+                Node {
+                    offset_x: off.0,
+                    offset_y: off.1,
+                    width: w,
+                    height: h,
+                },
+            )
         })
         .collect();
 
     // ── Compute union bounds. If the root has its own buffer, its dims
     //     anchor (0,0,W,H); otherwise we use the union of children.
     let root_dims = nodes.first().map(|(_, n)| *n).unwrap_or(Node {
-        offset_x: 0, offset_y: 0, width: 0, height: 0,
+        offset_x: 0,
+        offset_y: 0,
+        width: 0,
+        height: 0,
     });
     let mut min_x = 0i32;
     let mut min_y = 0i32;
     let mut max_x = root_dims.width.max(0);
     let mut max_y = root_dims.height.max(0);
     for (_, n) in &nodes {
-        if n.width <= 0 || n.height <= 0 { continue }
+        if n.width <= 0 || n.height <= 0 {
+            continue;
+        }
         min_x = min_x.min(n.offset_x);
         min_y = min_y.min(n.offset_y);
         max_x = max_x.max(n.offset_x + n.width);
@@ -889,14 +1033,18 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
         composite.resize(comp_len, 0);
     } else {
         // Same size — just clear in-place (one memset, no realloc).
-        for b in composite.iter_mut() { *b = 0; }
+        for b in composite.iter_mut() {
+            *b = 0;
+        }
     }
 
     // ── Pass 2 — blit each surface's buffer into the composite.
     let mut any_pixels = false;
     let single_surface = n_subs == 1;
     for (sub, node) in &nodes {
-        if node.width <= 0 || node.height <= 0 { continue }
+        if node.width <= 0 || node.height <= 0 {
+            continue;
+        }
 
         let buf = match with_renderer_surface_state(sub, |s| s.buffer().cloned()) {
             Some(Some(b)) => b,
@@ -904,7 +1052,7 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
         };
 
         let _ = with_buffer_contents(&*buf, |ptr: *const u8, len: usize, spec| {
-            let src_w = spec.width  as i32;
+            let src_w = spec.width as i32;
             let src_h = spec.height as i32;
             let stride = spec.stride as usize;
             let has_alpha = matches!(spec.format, wl_shm::Format::Argb8888);
@@ -915,30 +1063,34 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
 
             // ── Compute the per-row clipped X range once, outside the loop.
             let dst_x_start = (ox.max(0)) as usize;
-            let dst_x_end   = ((ox + src_w).min(comp_w as i32)) as usize;
-            if dst_x_end <= dst_x_start { return; }
+            let dst_x_end = ((ox + src_w).min(comp_w as i32)) as usize;
+            if dst_x_end <= dst_x_start {
+                return;
+            }
             let src_x_start = (dst_x_start as i32 - ox) as usize;
-            let row_pixels  = dst_x_end - dst_x_start;
-            let comp_row    = comp_w as usize * 4;
+            let row_pixels = dst_x_end - dst_x_start;
+            let comp_row = comp_w as usize * 4;
 
             // ── Fast path: single-surface tree with no horizontal/vertical
             //     padding and an opaque XRGB8888 buffer → bulk row memcpy
             //     with B↔R swap. This is the common case for SSD apps like
             //     kitty/foot and skips the per-pixel float math entirely.
-            if single_surface && !has_alpha && ox == 0 && oy == 0
-                && row_pixels == comp_w as usize
-            {
+            if single_surface && !has_alpha && ox == 0 && oy == 0 && row_pixels == comp_w as usize {
                 for y in 0..src_h {
-                    if y >= comp_h as i32 { break; }
+                    if y >= comp_h as i32 {
+                        break;
+                    }
                     let s_row = (y as usize) * stride;
                     let d_row = (y as usize) * comp_row;
-                    if s_row + row_pixels * 4 > data.len() { break; }
-                    let src = &data[s_row .. s_row + row_pixels * 4];
-                    let dst = &mut composite[d_row .. d_row + row_pixels * 4];
+                    if s_row + row_pixels * 4 > data.len() {
+                        break;
+                    }
+                    let src = &data[s_row..s_row + row_pixels * 4];
+                    let dst = &mut composite[d_row..d_row + row_pixels * 4];
                     // BGRA → premultiplied RGBA (alpha=255 → no premul math).
                     for px in 0..row_pixels {
                         let i = px * 4;
-                        dst[i]     = src[i + 2];
+                        dst[i] = src[i + 2];
                         dst[i + 1] = src[i + 1];
                         dst[i + 2] = src[i];
                         dst[i + 3] = 255;
@@ -948,39 +1100,57 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
                 return;
             }
 
-            // ── General path: per-row source-over compositing.
+            // ── General path: per-row source-over compositing with
+            // PRE-multiplied source pixels.
+            //
+            // wl_shm/dmabuf format codes (ARGB8888 / XRGB8888 / etc.) all
+            // imply pre-multiplied alpha by wayland convention — clients
+            // are required to pre-multiply before committing. Source-over
+            // compositing of pre-multiplied source onto pre-multiplied
+            // destination is therefore:
+            //     out.rgb = src.rgb + dst.rgb * (1 - src.a)
+            //     out.a   = src.a   + dst.a   * (1 - src.a)
+            // Multiplying src.rgb by af here (as the previous version did)
+            // pre-multiplied a second time, which crushed every glyph edge,
+            // anti-aliased line, and translucent overlay to near-black /
+            // invisible. Symptom: clients render solid fills correctly but
+            // text/icons/animations vanish.
             for y in 0..src_h {
                 let dy = oy + y;
-                if dy < 0 || dy >= comp_h as i32 { continue; }
+                if dy < 0 || dy >= comp_h as i32 {
+                    continue;
+                }
                 let s_row = (y as usize) * stride + src_x_start * 4;
                 let d_row = (dy as usize) * comp_row + dst_x_start * 4;
-                if s_row + row_pixels * 4 > data.len() { continue; }
-                let src = &data[s_row .. s_row + row_pixels * 4];
-                let dst = &mut composite[d_row .. d_row + row_pixels * 4];
+                if s_row + row_pixels * 4 > data.len() {
+                    continue;
+                }
+                let src = &data[s_row..s_row + row_pixels * 4];
+                let dst = &mut composite[d_row..d_row + row_pixels * 4];
                 for px in 0..row_pixels {
                     let si = px * 4;
+                    // Source is BGRA (wayland byte order on little-endian).
                     let b = src[si];
                     let g = src[si + 1];
                     let r = src[si + 2];
                     let a = if has_alpha { src[si + 3] } else { 255u8 };
-                    if a == 0 { continue; }
+                    if a == 0 {
+                        continue;
+                    }
                     let di = px * 4;
                     if a == 255 {
-                        // Fully opaque — direct overwrite, no float math.
-                        dst[di]     = r;
+                        // Fully opaque — direct overwrite.
+                        dst[di] = r;
                         dst[di + 1] = g;
                         dst[di + 2] = b;
                         dst[di + 3] = 255;
                     } else {
-                        let af = a as f32 * (1.0 / 255.0);
-                        let inv = 1.0 - af;
-                        let pr = (r as f32 * af) as u8;
-                        let pg = (g as f32 * af) as u8;
-                        let pb = (b as f32 * af) as u8;
-                        dst[di]     = pr.saturating_add((dst[di]     as f32 * inv) as u8);
-                        dst[di + 1] = pg.saturating_add((dst[di + 1] as f32 * inv) as u8);
-                        dst[di + 2] = pb.saturating_add((dst[di + 2] as f32 * inv) as u8);
-                        dst[di + 3] = a.saturating_add((dst[di + 3] as f32 * inv) as u8);
+                        // src.rgb is already pre-multiplied. Just blend.
+                        let inv = (255 - a) as u32;
+                        dst[di] = (r as u32 + (dst[di] as u32 * inv) / 255).min(255) as u8;
+                        dst[di + 1] = (g as u32 + (dst[di + 1] as u32 * inv) / 255).min(255) as u8;
+                        dst[di + 2] = (b as u32 + (dst[di + 2] as u32 * inv) / 255).min(255) as u8;
+                        dst[di + 3] = (a as u32 + (dst[di + 3] as u32 * inv) / 255).min(255) as u8;
                     }
                     any_pixels = true;
                 }
@@ -1002,13 +1172,141 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
 
     if n_subs > 1 {
         // Quieter than info! at the per-frame rate Firefox hits.
-        debug!("composited surface tree: {} surfaces, {}×{}", n_subs, comp_w, comp_h);
+        debug!(
+            "composited surface tree: {} surfaces, {}×{}",
+            n_subs, comp_w, comp_h
+        );
     }
 
-    out_guard.width  = comp_w;
+    out_guard.width = comp_w;
     out_guard.height = comp_h;
-    out_guard.dirty  = true;
+    out_guard.dirty = true;
+    out_guard.version = out_guard.version.wrapping_add(1);
     n_subs
+}
+
+/// Per-surface SHM importer for the new render-element model.
+///
+/// Walks the surface tree rooted at `root` and stores each surface's
+/// pixels in `surface_pixels_out`, keyed by `wl_surface.id().protocol_id()`.
+/// Unlike `import_shm_buffer`, this does NOT composite — each surface's
+/// buffer stays separate so the renderer can position and source-clip
+/// them independently.
+///
+/// Returns the number of surfaces that had pixels imported.
+pub fn import_shm_per_surface(
+    root: &WlSurface,
+    surface_pixels_out: &Arc<Mutex<std::collections::HashMap<u32, ClientSurfaceData>>>,
+) -> usize {
+    use smithay::backend::renderer::utils::with_renderer_surface_state;
+    use smithay::reexports::wayland_server::protocol::wl_shm;
+    use smithay::reexports::wayland_server::Resource;
+    use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+    use smithay::wayland::shm::with_buffer_contents;
+
+    // Collect every surface in the tree first, then read buffers in a
+    // separate pass — same trick as the legacy importer to avoid nested
+    // surface-state locks.
+    let mut surfaces: Vec<WlSurface> = Vec::new();
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |sub, _, _| surfaces.push(sub.clone()),
+        |_, _, _| true,
+    );
+
+    let mut imported = 0usize;
+    let mut out_map = surface_pixels_out.lock().unwrap();
+
+    for surface in &surfaces {
+        let key = surface.id().protocol_id();
+
+        // Resolve buffer + dims + commit counter for this surface.
+        // current_commit() advances on every wl_surface.commit; if it
+        // matches what we cached last time, the surface hasn't changed
+        // and we skip the BGRA→RGBA conversion + slint::Image rebuild
+        // entirely — the renderer will reuse the cached image keyed by
+        // version.
+        let buf_dims_commit = with_renderer_surface_state(surface, |s| {
+            let buf = s.buffer().cloned();
+            let size = s.buffer_size();
+            let commit = s.current_commit();
+            (buf, size, commit)
+        });
+        let (buf, size, commit) = match buf_dims_commit {
+            Some((Some(b), Some(sz), c)) => (b, sz, c),
+            _ => continue,
+        };
+        let (sw, sh) = (size.w as u32, size.h as u32);
+        if sw == 0 || sh == 0 {
+            continue;
+        }
+        // Damage skip: surface's commit counter unchanged → reuse the
+        // existing entry. We DON'T bump `version` here, so the renderer's
+        // per-surface image cache hits and skips the GPU re-upload too.
+        if let Some(existing) = out_map.get(&key) {
+            if existing.last_commit == Some(commit) && existing.width == sw && existing.height == sh
+            {
+                tracing::trace!("shm: damage-skip surface_id={} (commit unchanged)", key);
+                continue;
+            }
+        }
+
+        // Read SHM contents → premul RGBA.
+        let mut converted: Option<Vec<u8>> = None;
+        let _ = with_buffer_contents(&*buf, |ptr: *const u8, len: usize, spec| {
+            let stride = spec.stride as usize;
+            let has_alpha = matches!(spec.format, wl_shm::Format::Argb8888);
+            let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+            let pixel_count = (sw * sh) as usize;
+            let mut out = Vec::with_capacity(pixel_count * 4);
+            // Walk row-by-row, BGRA → RGBA premul. Source is already
+            // pre-multiplied per wayland convention; for opaque XRGB the
+            // alpha bits are undefined and we force 0xFF.
+            for y in 0..sh as usize {
+                let s_row = y * stride;
+                if s_row + (sw as usize) * 4 > data.len() {
+                    break;
+                }
+                for x in 0..sw as usize {
+                    let i = s_row + x * 4;
+                    let b = data[i];
+                    let g = data[i + 1];
+                    let r = data[i + 2];
+                    let a = if has_alpha { data[i + 3] } else { 255u8 };
+                    out.push(r);
+                    out.push(g);
+                    out.push(b);
+                    out.push(a);
+                }
+            }
+            converted = Some(out);
+        });
+        let Some(rgba) = converted else { continue };
+
+        let prev_version = out_map.get(&key).map(|d| d.version).unwrap_or(0);
+        out_map.insert(
+            key,
+            ClientSurfaceData {
+                pixels: rgba,
+                width: sw,
+                height: sh,
+                dirty: true,
+                version: prev_version.wrapping_add(1),
+                last_commit: Some(commit),
+            },
+        );
+        imported += 1;
+    }
+
+    // Drop entries for surfaces that have left the tree (e.g. a popup
+    // subsurface was destroyed). Without this the map grows unbounded.
+    let live: std::collections::HashSet<u32> =
+        surfaces.iter().map(|s| s.id().protocol_id()).collect();
+    out_map.retain(|k, _| live.contains(k));
+
+    imported
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1143,8 +1441,12 @@ impl WaylandDndGrabHandler for SpikeState {
 
         match type_ {
             GrabType::Pointer => {
-                let Some(pointer) = seat.get_pointer() else { return };
-                let Some(start_data) = pointer.grab_start_data() else { return };
+                let Some(pointer) = seat.get_pointer() else {
+                    return;
+                };
+                let Some(start_data) = pointer.grab_start_data() else {
+                    return;
+                };
                 pointer.set_grab(
                     self,
                     DnDGrab::new_pointer(&self.display_handle, start_data, source, seat),
@@ -1153,8 +1455,12 @@ impl WaylandDndGrabHandler for SpikeState {
                 );
             }
             GrabType::Touch => {
-                let Some(touch) = seat.get_touch() else { return };
-                let Some(start_data) = touch.grab_start_data() else { return };
+                let Some(touch) = seat.get_touch() else {
+                    return;
+                };
+                let Some(start_data) = touch.grab_start_data() else {
+                    return;
+                };
                 touch.set_grab(
                     self,
                     DnDGrab::new_touch(&self.display_handle, start_data, source, seat),

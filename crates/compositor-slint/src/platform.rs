@@ -88,10 +88,7 @@ impl GpuWindowAdapter {
         let new_size = PhysicalSize::new(physical_w, physical_h);
         self.size.set(new_size);
         let s = scale.max(0.0001);
-        let logical = LogicalSize::new(
-            physical_w as f32 / s,
-            physical_h as f32 / s,
-        );
+        let logical = LogicalSize::new(physical_w as f32 / s, physical_h as f32 / s);
         self.slint_window
             .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: s });
         self.slint_window

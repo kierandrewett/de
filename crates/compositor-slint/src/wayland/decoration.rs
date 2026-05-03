@@ -41,7 +41,11 @@ impl XdgDecorationHandler for SpikeState {
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Mode) {
         let csd = matches!(mode, Mode::ClientSide);
         toplevel.with_pending_state(|s| {
-            s.decoration_mode = Some(if csd { Mode::ClientSide } else { Mode::ServerSide });
+            s.decoration_mode = Some(if csd {
+                Mode::ClientSide
+            } else {
+                Mode::ServerSide
+            });
         });
         if toplevel.is_initial_configure_sent() {
             toplevel.send_configure();

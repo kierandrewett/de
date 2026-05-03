@@ -65,11 +65,22 @@ impl SpikeState {
                 time,
                 refresh,
                 seq,
-                wp_presentation_feedback::Kind::Vsync,
+                // Vsync | HwClock | HwCompletion. We render through a winit/wgpu
+                // swapchain that drives presents at the host's vsync, our
+                // timestamp comes from the host monotonic clock right
+                // after frame.present() returns, and the actual scanout
+                // happens within sub-frame latency in mailbox/fifo mode.
+                // Anvil ships these three combined when DRM metadata is
+                // available; without it clients (mpv's vsync sync, video
+                // players, frame-pacing benchmarks) think we don't
+                // support hardware-timed presentation and disable
+                // optimisations.
+                wp_presentation_feedback::Kind::Vsync
+                    | wp_presentation_feedback::Kind::HwClock
+                    | wp_presentation_feedback::Kind::HwCompletion,
             );
         }
     }
-
 }
 
 /// Walk one surface tree and pull every queued [`SurfacePresentationFeedback`]
@@ -88,7 +99,19 @@ fn collect_feedback(surface: &WlSurface, out: &mut Vec<SurfacePresentationFeedba
         |_surface, states, &()| {
             if let Some(feedback) = SurfacePresentationFeedback::from_states(
                 states,
-                wp_presentation_feedback::Kind::Vsync,
+                // Vsync | HwClock | HwCompletion. We render through a winit/wgpu
+                // swapchain that drives presents at the host's vsync, our
+                // timestamp comes from the host monotonic clock right
+                // after frame.present() returns, and the actual scanout
+                // happens within sub-frame latency in mailbox/fifo mode.
+                // Anvil ships these three combined when DRM metadata is
+                // available; without it clients (mpv's vsync sync, video
+                // players, frame-pacing benchmarks) think we don't
+                // support hardware-timed presentation and disable
+                // optimisations.
+                wp_presentation_feedback::Kind::Vsync
+                    | wp_presentation_feedback::Kind::HwClock
+                    | wp_presentation_feedback::Kind::HwCompletion,
             ) {
                 out.push(feedback);
             }

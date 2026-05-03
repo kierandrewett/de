@@ -21,21 +21,21 @@ const SHADER_SRC: &str = include_str!("../../shaders/dnd_icon.wgsl");
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DndUniforms {
-    rect_x:    f32,
-    rect_y:    f32,
-    rect_w:    f32,
-    rect_h:    f32,
+    rect_x: f32,
+    rect_y: f32,
+    rect_w: f32,
+    rect_h: f32,
     surface_w: f32,
     surface_h: f32,
-    _pad0:     f32,
-    _pad1:     f32,
+    _pad0: f32,
+    _pad1: f32,
 }
 
 pub struct DndIconPass {
-    device:   Arc<wgpu::Device>,
+    device: Arc<wgpu::Device>,
     pipeline: wgpu::RenderPipeline,
-    bgl:      wgpu::BindGroupLayout,
-    sampler:  wgpu::Sampler,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
     /// Cached icon texture; recreated when (w, h) change.
     icon_tex: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
@@ -130,7 +130,14 @@ impl DndIconPass {
             mapped_at_creation: false,
         });
 
-        Self { device, pipeline, bgl, sampler, uniforms, icon_tex: None }
+        Self {
+            device,
+            pipeline,
+            bgl,
+            sampler,
+            uniforms,
+            icon_tex: None,
+        }
     }
 
     /// Upload `pixels` (RGBA8, straight alpha, tightly packed) into the
@@ -144,11 +151,15 @@ impl DndIconPass {
         if need_new {
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("dnd-icon-tex"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
-                sample_count:    1,
-                dimension:       wgpu::TextureDimension::D2,
-                format:          wgpu::TextureFormat::Rgba8Unorm,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -169,7 +180,11 @@ impl DndIconPass {
                 bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -179,15 +194,15 @@ impl DndIconPass {
     /// untouched.
     pub fn render(
         &mut self,
-        queue:       &wgpu::Queue,
-        encoder:     &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         target_view: &wgpu::TextureView,
-        surface_w:   u32,
-        surface_h:   u32,
-        rect_xywh:   (f32, f32, f32, f32),
-        pixels:      &[u8],
-        icon_w:      u32,
-        icon_h:      u32,
+        surface_w: u32,
+        surface_h: u32,
+        rect_xywh: (f32, f32, f32, f32),
+        pixels: &[u8],
+        icon_w: u32,
+        icon_h: u32,
     ) {
         if icon_w == 0 || icon_h == 0 || rect_xywh.2 <= 0.0 || rect_xywh.3 <= 0.0 {
             return;
@@ -196,13 +211,14 @@ impl DndIconPass {
         let (_, view, _, _) = self.icon_tex.as_ref().unwrap();
 
         let u = DndUniforms {
-            rect_x:    rect_xywh.0,
-            rect_y:    rect_xywh.1,
-            rect_w:    rect_xywh.2,
-            rect_h:    rect_xywh.3,
+            rect_x: rect_xywh.0,
+            rect_y: rect_xywh.1,
+            rect_w: rect_xywh.2,
+            rect_h: rect_xywh.3,
             surface_w: surface_w as f32,
             surface_h: surface_h as f32,
-            _pad0: 0.0, _pad1: 0.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
@@ -215,13 +231,17 @@ impl DndIconPass {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &self.uniforms,
                         offset: 0,
-                        size:   std::num::NonZeroU64::new(
-                            std::mem::size_of::<DndUniforms>() as u64,
-                        ),
+                        size: std::num::NonZeroU64::new(std::mem::size_of::<DndUniforms>() as u64),
                     }),
                 },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
             ],
         });
 
@@ -232,7 +252,7 @@ impl DndIconPass {
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load:  wgpu::LoadOp::Load,
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],

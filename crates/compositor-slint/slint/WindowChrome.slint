@@ -21,6 +21,7 @@
 
 import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { IconButton } from "./widgets/IconButton.slint";
+import { SurfaceItem } from "./SurfaceItem.slint";
 
 export component WindowChrome {
     // ── Properties ────────────────────────────────────────────────────────────
@@ -43,6 +44,11 @@ export component WindowChrome {
     in property <int>    content-clip-y: 0;
     in property <int>    content-clip-w: 0;
     in property <int>    content-clip-h: 0;
+    // Per-surface render-element list (Phase 4 of the architectural
+    // rewrite). When non-empty, the content-area below renders a Repeater
+    // over these instead of the legacy single `content` Image. Each
+    // SurfaceItem positions independently inside the content-area.
+    in property <[SurfaceItem]> surfaces: [];
     // ClientSide-decoration mode (Firefox / GTK header-bar apps). When true,
     // the client paints its own titlebar / border / shadow into the buffer,
     // so we hide our SSD titlebar + Slint border + drop-shadow and let the
@@ -87,11 +93,14 @@ export component WindowChrome {
         ? Tokens.titlebar-border-dark
         : Tokens.titlebar-border-light;
 
-    // Inner highlight top alpha per WINDOW_SPEC:
-    //   dark-active=0.08, dark-inactive=0.04, light-active=0.50, light-inactive=0.25
+    // Inner top-edge highlight alpha. Tuned MUCH lower than the original
+    // WINDOW_SPEC values — at 0.08/0.50 the highlight strip stamped a
+    // bright white band across the top of every window, very obvious on
+    // dark content (terminals, code editors). The "highlight" is now a
+    // gentle hint of top-down lighting, not a gloss bar.
     property <color> resolved-highlight-top: Theme.mode == TokenMode.Dark
-        ? (focused ? rgba(255,255,255,0.08) : rgba(255,255,255,0.04))
-        : (focused ? rgba(255,255,255,0.50) : rgba(255,255,255,0.25));
+        ? (focused ? rgba(255,255,255,0.04) : rgba(255,255,255,0.02))
+        : (focused ? rgba(255,255,255,0.18) : rgba(255,255,255,0.10));
 
     // Content area background (no focus dependency — mode only).
     property <color> resolved-content-bg: Theme.window-content-bg;
@@ -138,10 +147,23 @@ export component WindowChrome {
         // corners are part of our chrome aesthetic and clip the (cropped)
         // client surface to the squircle on CSD apps too. The 1 px border
         // is SSD-only; CSD apps draw their own internal border (or none).
+        //
+        // For CSD: bg is TRANSPARENT. The client buffer's anti-aliased
+        // rounded corners gradient from opaque (interior content) to
+        // alpha=0 (the drop-shadow padding GTK includes around the
+        // visible window). If our outer-frame bg is opaque (e.g.
+        // `window-content-bg = #1d1d1d`), it bleeds through that
+        // gradient and reads as a bright halo at the corners — exactly
+        // what the user described as "window background behind on the
+        // corners". Transparent here lets the wallpaper / windows
+        // beneath show through the same alpha gradient the buffer
+        // intends, so the corner blend reads correctly. The clip
+        // radius matches GTK's default (14 px) so visible area
+        // matches.
         border-radius: Tokens.window-corner-radius-outer;
         border-width:  root.csd ? 0px : 1px;
         border-color:  root.resolved-border;
-        background:    root.resolved-content-bg;
+        background:    root.csd ? transparent : root.resolved-content-bg;
         clip:          true;
 
         // Drop shadow — single Slint layer (skipped for CSD).
@@ -149,11 +171,15 @@ export component WindowChrome {
         drop-shadow-offset-y: root.csd ? 0px : 8px;
         drop-shadow-color:    root.csd ? rgba(0, 0, 0, 0.0) : rgba(0, 0, 0, 0.45);
 
-        // ── Solid titlebar backing (drawn always; in CSD mode the client
-        //     surface paints over it, so it only ever surfaces if the buffer
-        //     leaves transparent pixels at the titlebar region — i.e. when
-        //     the app is unresponsive or genuinely wants the SSD chrome to
-        //     show through). ──────────────────────────────────────────────
+        // ── Solid titlebar backing — SSD only ──────────────────────────
+        // For CSD, the client owns its header bar (GTK headerbar, app
+        // title, header buttons). Our backing here used to render at
+        // light-mode `titlebar-bg-light-active` (#ffffff) regardless,
+        // which leaked through as a white strip across the top of
+        // every CSD app whose buffer didn't quite cover the very top
+        // pixel row (rounded corners, sub-pixel positioning, etc.).
+        // Hiding it for CSD lets the client's own buffer be the only
+        // thing painted at the titlebar region.
         titlebar-backing := Rectangle {
             x: 0; y: 0;
             width: parent.width;
@@ -163,13 +189,18 @@ export component WindowChrome {
             border-top-right-radius: Tokens.window-corner-radius-outer;
             border-bottom-left-radius: 0px;
             border-bottom-right-radius: 0px;
+            visible: !root.csd;
         }
 
-        // ── Title bar (drawn always; covered by the client surface in CSD)
+        // ── Title bar (SSD only — for CSD the client paints its own
+        // header bar into the buffer, so collapsing this whole subtree
+        // removes the slint TouchAreas that would otherwise eat clicks
+        // intended for the client's window controls.)
         titlebar := Rectangle {
             x: 0; y: 0;
             width: parent.width;
             height: Tokens.titlebar-height;
+            visible: !root.csd;
             background: root.resolved-titlebar-bg;
             border-top-left-radius: Tokens.window-corner-radius-outer;
             border-top-right-radius: Tokens.window-corner-radius-outer;
@@ -191,6 +222,11 @@ export component WindowChrome {
                      - (Tokens.control-size * 3 + Tokens.control-gap * 2)
                      - Tokens.control-inset * 2;
                 height: parent.height;
+                // CSD apps own their titlebar — clicks at y < 33 must reach
+                // the wayland client (header-bar buttons, search, window
+                // menu). Disable the SSD click-grab so the event falls
+                // through to the compositor's surface_under routing.
+                enabled: !root.csd;
                 clicked => { root.title-clicked(); }
                 double-clicked => { root.maximize-clicked(); }
             }
@@ -263,14 +299,15 @@ export component WindowChrome {
                     clicked => { root.maximize-clicked(); }
                 }
 
-                // Close (rightmost) — always uses red-tinted hover
+                // Close (rightmost) — same neutral hover as the other
+                // controls; the red-tint variant felt heavy.
                 close-btn := IconButton {
                     x: (Tokens.control-size + Tokens.control-gap) * 2;
                     y: 0;
                     diameter: Tokens.control-size;
                     bg: root.resolved-control-bg;
-                    bg-hover: rgba(200, 60, 60, 0.80);
-                    bg-pressed: rgba(180, 40, 40, 0.90);
+                    bg-hover: root.resolved-control-bg-hover;
+                    bg-pressed: root.resolved-control-bg-pressed;
                     icon: @image-url("assets/close.svg");
                     icon-tint: root.resolved-control-icon-tint;
                     clicked => { root.close-clicked(); }
@@ -306,16 +343,16 @@ export component WindowChrome {
             border-bottom-right-radius: Tokens.window-corner-radius-outer;
             clip: true;
 
+            // Legacy single-texture path — used when the per-surface
+            // `surfaces` list is empty (a freshly-mapped window before
+            // its first commit, or any code path that hasn't been
+            // migrated to the new render-element model yet). Rendered
+            // first so the surface Repeater below paints on top.
             Image {
+                visible: root.surfaces.length == 0;
                 width: parent.width;
                 height: parent.height;
                 source: root.content;
-                // Always crop to the visible-content rect Rust passes us
-                // (xdg_surface.set_window_geometry → auto-detected alpha
-                // bbox → full buffer). The chrome's content-area is sized
-                // to the same rect, so image-fit:fill is 1:1 and text stays
-                // crisp; it also strips out any client-painted shadow /
-                // border padding on CSD apps.
                 source-clip-x: root.content-clip-w > 0 ? root.content-clip-x : 0;
                 source-clip-y: root.content-clip-h > 0 ? root.content-clip-y : 0;
                 source-clip-width:  root.content-clip-w > 0
@@ -325,28 +362,51 @@ export component WindowChrome {
                 image-fit: fill;
                 image-rendering: pixelated;
             }
+
+            // Per-surface render path: each wl_surface positioned
+            // independently with its own src-clip. When this list is
+            // non-empty it covers the legacy Image above. Source-clip
+            // honours wp_viewporter src crop and (for the toplevel)
+            // xdg_surface.set_window_geometry.
+            for s in root.surfaces: Image {
+                x: s.x-in-window * 1px;
+                y: s.y-in-window * 1px;
+                width: s.w * 1px;
+                height: s.h * 1px;
+                source: s.texture;
+                source-clip-x:      s.src-x;
+                source-clip-y:      s.src-y;
+                source-clip-width:  s.src-w;
+                source-clip-height: s.src-h;
+                image-fit: fill;
+                image-rendering: pixelated;
+            }
         }
 
         // ── Inner highlight overlay (on top of everything) ────────────────────
-        // Simulates top-down lighting on glass per WINDOW_SPEC.
-        // The highlight alpha varies by mode × focus (animated via resolved-highlight-top).
+        // Subtle top-edge gradient that simulates top-down ambient light on
+        // glass. Drawn flush with the outer-frame's edges (no 1 px inset)
+        // so the chrome's content-bg can't bleed through between the
+        // highlight and the rounded outline. Wrapped in a clip rect with
+        // the same squircle radius as outer-frame so the gradient
+        // respects the corners.
         highlight := Rectangle {
-            x: 1px;
-            y: 1px;
-            width: parent.width - 2px;
-            height: parent.height - 2px;
-            border-radius: Tokens.window-corner-radius-outer - 1px;
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            border-radius: Tokens.window-corner-radius-outer;
             background: transparent;
             border-width: 0;
+            clip: true;
 
-            // Top-edge highlight strip (gradient Rectangle, 2 px tall).
+            // Top-edge highlight strip — fades over the first 12 px so it
+            // reads as a soft glow, not a hard 2 px band.
             Rectangle {
                 x: 0;
                 y: 0;
                 width: parent.width;
-                height: 2px;
-                border-top-left-radius: parent.border-radius;
-                border-top-right-radius: parent.border-radius;
+                height: 12px;
                 background: @linear-gradient(180deg,
                     root.resolved-highlight-top 0%,
                     rgba(255, 255, 255, 0.00) 100%);

@@ -60,7 +60,10 @@ impl SpikeState {
             );
         }
 
-        debug!("send_frame_callbacks_for: sent to {} surfaces", surfaces.len());
+        debug!(
+            "send_frame_callbacks_for: sent to {} surfaces",
+            surfaces.len()
+        );
     }
 
     /// Signal wp_fifo barriers and drain blocked transaction queues.
@@ -91,6 +94,24 @@ impl SpikeState {
             signal_fifo_barriers(surface);
         }
 
+        // Release wp_commit_timing_v1 deferred commits whose target
+        // timestamp has passed.
+        //
+        // Mesa's Vulkan WSI sets a target timestamp on every commit via
+        // `wp_commit_timer_v1.set_timestamp` (see CommitTimingManagerState
+        // in smithay). Smithay parks the commit on a Blocker until we
+        // call `signal_until(now)` past the target. Without this drive,
+        // every wing/mpv/Chrome commit (any wgpu+vulkan+fifo client) is
+        // pinned in the transaction queue forever — only the very first
+        // commit, scheduled for ~0, ever applies. Symptom from the wild:
+        // client lights up briefly, renders 1-2 frames, then freezes
+        // because subsequent commits are queued at e.g. 9443.075s but
+        // we never advance the gate.
+        let now = current_timestamp(&self.clock);
+        for surface in &surfaces {
+            signal_commit_timer(surface, now);
+        }
+
         // Drain per-client transaction queues.
         let dh = self.display_handle.clone();
         let mut seen: std::collections::HashSet<
@@ -113,7 +134,50 @@ impl SpikeState {
             ccs.blocker_cleared(self, &dh);
         }
 
-        debug!("pre_render_drive_clients: processed {} surfaces", surfaces.len());
+        debug!(
+            "pre_render_drive_clients: processed {} surfaces",
+            surfaces.len()
+        );
+    }
+}
+
+/// Get the current monotonic clock as a Timestamp suitable for
+/// `CommitTimerBarrierState::signal_until`.
+fn current_timestamp(
+    clock: &smithay::utils::Clock<smithay::utils::Monotonic>,
+) -> smithay::wayland::commit_timing::Timestamp {
+    clock.now().into()
+}
+
+/// Walk the surface tree rooted at `surface` and signal any
+/// `wp_commit_timer_v1` barrier whose target timestamp is at or before
+/// `deadline`. Required for mesa-vulkan WSI clients (eframe/wgpu, mpv,
+/// Chrome): each commit's `set_timestamp` parks the commit on a blocker
+/// until we advance the gate. Without this they freeze after a couple
+/// of frames.
+fn signal_commit_timer(surface: &WlSurface, deadline: smithay::wayland::commit_timing::Timestamp) {
+    use smithay::reexports::wayland_server::Resource;
+    use smithay::wayland::commit_timing::CommitTimerBarrierStateUserData;
+
+    let mut signaled_any = false;
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |_sub, states, _| {
+            if let Some(s) = states.data_map.get::<CommitTimerBarrierStateUserData>() {
+                if s.lock().unwrap().signal_until(deadline) {
+                    signaled_any = true;
+                }
+            }
+        },
+        |_, _, _| true,
+    );
+    if signaled_any {
+        debug!(
+            "commit-timer: signalled deferred commit(s) on root surface_id={}",
+            surface.id().protocol_id(),
+        );
     }
 }
 
@@ -121,13 +185,17 @@ impl SpikeState {
 /// `wp_fifo_v1` barrier on each node.  Required for clients that use
 /// mesa-vk's fifo-mode swapchain.
 fn signal_fifo_barriers(surface: &WlSurface) {
+    use smithay::reexports::wayland_server::Resource;
     use smithay::wayland::fifo::FifoBarrierCachedState;
 
+    let mut signaled = 0u32;
+    let mut walked = 0u32;
     with_surface_tree_downward(
         surface,
         (),
         |_, _, _| TraversalAction::DoChildren(()),
         |_sub, states, _| {
+            walked += 1;
             let barrier = states
                 .cached_state
                 .get::<FifoBarrierCachedState>()
@@ -136,8 +204,17 @@ fn signal_fifo_barriers(surface: &WlSurface) {
                 .take();
             if let Some(b) = barrier {
                 b.signal();
+                signaled += 1;
             }
         },
         |_, _, _| true,
     );
+    if signaled > 0 {
+        debug!(
+            "fifo: signaled {} barrier(s) on root surface_id={} (walked {} subsurfaces)",
+            signaled,
+            surface.id().protocol_id(),
+            walked,
+        );
+    }
 }

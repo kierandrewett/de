@@ -40,27 +40,28 @@ impl SpikeState {
     /// something actually changed (a new surface mapped, or the output
     /// scale / transform changed).
     pub fn bind_surfaces_to_output(&self) {
-        let Some(output) = self.output.as_ref() else {
+        let Some(output) = self.primary_output() else {
             return;
         };
 
         let scale = output.current_scale().integer_scale();
         let transform = output.current_transform();
 
-        let emit = |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
-            // wl_surface.enter is per-root-surface, not per node — Smithay's
-            // Output keeps a HashSet keyed on the surface so this is a noop
-            // after the first call.
-            output.enter(surface);
+        let emit =
+            |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+                // wl_surface.enter is per-root-surface, not per node — Smithay's
+                // Output keeps a HashSet keyed on the surface so this is a noop
+                // after the first call.
+                output.enter(surface);
 
-            // preferred_buffer_scale + preferred_buffer_transform are per
-            // wl_surface (subsurfaces included) on protocol version 6+.
-            // send_surface_state diffs against the cached value before
-            // emitting.
-            with_surfaces_surface_tree(surface, |sub, states: &SurfaceData| {
-                send_surface_state(sub, states, scale, transform);
-            });
-        };
+                // preferred_buffer_scale + preferred_buffer_transform are per
+                // wl_surface (subsurfaces included) on protocol version 6+.
+                // send_surface_state diffs against the cached value before
+                // emitting.
+                with_surfaces_surface_tree(surface, |sub, states: &SurfaceData| {
+                    send_surface_state(sub, states, scale, transform);
+                });
+            };
 
         for tl in &self.toplevels {
             emit(&tl.surface);

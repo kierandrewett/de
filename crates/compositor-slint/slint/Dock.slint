@@ -36,11 +36,11 @@ component DockIconSlot {
     /// (caller can convert to compositor-space for context-menu positioning).
     callback icon-right-clicked(string, length, length);
 
-    // Slot is sized to give icons a generous footprint with minimal
-    // padding — macOS-style: icons fill ~80% of the slot, no border /
-    // background by default, only a faint hover highlight.
-    width: 64px;
-    height: 68px;
+    // Slot is a square of `dock-slot-size` (= icon-size + 2·padding).
+    // Square keeps the layout grid clean — the running-dot lives within
+    // the slot bounds at the bottom, no extra height needed.
+    width: Tokens.dock-slot-size;
+    height: Tokens.dock-slot-size;
 
     // ── Subtle hover background (animated). No idle bg, no border, no
     //    top-edge gloss — the icon itself is the visual; we keep things
@@ -74,64 +74,201 @@ component DockIconSlot {
         clicked => { root.icon-clicked(root.item.app-id); }
     }
 
-    // ── Hover spotlight (only visible on hover/press) ───────────────────
-    // No fill / border at rest — the icon is the entire visual.
+    // ── Hover spotlight + icon image ────────────────────────────────
+    // The hover fill fills the full slot; the icon glyph sits centred
+    // inside at `dock-icon-size`. With slot = icon + 2·padding the
+    // glyph naturally lands with `dock-padding` of breathing room on
+    // every side — no extra inset variables.
     button := Rectangle {
-        property <length> button-size: 60px;
-        x: (parent.width - self.width) / 2;
-        y: 4px - (ta.has-hover ? 4px : 0px);
-        width: button-size;
-        height: button-size;
-        border-radius: 14px;
+        x: 0; y: 0;
+        width:  parent.width;
+        height: parent.height;
+        border-radius: Tokens.dock-padding * 1.5;
         background: ta.pressed
             ? root.button-bg-pressed
             : (ta.has-hover ? root.button-bg-hover : transparent);
         animate background { duration: 140ms; easing: ease-out; }
-        animate y          { duration: 200ms; easing: ease-out; }
 
-        // Icon image — fills almost the whole slot for a chunky, macOS-
-        // style appearance. 4 px inset leaves a tiny breathing margin.
         icon-img := Image {
-            x: 4px;
-            y: 4px;
-            width:  parent.width - 8px;
-            height: parent.height - 8px;
+            x: (parent.width  - Tokens.dock-icon-size) / 2;
+            y: (parent.height - Tokens.dock-icon-size) / 2;
+            width:  Tokens.dock-icon-size;
+            height: Tokens.dock-icon-size;
             source: root.item.icon;
             image-fit: contain;
         }
     }
 
     // ── Tooltip — macOS-style, shows the app's display name on hover ──
-    // Re-positioned to render INSIDE the slot but ABOVE the pill region
-    // (we render it from a Layer outside the pill in DockSlot). Negative
-    // y combined with `clip: false` on the slot lets it escape the dock
-    // pill's clip. Sits above the button, fading in 100 ms after enter.
-    if ta.has-hover && root.item.name != "": Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: -self.height - 4px - (ta.has-hover ? 3px : 0px);
-        width: tip-text.preferred-width + 14px;
-        height: 22px;
-        background: Theme.mode == TokenMode.Dark
-            ? rgba(20, 22, 28, 0.96)
-            : rgba(36, 38, 46, 0.95);
-        border-radius: 6px;
-        border-width: 1px;
-        border-color: Theme.mode == TokenMode.Dark
+    // Speech-bubble shape: rounded body + small downward-pointing arrow
+    // centred under the slot. Auto-positioning: the body is centred
+    // above the slot by default; if that would push it past the
+    // compositor's left/right edge we shift the body to stay on-screen
+    // and re-anchor the arrow under the slot so the arrow stays glued
+    // to the icon while the body slides.
+    //
+    // Currently only handles horizontal flipping — vertical flipping
+    // (tooltip below the icon) isn't needed because the dock is at the
+    // bottom of the screen and there's always room above.
+    // Tooltip — speech-bubble with downward arrow centred under the
+    // slot. Drawn as a SINGLE path so the 1 px border traces the
+    // combined silhouette continuously (body → arrow slants → body)
+    // instead of the body and arrow being two disconnected shapes
+    // with a visible seam. Theme-aware bg/border/text. Squircle-ish
+    // 10 px corner radius.
+    tip-body := Rectangle {
+        property <bool>   shown: ta.has-hover && root.item.name != "";
+        property <float>  tip-vis: 0.0;
+        states [
+            shown-state when self.shown: {
+                tip-vis: 1.0;
+                in {
+                    animate tip-vis {
+                        duration: Tokens.motion-overlay-duration;
+                        easing:   Tokens.motion-overlay-curve-in;
+                    }
+                }
+                out {
+                    animate tip-vis {
+                        duration: Tokens.motion-overlay-duration;
+                        easing:   Tokens.motion-overlay-curve-out;
+                    }
+                }
+            }
+        ]
+        opacity: self.tip-vis;
+        visible: true;
+
+        property <length> body-w: tip-text.preferred-width + 24px;
+        property <length> body-h: 30px;
+        property <length> arrow-h: 7px;
+        property <length> radius:  10px;
+        property <length> arrow-half: 6px;
+        property <length> slot-cx: parent.width / 2;
+
+        x: self.slot-cx - self.body-w / 2;
+        // Slide up from the icon as we fade in (–4 px → 0 px).
+        // Scale was pulled because text rendered through a scaled
+        // transform reads as duplicated/blurry: glyphs are baked into
+        // an atlas at one size and bitmap-scaled, which subpixel
+        // positioning can't compensate for. Opacity + slide is enough
+        // motion for a tooltip.
+        y: -self.body-h - self.arrow-h - 4px - 4px * (1.0 - self.tip-vis);
+        width: self.body-w;
+        height: self.body-h + self.arrow-h;
+
+        // Theme-aware fill / border / text. Light mode picks a
+        // proper near-white surface; dark mode keeps a deep slate.
+        property <color> bubble-bg: Theme.mode == TokenMode.Dark
+            ? rgba(28, 30, 36, 0.96)
+            : rgba(252, 252, 252, 0.97);
+        property <color> bubble-border: Theme.mode == TokenMode.Dark
             ? rgba(255, 255, 255, 0.10)
-            : rgba(0, 0, 0, 0.18);
-        drop-shadow-blur: 12px;
-        drop-shadow-offset-y: 4px;
-        drop-shadow-color: rgba(0, 0, 0, 0.45);
-        tip-text := Text {
-            x: 7px; y: 0;
-            width: parent.width - 14px;
+            : rgba(0, 0, 0, 0.14);
+        property <color> bubble-fg: Theme.mode == TokenMode.Dark
+            ? rgba(255, 255, 255, 0.92)
+            : rgba(0, 0, 0, 0.85);
+        animate bubble-bg     { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+        animate bubble-border { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+        animate bubble-fg     { duration: Tokens.motion-fade-duration; easing: Tokens.motion-fade-curve; }
+
+        // Drop-shadow source. Slint only casts shadow from a rect
+        // with an actual fill — `background: transparent` short-
+        // circuits and renders nothing. We give it the bubble bg so
+        // it casts; the Path on top covers it pixel-for-pixel in the
+        // body region (same fill, same rounding) so there's no double
+        // colour. Shape is the body rect only (no arrow), but with
+        // 18 px blur the rectangular shadow blob softens enough that
+        // the discrepancy at the arrow isn't perceptible.
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.body-w;
+            height: parent.body-h;
+            background: parent.bubble-bg;
+            border-radius: parent.radius;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: rgba(0, 0, 0, 0.55);
+        }
+
+        // Speech-bubble silhouette — single Path so fill + 1 px
+        // stroke trace the combined body + arrow outline. Path
+        // co-ordinates are in viewbox space; we set the viewbox to
+        // match the element's pixel size so values can be specified
+        // in pixels directly.
+        Path {
+            x: 0; y: 0;
+            width: parent.width;
             height: parent.height;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width:  parent.width  / 1px;
+            viewbox-height: parent.height / 1px;
+            fill: parent.bubble-bg;
+            stroke: parent.bubble-border;
+            // Slint Path strokes anti-alias outward — 1 px logical
+            // reads as ~2 px on HiDPI, which felt heavy. 0.5 px lands
+            // as a single physical pixel at 2× and a soft hairline at
+            // 1×.
+            stroke-width: 0.5px;
+
+            // Top-left after radius → top edge → top-right corner →
+            // right edge → bottom-right corner → bottom edge to right
+            // base of arrow → arrow right slant → arrow tip → arrow
+            // left slant → bottom edge → bottom-left corner → left
+            // edge → top-left corner → close.
+            MoveTo { x: tip-body.radius / 1px; y: 0; }
+            LineTo { x: (tip-body.body-w - tip-body.radius) / 1px; y: 0; }
+            ArcTo  {
+                x: tip-body.body-w / 1px;
+                y: tip-body.radius / 1px;
+                radius-x: tip-body.radius / 1px;
+                radius-y: tip-body.radius / 1px;
+                sweep: true;
+            }
+            LineTo { x: tip-body.body-w / 1px; y: (tip-body.body-h - tip-body.radius) / 1px; }
+            ArcTo  {
+                x: (tip-body.body-w - tip-body.radius) / 1px;
+                y: tip-body.body-h / 1px;
+                radius-x: tip-body.radius / 1px;
+                radius-y: tip-body.radius / 1px;
+                sweep: true;
+            }
+            LineTo { x: (tip-body.body-w / 2 + tip-body.arrow-half) / 1px; y: tip-body.body-h / 1px; }
+            LineTo { x: (tip-body.body-w / 2) / 1px;                       y: (tip-body.body-h + tip-body.arrow-h) / 1px; }
+            LineTo { x: (tip-body.body-w / 2 - tip-body.arrow-half) / 1px; y: tip-body.body-h / 1px; }
+            LineTo { x: tip-body.radius / 1px; y: tip-body.body-h / 1px; }
+            ArcTo  {
+                x: 0;
+                y: (tip-body.body-h - tip-body.radius) / 1px;
+                radius-x: tip-body.radius / 1px;
+                radius-y: tip-body.radius / 1px;
+                sweep: true;
+            }
+            LineTo { x: 0; y: tip-body.radius / 1px; }
+            ArcTo  {
+                x: tip-body.radius / 1px;
+                y: 0;
+                radius-x: tip-body.radius / 1px;
+                radius-y: tip-body.radius / 1px;
+                sweep: true;
+            }
+            Close { }
+        }
+
+        tip-text := Text {
+            x: 12px;
+            y: 0;
+            width: parent.body-w - 24px;
+            height: parent.body-h;
             text: root.item.name;
-            color: rgba(255, 255, 255, 0.92);
+            color: parent.bubble-fg;
             font-family: Tokens.font-family;
             font-size: 12px;
             font-weight: 500;
             vertical-alignment: center;
+            horizontal-alignment: center;
         }
     }
 
@@ -142,7 +279,10 @@ component DockIconSlot {
     if item.running: dot := Rectangle {
         property <length> w-pill: item.focused ? 8px : 5px;
         x: (parent.width - w-pill) / 2;
+        // Sit just below the icon, inside the slot's bottom padding.
         y: parent.height - 6px;
+        // (icon ends at `padding + icon-size = slot - padding`, so we
+        //  have `padding` of vertical room — 8 px — for the dot)
         width: w-pill;
         height: 3px;
         border-radius: 1.5px;
@@ -154,18 +294,20 @@ component DockIconSlot {
 
 // ── Separator between pinned and running sections ─────────────────────────────
 component DockSeparator {
-    // Separator colour mirrors dock-border (animated on theme change).
     property <color> sep-color: Theme.dock-border;
     animate sep-color { duration: 200ms; easing: ease-in-out; }
 
-    width: 18px;
-    height: 64px;
+    // Separator slot is `2·padding` wide (matches the slot's interior
+    // breathing room on either side), full slot-tall.
+    width: Tokens.dock-padding * 2;
+    height: Tokens.dock-slot-size;
 
     Rectangle {
         x: (parent.width - 1px) / 2;
-        y: (parent.height - 32px) / 2;
+        // Hairline at half the slot's height, vertically centred.
+        y: parent.height / 4;
         width: 1px;
-        height: 32px;
+        height: parent.height / 2;
         background: root.sep-color;
     }
 }
@@ -181,9 +323,9 @@ export component Dock {
     /// Right-click — caller positions a context menu near the cursor.
     callback icon-right-clicked(string);
 
-    height: 64px + 2 * Tokens.dock-padding + 2 * Tokens.dock-outer-gap;
+    // Total dock band: pill + outer-padding above & below.
+    height: Tokens.dock-height;
 
-    // Locally-resolved colours for the pill (animated on theme change).
     property <color> resolved-bg:     Theme.dock-bg;
     property <color> resolved-border: Theme.dock-border;
 
@@ -192,9 +334,10 @@ export component Dock {
 
     dock-bg := Rectangle {
         x: 0;
-        y: Tokens.dock-outer-gap;
+        // Pill sits one `dock-padding` below the dock band's top edge.
+        y: Tokens.dock-padding;
         width: parent.width;
-        height: 64px + 2 * Tokens.dock-padding;
+        height: Tokens.dock-pill-height;
         background: transparent;
 
         // Inner pill — outer container is non-clipping so per-icon
@@ -206,7 +349,15 @@ export component Dock {
         pill := Rectangle {
             x: (parent.width - self.width) / 2;
             y: 0;
-            width: items-row.preferred-width + 2 * Tokens.dock-padding;
+            // `items-row.preferred-width` already includes its own
+            // padding-left + padding-right (Slint counts a layout's
+            // preferred size INCLUSIVE of its padding). The previous
+            // formula then added another `2 * dock-padding` on top,
+            // double-counting horizontally and giving 22 px gap from
+            // pill edge to first icon vs only 14 px vertically. Now
+            // single-counted: horizontal and vertical pill padding
+            // both come out to 14 px (`dock-padding + slot-internal`).
+            width: items-row.preferred-width;
             height: parent.height;
             background: transparent;
             clip: false;
@@ -251,7 +402,7 @@ export component Dock {
                 // dock did not show up in the backdrop.
                 Image {
                     x: -pill.x;
-                    y: root.backdrop-offset-y - Tokens.dock-outer-gap;
+                    y: root.backdrop-offset-y - Tokens.dock-padding;
                     width: root.backdrop-screen-w;
                     height: root.backdrop-screen-h;
                     source: root.backdrop;

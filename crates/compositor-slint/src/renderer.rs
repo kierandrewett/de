@@ -28,7 +28,7 @@
 //! WM (Wave 1A): WindowManager drives focus stack, z-order, animations.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -39,17 +39,8 @@ use tracing::{debug, info, warn};
 
 use smithay::{
     output::{Mode, Output, PhysicalProperties, Subpixel},
-    reexports::{
-        calloop::{
-            generic::Generic, EventLoop, Interest, Mode as CalloopMode, PostAction,
-        },
-        wayland_server::{
-            protocol::wl_surface::WlSurface,
-            Display,
-        },
-    },
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Transform, SERIAL_COUNTER},
-    wayland::socket::ListeningSocketSource,
 };
 
 use slint::{ComponentHandle, LogicalPosition, Model, SharedString, VecModel};
@@ -78,13 +69,18 @@ use crate::{
     resize::{self, ActiveDrag, ResizeEdge, WindowGeomSnapshot},
     theme::{ThemeMode, ThemeState},
     wallpaper,
-    wayland_state::{ClientState, SpikeState},
+    wayland_runtime::WaylandRuntime,
+    wayland_state::SpikeState,
     wm::WindowManager,
     Compositor, DockItem, TokenMode,
 };
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 960;
+
+/// Number of frame-duration samples retained for the debug overlay's chart.
+/// 120 ≈ 2s at 60fps, enough to see a spike without scrolling forever.
+const FRAME_HISTORY_LEN: usize = 120;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Pending input events (processed in the main loop where SpikeState is available)
@@ -104,17 +100,28 @@ pub enum PendingPointerEvent {
     Motion { x: f64, y: f64 },
     /// Mouse button pressed/released. `button` is the Linux evdev button code.
     Button { button: u32, pressed: bool },
+    /// Scroll wheel / touchpad axis. Pixel-delta semantics; line/discrete scrolls
+    /// from a wheel are pre-multiplied by 15 (a typical line height) on the
+    /// winit→PendingPointerEvent edge so all events are normalised to pixels
+    /// before reaching the wayland client. `discrete_v120` carries the v120
+    /// representation (1 wheel notch = 120) when the source is a real wheel.
+    Axis {
+        dx: f64,
+        dy: f64,
+        discrete_v120: Option<(i32, i32)>,
+        is_wheel: bool,
+    },
 }
 
 /// Map a winit `MouseButton` to a Linux evdev button code.
 fn winit_button_to_evdev(button: MouseButton) -> u32 {
     match button {
-        MouseButton::Left   => 0x110, // BTN_LEFT
-        MouseButton::Right  => 0x111, // BTN_RIGHT
-        MouseButton::Middle => 0x112, // BTN_MIDDLE
-        MouseButton::Back   => 0x116, // BTN_SIDE
-        MouseButton::Forward=> 0x115, // BTN_EXTRA
-        _                   => 0x110,
+        MouseButton::Left => 0x110,    // BTN_LEFT
+        MouseButton::Right => 0x111,   // BTN_RIGHT
+        MouseButton::Middle => 0x112,  // BTN_MIDDLE
+        MouseButton::Back => 0x116,    // BTN_SIDE
+        MouseButton::Forward => 0x115, // BTN_EXTRA
+        _ => 0x110,
     }
 }
 
@@ -123,10 +130,19 @@ fn winit_button_to_evdev(button: MouseButton) -> u32 {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Allocate an offscreen texture for Slint/FemtoVG to render into.
-fn make_render_texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
+fn make_render_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("slint-render-target"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -229,6 +245,10 @@ struct CompositorApp {
     pointer_pos: (f64, f64),
     start_time: Instant,
     last_clock_update: Instant,
+    /// Months ahead (+) or behind (-) the current month for the
+    /// datetime popout's calendar. Driven by the prev/next chevrons
+    /// in the popout header. `0` means "show current month".
+    calendar_month_offset: i32,
     pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
     pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
     frame_count: u64,
@@ -258,7 +278,7 @@ struct CompositorApp {
     alt_tab: AltTabState,
 
     // Pending WM actions from Slint callbacks (processed in the main loop).
-    pending_close:    Arc<Mutex<VecDeque<i32>>>,
+    pending_close: Arc<Mutex<VecDeque<i32>>>,
     /// Dock-menu deferred actions: `(app_id, action_id)` — 2=Show All, 5=Quit.
     pending_dock_action: Arc<Mutex<VecDeque<(String, i32)>>>,
     /// Currently-registered StatusNotifierItems. Updated each frame by
@@ -268,9 +288,12 @@ struct CompositorApp {
     pending_maximize: Arc<Mutex<VecDeque<i32>>>,
     pending_activate: Arc<Mutex<VecDeque<i32>>>,
     /// Pending alt-tab step requests from the winit key handler.
-    pending_alt_tab_step:   Arc<Mutex<u32>>,
+    pending_alt_tab_step: Arc<Mutex<u32>>,
     /// Pending alt-tab commit (Alt released).
     pending_alt_tab_commit: Arc<Mutex<bool>>,
+    /// Key releases to swallow because the corresponding press was handled
+    /// by compositor UI/WM policy and never forwarded to the focused client.
+    swallowed_key_releases: HashSet<u32>,
 
     /// Persistent windows VecModel — Slint repeater preserves WindowChrome
     /// component identity (and IconButton hover state) across redraws.
@@ -287,6 +310,11 @@ struct CompositorApp {
     fps: f32,
     last_fps_sample: Instant,
     last_fps_count: u64,
+
+    /// Sliding window of per-frame render durations (ms), bound to the debug
+    /// overlay's chart. Capped at FRAME_HISTORY_LEN; oldest sample evicted
+    /// each push so the chart shows the most recent ~2s at 60fps.
+    frame_times_model: Rc<VecModel<f32>>,
 
     /// Snap candidate from the last Move-drag motion. If Some on left-up,
     /// apply_pending_snap glides the window into the snap rect.
@@ -324,6 +352,28 @@ struct CompositorApp {
     /// Multi-output not yet supported; we only render the first lock
     /// surface.
     lock_surface_snapshot: Option<LockSurfaceSnapshot>,
+
+    /// Cached Slint `Image` per layer surface (keyed by wl_surface
+    /// protocol_id). Rebuilt only when the surface's `pixels.dirty` flag
+    /// flips on commit; otherwise reused so the panel/dock textures don't
+    /// re-upload every frame.
+    layer_image_cache: std::collections::HashMap<u32, slint::Image>,
+    /// Fingerprint of the last layers model published to Slint. When it
+    /// matches the current state and no surface dirtied, the per-iteration
+    /// rebuild + `set_layers` is skipped entirely.
+    last_layers_fingerprint: Vec<(u32, i32, i32, i32, i32, i32)>,
+    /// Cached Slint `Image` per WM window id (keyed by `WindowState::id`),
+    /// paired with the `ClientSurfaceData::version` it was built from.
+    /// Rebuilt only when the toplevel's buffer version has advanced;
+    /// otherwise reused so window content doesn't re-upload on animation-
+    /// only ticks (focus crossfade, drag, alt-tab) or geometry updates.
+    client_image_cache: std::collections::HashMap<i32, (u64, slint::Image)>,
+    /// Per-surface image cache for the new render-element model.
+    /// Keyed by `(WindowState::id, wl_surface protocol_id)`, value is
+    /// `(ClientSurfaceData::version, slint::Image)`. Reuses uploads across
+    /// frames when neither the toplevel's window id nor the individual
+    /// surface's buffer version has advanced.
+    client_image_cache_per_surface: std::collections::HashMap<(i32, u32), (u64, slint::Image)>,
 }
 
 /// Per-frame snapshot of the active lock surface for the renderer.
@@ -379,6 +429,7 @@ impl CompositorApp {
             pointer_pos: (0.0, 0.0),
             start_time: Instant::now(),
             last_clock_update: Instant::now(),
+            calendar_month_offset: 0,
             pending_keys,
             pending_pointers,
             frame_count: 0,
@@ -390,26 +441,32 @@ impl CompositorApp {
             left_button_down: false,
             wm: WindowManager::new(WIDTH as i32, HEIGHT as i32),
             alt_tab: AltTabState::default(),
-            pending_close:    Arc::new(Mutex::new(VecDeque::new())),
+            pending_close: Arc::new(Mutex::new(VecDeque::new())),
             pending_dock_action: Arc::new(Mutex::new(VecDeque::new())),
-            tray_items:        Vec::new(),
+            tray_items: Vec::new(),
             pending_minimize: Arc::new(Mutex::new(VecDeque::new())),
             pending_maximize: Arc::new(Mutex::new(VecDeque::new())),
             pending_activate: Arc::new(Mutex::new(VecDeque::new())),
-            pending_alt_tab_step:   Arc::new(Mutex::new(0)),
+            pending_alt_tab_step: Arc::new(Mutex::new(0)),
             pending_alt_tab_commit: Arc::new(Mutex::new(false)),
+            swallowed_key_releases: HashSet::new(),
             windows_model: Rc::new(VecModel::default()),
             popups_model: Rc::new(VecModel::default()),
             backdrop: BackdropSynth::new(WIDTH, HEIGHT),
             fps: 0.0,
             last_fps_sample: Instant::now(),
             last_fps_count: 0,
+            frame_times_model: Rc::new(VecModel::default()),
             pending_snap: None,
             pending_ipc: Arc::new(Mutex::new(Vec::new())),
             last_present_time: None,
             dnd_icon_snapshot: None,
             pending_output_scale: None,
             lock_surface_snapshot: None,
+            layer_image_cache: std::collections::HashMap::new(),
+            last_layers_fingerprint: Vec::new(),
+            client_image_cache: std::collections::HashMap::new(),
+            client_image_cache_per_surface: std::collections::HashMap::new(),
         }
     }
 
@@ -417,11 +474,16 @@ impl CompositorApp {
         if self.render_texture.is_none() || self.render_texture_size != (width, height) {
             let gpu_window = self.gpu_window.as_ref()?;
             let device = &gpu_window.wgpu_device;
-            let format = self.swapchain_format.unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
+            let format = self
+                .swapchain_format
+                .unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
             self.render_texture = Some(make_render_texture(device, width, height, format));
-            self.final_texture  = Some(make_render_texture(device, width, height, format));
+            self.final_texture = Some(make_render_texture(device, width, height, format));
             self.render_texture_size = (width, height);
-            debug!("(Re)created render+final textures {}x{} {:?}", width, height, format);
+            debug!(
+                "(Re)created render+final textures {}x{} {:?}",
+                width, height, format
+            );
         }
         self.render_texture.as_ref()
     }
@@ -438,10 +500,16 @@ impl ApplicationHandler for CompositorApp {
             .with_inner_size(LogicalSize::new(WIDTH, HEIGHT));
 
         let window = Rc::new(
-            event_loop.create_window(attrs).expect("failed to create window"),
+            event_loop
+                .create_window(attrs)
+                .expect("failed to create window"),
         );
 
-        let gpu_window = self.window_ref.lock().unwrap().clone()
+        let gpu_window = self
+            .window_ref
+            .lock()
+            .unwrap()
+            .clone()
             .expect("Slint GPU window adapter should exist after Compositor::new()");
 
         let surface = unsafe {
@@ -450,12 +518,13 @@ impl ApplicationHandler for CompositorApp {
                 raw_display_handle: window.display_handle().unwrap().as_raw(),
                 raw_window_handle: window.window_handle().unwrap().as_raw(),
             };
-            gpu_window.wgpu_instance.create_surface_unsafe(target)
+            gpu_window
+                .wgpu_instance
+                .create_surface_unsafe(target)
                 .expect("create_surface_unsafe failed")
         };
-        let surface: wgpu::Surface<'static> = unsafe {
-            std::mem::transmute::<wgpu::Surface<'_>, wgpu::Surface<'static>>(surface)
-        };
+        let surface: wgpu::Surface<'static> =
+            unsafe { std::mem::transmute::<wgpu::Surface<'_>, wgpu::Surface<'static>>(surface) };
 
         let format = configure_surface(
             &surface,
@@ -466,10 +535,8 @@ impl ApplicationHandler for CompositorApp {
         );
         info!("wgpu swapchain ready, format={:?} (shared device)", format);
 
-        let chrome = ChromeRenderer::new(
-            std::sync::Arc::new(gpu_window.wgpu_device.clone()),
-            format,
-        );
+        let chrome =
+            ChromeRenderer::new(std::sync::Arc::new(gpu_window.wgpu_device.clone()), format);
         self.chrome = Some(chrome);
         info!("ChromeRenderer initialised (shadow + border + highlight passes)");
 
@@ -484,7 +551,7 @@ impl ApplicationHandler for CompositorApp {
         // factor at this point. The first WindowEvent::Resized that
         // arrives shortly after will fix this up if the host disagrees.
         let initial_scale = window.scale_factor() as f32;
-        let initial_phys_w = (WIDTH  as f32 * initial_scale).round() as u32;
+        let initial_phys_w = (WIDTH as f32 * initial_scale).round() as u32;
         let initial_phys_h = (HEIGHT as f32 * initial_scale).round() as u32;
         self.scale_factor = initial_scale;
         // Output is created in main() before winit knows the host's
@@ -508,6 +575,7 @@ impl ApplicationHandler for CompositorApp {
             // hover state) across redraws.
             ui.set_windows(slint::ModelRc::from(self.windows_model.clone()));
             ui.set_popups(slint::ModelRc::from(self.popups_model.clone()));
+            ui.set_debug_frame_times(slint::ModelRc::from(self.frame_times_model.clone()));
             ui.window().show().ok();
         }
 
@@ -519,12 +587,7 @@ impl ApplicationHandler for CompositorApp {
         info!("GPU window created, FemtoVG renderer active");
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let gpu_window = match self.gpu_window.as_ref() {
             Some(w) => w.clone(),
             None => return,
@@ -545,7 +608,9 @@ impl ApplicationHandler for CompositorApp {
                 // forwarded to clients land at the wrong spot. Divide by
                 // the host's scale_factor here so the WM, slint, and the
                 // wayland boundary all share one coord system.
-                let scale = self.window.as_ref()
+                let scale = self
+                    .window
+                    .as_ref()
                     .map(|w| w.scale_factor())
                     .unwrap_or(1.0)
                     .max(0.0001);
@@ -554,12 +619,11 @@ impl ApplicationHandler for CompositorApp {
                 if (prev_scale as f64 - scale).abs() > 0.001 {
                     self.pending_output_scale = Some(scale);
                 }
-                let logical_w = ((size.width  as f64 / scale).round() as u32).max(1);
+                let logical_w = ((size.width as f64 / scale).round() as u32).max(1);
                 let logical_h = ((size.height as f64 / scale).round() as u32).max(1);
                 info!(
                     "compositor resize: logical={}x{} physical={}x{} scale_factor={} (was {})",
-                    logical_w, logical_h, size.width, size.height,
-                    self.scale_factor, prev_scale,
+                    logical_w, logical_h, size.width, size.height, self.scale_factor, prev_scale,
                 );
                 if let Some(surface) = self.wgpu_surface.as_ref() {
                     // wgpu surface is in physical pixels (raw size).
@@ -577,7 +641,7 @@ impl ApplicationHandler for CompositorApp {
                 // is allocated at PHYSICAL size below (matches swapchain).
                 gpu_window.resize(size.width.max(1), size.height.max(1), scale as f32);
                 self.render_texture = None;
-                self.final_texture  = None;
+                self.final_texture = None;
                 self.wm.output_w = logical_w as i32;
                 self.wm.output_h = logical_h as i32;
                 self.backdrop.set_output_size(logical_w, logical_h);
@@ -590,7 +654,9 @@ impl ApplicationHandler for CompositorApp {
                 // winit `position` is PHYSICAL pixels. Convert to LOGICAL so
                 // the cursor visual, slint hit testing, and wayland client
                 // events all share the compositor's logical-pixel space.
-                let scale = self.window.as_ref()
+                let scale = self
+                    .window
+                    .as_ref()
                     .map(|w| w.scale_factor())
                     .unwrap_or(1.0)
                     .max(0.0001);
@@ -603,9 +669,66 @@ impl ApplicationHandler for CompositorApp {
                         position: LogicalPosition::new(lx as f32, ly as f32),
                     },
                 );
-                self.pending_pointers.lock().unwrap().push_back(
-                    PendingPointerEvent::Motion { x: lx, y: ly }
+                if self.slint_pointer_overlay_open() {
+                    self.show_builtin_cursor(CursorKind::Arrow);
+                    return;
+                }
+                self.pending_pointers
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingPointerEvent::Motion { x: lx, y: ly });
+            }
+
+            WindowEvent::MouseWheel {
+                delta, phase: _, ..
+            } => {
+                use winit::event::MouseScrollDelta;
+                // Wayland axis events are pixel-deltas. winit hands us either
+                // discrete LineDelta (mouse wheel — one notch per integer) or
+                // PixelDelta (touchpad). Multiply LineDelta by ~15 px/line so
+                // wheel scrolls feel like real scroll distance, then forward
+                // unchanged for PixelDelta. The v120 (=120 per detent) signal
+                // is what GTK/Qt use for high-resolution scroll feel; only
+                // emit it for genuine wheels.
+                let (dx_px, dy_px, discrete_v120, is_wheel) = match delta {
+                    MouseScrollDelta::LineDelta(lx, ly) => {
+                        let v120 = (
+                            (lx as f64 * 120.0).round() as i32,
+                            (ly as f64 * 120.0).round() as i32,
+                        );
+                        (lx as f64 * 15.0, ly as f64 * 15.0, Some(v120), true)
+                    }
+                    MouseScrollDelta::PixelDelta(p) => (p.x, p.y, None, false),
+                };
+                // Dispatch to Slint so any in-process scrollable widgets
+                // (debug overlay text, dock overflow, future control-centre
+                // sliders) react to wheel input. Slint's PointerScrolled
+                // matches our "positive = down/right" convention 1:1, so
+                // no axis flip is needed.
+                let pos =
+                    LogicalPosition::new(self.pointer_pos.0 as f32, self.pointer_pos.1 as f32);
+                gpu_window.inner_window().dispatch_event(
+                    slint::platform::WindowEvent::PointerScrolled {
+                        position: pos,
+                        delta_x: dx_px as f32,
+                        delta_y: dy_px as f32,
+                    },
                 );
+                if self.slint_pointer_overlay_open() {
+                    return;
+                }
+                // Wayland axis convention: positive = down/right, matching
+                // winit's "content moves right/down" for positive deltas. No
+                // sign flip needed.
+                self.pending_pointers
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingPointerEvent::Axis {
+                        dx: dx_px,
+                        dy: dy_px,
+                        discrete_v120,
+                        is_wheel,
+                    });
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
@@ -615,10 +738,39 @@ impl ApplicationHandler for CompositorApp {
                     MouseButton::Middle => slint::platform::PointerEventButton::Middle,
                     _ => slint::platform::PointerEventButton::Other,
                 };
-                let pos = LogicalPosition::new(
-                    self.pointer_pos.0 as f32, self.pointer_pos.1 as f32,
-                );
+                let pos =
+                    LogicalPosition::new(self.pointer_pos.0 as f32, self.pointer_pos.1 as f32);
                 let pressed = state == ElementState::Pressed;
+
+                // Right-click while a context menu is open → dismiss
+                // BEFORE forwarding to slint or queuing for Rust. If
+                // we forwarded first, slint's click-absorber would
+                // close the menu, then `forward_pointer_button` would
+                // see `desktop_menu_open == false` and re-open at the
+                // new cursor — net effect: menu teleports instead of
+                // dismissing. By returning here we suppress both.
+                if button == MouseButton::Right && pressed {
+                    if let Some(ui) = self.ui.as_ref() {
+                        let any_open = ui.get_desktop_menu_open()
+                            || ui.get_dock_menu_open()
+                            || ui.get_tray_menu_open()
+                            || ui.get_window_menu_open();
+                        if any_open {
+                            ui.set_desktop_menu_open(false);
+                            ui.set_desktop_menu_selected(-1);
+                            ui.set_dock_menu_open(false);
+                            ui.set_dock_menu_selected(-1);
+                            ui.set_tray_menu_open(false);
+                            ui.set_tray_menu_selected(-1);
+                            ui.set_window_menu_open(false);
+                            ui.set_window_menu_selected(-1);
+                            if let Some(gpu) = self.gpu_window.as_ref() {
+                                gpu.mark_dirty();
+                            }
+                            return;
+                        }
+                    }
+                }
 
                 // Track left button state for drag detection.
                 if button == MouseButton::Left {
@@ -628,40 +780,72 @@ impl ApplicationHandler for CompositorApp {
                     // where we have SpikeState access — see release_drag().
                 }
 
+                let slint_captures_pointer = self.slint_pointer_overlay_open();
+
                 let slint_event = match state {
                     ElementState::Pressed => slint::platform::WindowEvent::PointerPressed {
-                        position: pos, button: slint_btn,
+                        position: pos,
+                        button: slint_btn,
                     },
                     ElementState::Released => slint::platform::WindowEvent::PointerReleased {
-                        position: pos, button: slint_btn,
+                        position: pos,
+                        button: slint_btn,
                     },
                 };
                 gpu_window.inner_window().dispatch_event(slint_event);
+                if slint_captures_pointer {
+                    self.show_builtin_cursor(CursorKind::Arrow);
+                    return;
+                }
 
                 // On press, update WM focus based on pointer position.
                 // Actual focus update happens in the main loop via pending_pointers.
                 let evdev_btn = winit_button_to_evdev(button);
-                self.pending_pointers.lock().unwrap().push_back(
-                    PendingPointerEvent::Button { button: evdev_btn, pressed }
-                );
+                self.pending_pointers
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingPointerEvent::Button {
+                        button: evdev_btn,
+                        pressed,
+                    });
             }
 
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
                 let scancode = key_event.physical_key.to_scancode().unwrap_or(0);
                 let pressed = key_event.state == ElementState::Pressed;
+                let release_consumed = !pressed && self.swallowed_key_releases.remove(&scancode);
+
+                // Context-menu keyboard navigation. When a desktop / dock /
+                // tray context menu is open, Up / Down / Enter drive the
+                // selection and never reach wayland clients. Escape is
+                // already handled below in the catch-all overlay-close
+                // branch.
+                let menu_consumed = if pressed {
+                    self.handle_menu_nav_key(scancode)
+                } else {
+                    // Swallow the matching release so clients don't see a
+                    // stray key-up for a press they never received.
+                    matches!(scancode, 103 | 108 | 28 | 96) && self.menu_nav_active()
+                };
+                let mut compositor_consumed = release_consumed || menu_consumed;
 
                 // ── Super+T → toggle light/dark theme ─────────────────────
                 // Scancode 125 = KEY_LEFTMETA (Super/Win key)
                 // Scancode 126 = KEY_RIGHTMETA
                 // Scancode 20  = KEY_T
                 match scancode {
-                    125 | 126 => { self.super_held = pressed; }
+                    125 | 126 => {
+                        self.super_held = pressed;
+                    }
                     20 if pressed && self.super_held => {
                         // Super+T → toggle light/dark theme + per-mode wallpaper.
                         self.theme.toggle_mode();
                         self.apply_theme_to_slint();
                         self.swap_wallpaper_for_current_mode();
                         debug!("Super+T: toggled theme to {:?}", self.theme.current_mode);
+                        compositor_consumed = true;
                     }
                     23 if pressed && self.super_held => {
                         // Super+I → toggle debug overlay.
@@ -669,6 +853,7 @@ impl ApplicationHandler for CompositorApp {
                             let now = ui.get_debug_overlay_visible();
                             ui.set_debug_overlay_visible(!now);
                         }
+                        compositor_consumed = true;
                     }
                     53 if pressed && self.super_held => {
                         // Super+/ → keyboard shortcuts help.
@@ -676,6 +861,7 @@ impl ApplicationHandler for CompositorApp {
                             let now = ui.get_help_overlay_visible();
                             ui.set_help_overlay_visible(!now);
                         }
+                        compositor_consumed = true;
                     }
                     // Super+W (scancode 17) → close focused window.
                     17 if pressed && self.super_held => {
@@ -683,6 +869,7 @@ impl ApplicationHandler for CompositorApp {
                             self.pending_close.lock().unwrap().push_back(id);
                             debug!("Super+W: queued close for focused id={}", id);
                         }
+                        compositor_consumed = true;
                     }
                     // Super+M (scancode 50) → minimize focused window.
                     50 if pressed && self.super_held => {
@@ -690,37 +877,47 @@ impl ApplicationHandler for CompositorApp {
                             self.pending_minimize.lock().unwrap().push_back(id);
                             debug!("Super+M: queued minimize for focused id={}", id);
                         }
+                        compositor_consumed = true;
                     }
                     // Super+D (scancode 32) → show desktop / minimize all.
                     32 if pressed && self.super_held => {
-                        let ids: Vec<i32> = self.wm.windows.values()
+                        let ids: Vec<i32> = self
+                            .wm
+                            .windows
+                            .values()
                             .filter(|w| !w.minimized && !w.closing)
                             .map(|w| w.id)
                             .collect();
                         let mut q = self.pending_minimize.lock().unwrap();
-                        for id in ids { q.push_back(id); }
+                        for id in ids {
+                            q.push_back(id);
+                        }
                         debug!("Super+D: minimized all visible windows");
+                        compositor_consumed = true;
                     }
                     // Super+Space (scancode 57) → toggle the app launcher.
                     57 if pressed && self.super_held => {
                         if let Some(ui) = self.ui.as_ref() {
                             let now = ui.get_launcher_open();
                             ui.set_launcher_open(!now);
-                            if !now { ui.set_launcher_query(SharedString::default()); }
+                            if !now {
+                                ui.set_launcher_query(SharedString::default());
+                            }
                         }
+                        compositor_consumed = true;
                     }
                     // Escape → close any open compositor overlay (menus,
                     // popouts, debug overlay, launcher) without forwarding
                     // to clients.
                     1 if pressed => {
                         if let Some(ui) = self.ui.as_ref() {
-                            let any_open =
-                                ui.get_desktop_menu_open()
+                            let any_open = ui.get_desktop_menu_open()
                                 || ui.get_datetime_popout_open()
                                 || ui.get_control_centre_open()
                                 || ui.get_help_overlay_visible()
                                 || ui.get_launcher_open()
-                                || ui.get_dock_menu_open();
+                                || ui.get_dock_menu_open()
+                                || ui.get_window_menu_open();
                             if any_open {
                                 ui.set_desktop_menu_open(false);
                                 ui.set_datetime_popout_open(false);
@@ -728,25 +925,56 @@ impl ApplicationHandler for CompositorApp {
                                 ui.set_help_overlay_visible(false);
                                 ui.set_launcher_open(false);
                                 ui.set_dock_menu_open(false);
+                                ui.set_window_menu_open(false);
                                 if let Some(gpu) = self.gpu_window.as_ref() {
                                     gpu.mark_dirty();
                                 }
+                                compositor_consumed = true;
+                            }
+                        }
+                    }
+                    // Menu key (KEY_MENU = 127 on Linux input) → open
+                    // the window context menu for the focused window
+                    // at its titlebar centre.
+                    127 if pressed => {
+                        if let Some(focused_id) = self.wm.focused_id() {
+                            if let Some(win) = self.wm.windows.values().find(|w| w.id == focused_id)
+                            {
+                                let (wx, wy, ww) = (
+                                    win.anim.current_x() as f64,
+                                    win.anim.current_y() as f64,
+                                    win.anim.current_w() as f64,
+                                );
+                                // Anchor at titlebar centre, just below
+                                // its bottom edge so the menu drops
+                                // out of the chrome.
+                                let titlebar_h = crate::wm::TITLEBAR_HEIGHT;
+                                let cx = wx + ww / 2.0;
+                                let cy = wy + titlebar_h;
+                                self.open_window_menu(focused_id, cx, cy);
+                                compositor_consumed = true;
                             }
                         }
                     }
                     _ => {}
                 }
 
-                if scancode > 0 {
-                    self.pending_keys.lock().unwrap().push_back(PendingKeyEvent {
-                        scancode,
-                        pressed,
-                    });
-                }
-
                 // Handle Alt-Tab cycling in the winit handler so we get
                 // immediate key state without waiting for the calloop round-trip.
-                self.handle_alt_tab_key(&key_event);
+                if self.handle_alt_tab_key(&key_event) {
+                    compositor_consumed = true;
+                }
+
+                if pressed && compositor_consumed && scancode > 0 {
+                    self.swallowed_key_releases.insert(scancode);
+                }
+
+                if scancode > 0 && !compositor_consumed {
+                    self.pending_keys
+                        .lock()
+                        .unwrap()
+                        .push_back(PendingKeyEvent { scancode, pressed });
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -765,8 +993,230 @@ impl ApplicationHandler for CompositorApp {
 }
 
 impl CompositorApp {
+    /// True iff a context menu (desktop / dock / tray / window) is open.
+    /// Used to decide whether key-release events for navigation keys
+    /// should be swallowed instead of forwarded to wayland clients.
+    fn menu_nav_active(&self) -> bool {
+        let Some(ui) = self.ui.as_ref() else {
+            return false;
+        };
+        ui.get_desktop_menu_open()
+            || ui.get_dock_menu_open()
+            || ui.get_tray_menu_open()
+            || ui.get_window_menu_open()
+    }
+
+    /// True while a compositor-owned Slint surface should capture pointer
+    /// input instead of letting the event fall through to Wayland clients.
+    fn slint_pointer_overlay_open(&self) -> bool {
+        let Some(ui) = self.ui.as_ref() else {
+            return false;
+        };
+        ui.get_desktop_menu_open()
+            || ui.get_dock_menu_open()
+            || ui.get_tray_menu_open()
+            || ui.get_window_menu_open()
+            || ui.get_datetime_popout_open()
+            || ui.get_control_centre_open()
+            || ui.get_launcher_open()
+            || ui.get_help_overlay_visible()
+    }
+
+    fn show_builtin_cursor(&mut self, kind: CursorKind) {
+        self.current_cursor = kind;
+        self.update_cursor_overlay();
+        if let Some(ui) = self.ui.as_ref() {
+            ui.set_cursor_visible(true);
+        }
+    }
+
+    /// Open the per-window context menu (Minimize / Maximize / Close)
+    /// for the given WM window id at screen-space (x, y). Same clamp +
+    /// origin maths as the desktop menu so the cursor lands inside the
+    /// menu and the open-scale grows out of the click point.
+    fn open_window_menu(&mut self, target_id: i32, x: f64, y: f64) {
+        let Some(ui) = self.ui.as_ref() else { return };
+        let menu_w = 220.0;
+        let panel_h = crate::wm::PANEL_HEIGHT as f64;
+        let dock_h = crate::wm::DOCK_HEIGHT as f64;
+        let ow = self.wm.output_w as f64;
+        let oh = self.wm.output_h as f64;
+        let items = ui.get_window_menu_items();
+        let menu_h = compute_menu_height(&items);
+        let side_pad = 8.0;
+        let bot_pad = 4.0;
+        let x_flipped = x + menu_w + side_pad > ow;
+        let mut mx = if x_flipped { x - menu_w } else { x };
+        mx = mx.clamp(side_pad, (ow - menu_w - side_pad).max(side_pad));
+        let y_flipped = y + menu_h + bot_pad > oh - dock_h;
+        let mut my = if y_flipped { y - menu_h } else { y };
+        my = my.clamp(
+            panel_h + 4.0,
+            (oh - dock_h - menu_h - bot_pad).max(panel_h + 4.0),
+        );
+        let origin_x = (x - mx).clamp(0.0, menu_w);
+        let origin_y = (y - my).clamp(0.0, menu_h);
+        ui.set_window_menu_target_id(target_id);
+        ui.set_window_menu_x(mx as i32);
+        ui.set_window_menu_y(my as i32);
+        ui.set_window_menu_w(menu_w as i32);
+        ui.set_window_menu_h(menu_h as i32);
+        ui.set_window_menu_origin_x(origin_x as i32);
+        ui.set_window_menu_origin_y(origin_y as i32);
+        ui.set_window_menu_selected(-1);
+        ui.set_window_menu_open(true);
+        if let Some(gpu) = self.gpu_window.as_ref() {
+            gpu.mark_dirty();
+        }
+    }
+
+    /// Drive keyboard navigation for whichever context menu is open.
+    /// Returns `true` if the keypress was consumed (don't forward to
+    /// clients). Recognises Up / Down / Home / End / Enter / KP-Enter.
+    /// Skips separator and disabled rows when stepping. Enter invokes
+    /// the same callback the click handler does, then closes the menu.
+    fn handle_menu_nav_key(&mut self, scancode: u32) -> bool {
+        // 103 = KEY_UP, 108 = KEY_DOWN, 28 = KEY_ENTER, 96 = KEY_KPENTER,
+        // 102 = KEY_HOME, 107 = KEY_END.
+        if !matches!(scancode, 103 | 108 | 28 | 96 | 102 | 107) {
+            return false;
+        }
+        let Some(ui) = self.ui.as_ref() else {
+            return false;
+        };
+
+        // Pick the open menu — most-recently-overlaid wins (dock + tray
+        // are explicitly stacked above desktop in Compositor.slint).
+        enum Kind {
+            Desktop,
+            Dock,
+            Tray,
+        }
+        let kind = if ui.get_dock_menu_open() {
+            Kind::Dock
+        } else if ui.get_tray_menu_open() {
+            Kind::Tray
+        } else if ui.get_desktop_menu_open() {
+            Kind::Desktop
+        } else {
+            return false;
+        };
+
+        // Snapshot which rows are pickable (not separator, enabled).
+        let model = match kind {
+            Kind::Desktop => ui.get_desktop_menu_items(),
+            Kind::Dock => ui.get_dock_menu_items(),
+            Kind::Tray => ui.get_tray_menu_items(),
+        };
+        let n = model.row_count() as i32;
+        if n == 0 {
+            return true;
+        }
+        let pickable: Vec<bool> = (0..n)
+            .map(|i| {
+                model
+                    .row_data(i as usize)
+                    .map(|it| !it.separator && it.enabled)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !pickable.iter().any(|p| *p) {
+            return true;
+        }
+
+        let current = match kind {
+            Kind::Desktop => ui.get_desktop_menu_selected(),
+            Kind::Dock => ui.get_dock_menu_selected(),
+            Kind::Tray => ui.get_tray_menu_selected(),
+        };
+
+        // Step from `from` (exclusive) in `dir` (+1 / -1), wrapping, until
+        // we land on a pickable row. Caller guarantees ≥1 pickable row.
+        let step = |from: i32, dir: i32| -> i32 {
+            let mut i = from;
+            for _ in 0..n {
+                i += dir;
+                if i < 0 {
+                    i = n - 1;
+                }
+                if i >= n {
+                    i = 0;
+                }
+                if pickable[i as usize] {
+                    return i;
+                }
+            }
+            from
+        };
+
+        let new_idx = match scancode {
+            103 => {
+                // Up
+                let from = if current < 0 { 0 } else { current };
+                step(from, -1)
+            }
+            108 => {
+                // Down
+                let from = if current < 0 { -1 } else { current };
+                step(from, 1)
+            }
+            102 => {
+                // Home — first pickable
+                step(-1, 1)
+            }
+            107 => {
+                // End — last pickable
+                step(n, -1)
+            }
+            28 | 96 => {
+                // Enter — fire the click callback
+                if current < 0 || !pickable[current as usize] {
+                    return true;
+                }
+                let id = model
+                    .row_data(current as usize)
+                    .map(|it| it.id)
+                    .unwrap_or(0);
+                match kind {
+                    Kind::Desktop => {
+                        ui.set_desktop_menu_open(false);
+                        ui.set_desktop_menu_selected(-1);
+                        ui.invoke_desktop_menu_clicked(id);
+                    }
+                    Kind::Dock => {
+                        let app_id = ui.get_dock_menu_app_id();
+                        ui.set_dock_menu_open(false);
+                        ui.set_dock_menu_selected(-1);
+                        ui.invoke_dock_menu_clicked(app_id, id);
+                    }
+                    Kind::Tray => {
+                        let sni = ui.get_tray_menu_id();
+                        ui.set_tray_menu_open(false);
+                        ui.set_tray_menu_selected(-1);
+                        ui.invoke_tray_menu_clicked(sni, id);
+                    }
+                }
+                if let Some(gpu) = self.gpu_window.as_ref() {
+                    gpu.mark_dirty();
+                }
+                return true;
+            }
+            _ => return false,
+        };
+
+        match kind {
+            Kind::Desktop => ui.set_desktop_menu_selected(new_idx),
+            Kind::Dock => ui.set_dock_menu_selected(new_idx),
+            Kind::Tray => ui.set_tray_menu_selected(new_idx),
+        }
+        if let Some(gpu) = self.gpu_window.as_ref() {
+            gpu.mark_dirty();
+        }
+        true
+    }
+
     /// Handle alt/tab key events for the alt-tab switcher.
-    fn handle_alt_tab_key(&mut self, key_event: &KeyEvent) {
+    fn handle_alt_tab_key(&mut self, key_event: &KeyEvent) -> bool {
         let pressed = key_event.state == ElementState::Pressed;
         match key_event.physical_key {
             PhysicalKey::Code(KeyCode::AltLeft) | PhysicalKey::Code(KeyCode::AltRight) => {
@@ -776,6 +1226,7 @@ impl CompositorApp {
                     self.alt_tab.cycling = false;
                     *self.pending_alt_tab_commit.lock().unwrap() = true;
                 }
+                false
             }
             PhysicalKey::Code(KeyCode::Tab) => {
                 if pressed && self.alt_tab.alt_held {
@@ -783,18 +1234,24 @@ impl CompositorApp {
                     self.alt_tab.cycling = true;
                     let mut steps = self.pending_alt_tab_step.lock().unwrap();
                     *steps += 1;
+                    return true;
                 }
+                self.alt_tab.cycling
             }
-            _ => {}
+            _ => false,
         }
     }
 
     /// GPU render: damage-tracked Slint render + swapchain blit.
     fn render_frame(&mut self) {
-        let gpu_window = match self.gpu_window.clone() { Some(w) => w, None => return };
+        let gpu_window = match self.gpu_window.clone() {
+            Some(w) => w,
+            None => return,
+        };
         let Some(ui) = self.ui.as_ref() else { return };
 
-        let now = Instant::now();
+        let frame_start = Instant::now();
+        let now = frame_start;
         if now.duration_since(self.last_clock_update) >= Duration::from_secs(1) {
             self.last_clock_update = now;
             let local = chrono::Local::now();
@@ -804,13 +1261,9 @@ impl CompositorApp {
             ui.set_popout_date_text(SharedString::from(local.format("%A, %-d %B").to_string()));
             ui.set_popout_day_text(SharedString::from(local.format("%A").to_string()));
 
-            // Calendar grid for the popout — rebuild only when the day
-            // changes (cheap to do every second; the model is 42 cells).
-            ui.set_popout_calendar_month_text(
-                SharedString::from(local.format("%B %Y").to_string()));
-            let cal = build_calendar_grid(local.date_naive());
-            let model = std::rc::Rc::new(VecModel::from(cal));
-            ui.set_popout_calendar_days(slint::ModelRc::from(model));
+            // Calendar grid for the popout — rebuilds whichever month
+            // the user is currently browsing (today + offset).
+            self.refresh_calendar();
             if ui.get_debug_overlay_visible() {
                 let dump = self.build_debug_dump();
                 ui.set_debug_text(SharedString::from(dump));
@@ -839,26 +1292,34 @@ impl CompositorApp {
                 if self.frame_count % 60 == 0 {
                     info!("frame loop: {} frames rendered", self.frame_count);
                 }
-                debug!("GPU render: {}x{} (dirty, frame {})", w, h, self.frame_count);
+                debug!(
+                    "GPU render: {}x{} (dirty, frame {})",
+                    w, h, self.frame_count
+                );
             }
         }
 
-        let Some(surface) = self.wgpu_surface.as_ref() else { return };
+        let Some(surface) = self.wgpu_surface.as_ref() else {
+            return;
+        };
         let device = &gpu_window.wgpu_device;
         let queue = &gpu_window.wgpu_queue;
 
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated) => return,
-            Err(e) => { warn!("swapchain: {}", e); return; }
+            Err(e) => {
+                warn!("swapchain: {}", e);
+                return;
+            }
         };
 
         if let (Some(render_tex), Some(final_tex)) =
             (self.render_texture.as_ref(), self.final_texture.as_ref())
         {
-            let mut encoder = device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("chrome+blit") }
-            );
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("chrome+blit"),
+            });
 
             // Step 1 — copy render_tex → final_tex. final_tex is freshly
             // populated every frame, even on frames where Slint didn't
@@ -878,7 +1339,11 @@ impl CompositorApp {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
             );
 
             // Step 2 — chrome passes draw onto final_tex. scene_view is
@@ -895,53 +1360,92 @@ impl CompositorApp {
                     let model = ui.get_windows();
                     let len = model.row_count();
                     let mode_t = self.theme.mode_t;
-                    (0..len).map(|i| {
-                        let item = model.row_data(i).unwrap();
-                        let focus_t = self.theme.window_focus_t(item.id);
-                        let titlebar = if item.csd { 0.0 } else { 33.0 };
-                        let chrome_w = item.geom_w.max(1) as f32;
-                        let chrome_h = item.geom_h.max(1) as f32 + titlebar;
-                        WindowChromeParams {
-                            x: item.x as f32 * s,
-                            y: item.y as f32 * s,
-                            w: chrome_w * s,
-                            h: chrome_h * s,
-                            active: item.focused,
-                            focus_t,
-                            mode_t,
-                            csd: item.csd,
-                        }
-                    }).collect()
-                } else { Vec::new() };
+                    (0..len)
+                        .map(|i| {
+                            let item = model.row_data(i).unwrap();
+                            let focus_t = self.theme.window_focus_t(item.id);
+                            let titlebar = if item.csd { 0.0 } else { 33.0 };
+                            // Honour the lifecycle scale spring (open/close
+                            // animation goes 0.85 → 1.0 / 1.0 → 0.85). The
+                            // slint content scales inside outer-frame; if we
+                            // emitted the GPU chrome at fixed full size the
+                            // shadow / border / highlight would stay rooted
+                            // at the un-animated rect, hovering visually
+                            // around the shrinking content. Apply the scale
+                            // to w/h, recentre x/y so the scaled rect stays
+                            // anchored on the chrome's centre — matches the
+                            // slint outer-frame's `(parent.size - self.size) / 2`.
+                            let scale = item.anim_scale.clamp(0.0, 2.0);
+                            // Use the ANIMATED w/h here, not `geom_w/h`, so
+                            // the GPU chrome (shadow, border) tracks the
+                            // resize target instantly. The slint chrome
+                            // dimensions were switched to `win.w/win.h` for
+                            // the same reason — keep these in sync or the
+                            // shadow will lag visibly behind the chrome
+                            // edge during resize drags.
+                            let chrome_w_full = item.w.max(1) as f32;
+                            let chrome_h_full = item.h.max(1) as f32 + titlebar;
+                            let chrome_w = chrome_w_full * scale;
+                            let chrome_h = chrome_h_full * scale;
+                            let cx_offset = (chrome_w_full - chrome_w) / 2.0;
+                            let cy_offset = (chrome_h_full - chrome_h) / 2.0;
+                            WindowChromeParams {
+                                x: (item.x as f32 + cx_offset) * s,
+                                y: (item.y as f32 + cy_offset) * s,
+                                w: chrome_w * s,
+                                h: chrome_h * s,
+                                active: item.focused,
+                                focus_t,
+                                mode_t,
+                                csd: item.csd,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
                 if !chrome_windows.is_empty() {
-                    let scene_view  = render_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                    let target_view = final_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    let scene_view =
+                        render_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    let target_view =
+                        final_tex.create_view(&wgpu::TextureViewDescriptor::default());
                     // Snapshot the per-window rects in physical pixels;
                     // used by the between-phases closure to re-blit each
                     // window's region from render_tex onto final_tex,
                     // overwriting any shadow that bled into the window's
                     // footprint. Caps each rect to the surface bounds so
                     // copy_texture_to_texture never reads/writes OOB.
-                    let win_rects: Vec<(u32, u32, u32, u32)> = chrome_windows.iter().map(|win| {
-                        let x = win.x as i32;
-                        let y = win.y as i32;
-                        // chrome_windows w/h already include the SSD titlebar
-                        // (or the cropped geom_h for CSD), so this rect IS the
-                        // full visual footprint — no extra titlebar add.
-                        let ww = win.w as i32;
-                        let wh = win.h as i32;
-                        let cx0 = x.max(0);
-                        let cy0 = y.max(0);
-                        let cx1 = (x + ww).min(w as i32).max(cx0);
-                        let cy1 = (y + wh).min(h as i32).max(cy0);
-                        (cx0 as u32, cy0 as u32, (cx1 - cx0) as u32, (cy1 - cy0) as u32)
-                    }).collect();
+                    let win_rects: Vec<(u32, u32, u32, u32)> = chrome_windows
+                        .iter()
+                        .map(|win| {
+                            let x = win.x as i32;
+                            let y = win.y as i32;
+                            // chrome_windows w/h already include the SSD titlebar
+                            // (or the cropped geom_h for CSD), so this rect IS the
+                            // full visual footprint — no extra titlebar add.
+                            let ww = win.w as i32;
+                            let wh = win.h as i32;
+                            let cx0 = x.max(0);
+                            let cy0 = y.max(0);
+                            let cx1 = (x + ww).min(w as i32).max(cx0);
+                            let cy1 = (y + wh).min(h as i32).max(cy0);
+                            (
+                                cx0 as u32,
+                                cy0 as u32,
+                                (cx1 - cx0) as u32,
+                                (cy1 - cy0) as u32,
+                            )
+                        })
+                        .collect();
 
                     chrome.render(
-                        queue, &mut encoder,
-                        &scene_view, &target_view,
-                        w, h,
+                        queue,
+                        &mut encoder,
+                        &scene_view,
+                        &target_view,
+                        w,
+                        h,
                         &chrome_windows,
                         |enc, wi| {
                             // Z-order fix: after each window's chrome
@@ -956,7 +1460,9 @@ impl CompositorApp {
                             // per-window content textures.
                             for j in (wi + 1)..win_rects.len() {
                                 let (rx, ry, rw, rh) = win_rects[j];
-                                if rw == 0 || rh == 0 { continue }
+                                if rw == 0 || rh == 0 {
+                                    continue;
+                                }
                                 enc.copy_texture_to_texture(
                                     wgpu::TexelCopyTextureInfo {
                                         texture: render_tex,
@@ -970,7 +1476,11 @@ impl CompositorApp {
                                         origin: wgpu::Origin3d { x: rx, y: ry, z: 0 },
                                         aspect: wgpu::TextureAspect::All,
                                     },
-                                    wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+                                    wgpu::Extent3d {
+                                        width: rw,
+                                        height: rh,
+                                        depth_or_array_layers: 1,
+                                    },
                                 );
                             }
                         },
@@ -990,8 +1500,8 @@ impl CompositorApp {
                 // physical (matches the swapchain texture's pixel grid).
                 let s = self.scale_factor;
                 let mut reblit = |x: i32, y: i32, rw: i32, rh: i32| {
-                    let px  = (x  as f32 * s).round() as i32;
-                    let py  = (y  as f32 * s).round() as i32;
+                    let px = (x as f32 * s).round() as i32;
+                    let py = (y as f32 * s).round() as i32;
                     let prw = (rw as f32 * s).round() as i32;
                     let prh = (rh as f32 * s).round() as i32;
                     let cx0 = px.max(0);
@@ -1000,24 +1510,40 @@ impl CompositorApp {
                     let cy1 = (py + prh).min(h as i32).max(cy0);
                     let cw = (cx1 - cx0) as u32;
                     let ch = (cy1 - cy0) as u32;
-                    if cw == 0 || ch == 0 { return; }
+                    if cw == 0 || ch == 0 {
+                        return;
+                    }
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
-                            texture: render_tex, mip_level: 0,
-                            origin: wgpu::Origin3d { x: cx0 as u32, y: cy0 as u32, z: 0 },
+                            texture: render_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: cx0 as u32,
+                                y: cy0 as u32,
+                                z: 0,
+                            },
                             aspect: wgpu::TextureAspect::All,
                         },
                         wgpu::TexelCopyTextureInfo {
-                            texture: final_tex, mip_level: 0,
-                            origin: wgpu::Origin3d { x: cx0 as u32, y: cy0 as u32, z: 0 },
+                            texture: final_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: cx0 as u32,
+                                y: cy0 as u32,
+                                z: 0,
+                            },
                             aspect: wgpu::TextureAspect::All,
                         },
-                        wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                        wgpu::Extent3d {
+                            width: cw,
+                            height: ch,
+                            depth_or_array_layers: 1,
+                        },
                     );
                 };
 
                 let panel_h = crate::wm::PANEL_HEIGHT.max(0);
-                let dock_h  = crate::wm::DOCK_HEIGHT.max(0);
+                let dock_h = crate::wm::DOCK_HEIGHT.max(0);
                 // reblit takes LOGICAL coords; iw/ih are LOGICAL screen size.
                 let iw = self.wm.output_w;
                 let ih = self.wm.output_h;
@@ -1079,17 +1605,17 @@ impl CompositorApp {
                     let logical_y = snap.cursor_y - snap.hotspot_y as f64;
                     let cx_phys = (logical_x as f32) * s;
                     let cy_phys = (logical_y as f32) * s;
-                    let final_view = final_tex.create_view(
-                        &wgpu::TextureViewDescriptor::default(),
-                    );
+                    let final_view = final_tex.create_view(&wgpu::TextureViewDescriptor::default());
                     pass.render(
                         queue,
                         &mut encoder,
                         &final_view,
-                        w, h,
+                        w,
+                        h,
                         (cx_phys, cy_phys, snap.width as f32, snap.height as f32),
                         &snap.pixels,
-                        snap.width, snap.height,
+                        snap.width,
+                        snap.height,
                     );
                 }
             }
@@ -1119,7 +1645,11 @@ impl CompositorApp {
                             bytes_per_row: Some(bytes_per_row),
                             rows_per_image: Some(snap.height),
                         },
-                        wgpu::Extent3d { width: copy_w, height: copy_h, depth_or_array_layers: 1 },
+                        wgpu::Extent3d {
+                            width: copy_w,
+                            height: copy_h,
+                            depth_or_array_layers: 1,
+                        },
                     );
                 }
             }
@@ -1138,7 +1668,11 @@ impl CompositorApp {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
             );
 
             queue.submit(std::iter::once(encoder.finish()));
@@ -1152,9 +1686,17 @@ impl CompositorApp {
         // after the swapchain submit returns, but the delta is sub-frame for
         // mailbox/fifo presentation modes and good enough for clients that
         // just need monotonic increments (mpv, Chrome's vsync sync).
-        let clock: smithay::utils::Clock<smithay::utils::Monotonic> =
-            smithay::utils::Clock::new();
+        let clock: smithay::utils::Clock<smithay::utils::Monotonic> = smithay::utils::Clock::new();
         self.last_present_time = Some(clock.now());
+
+        // Record this frame's render+present cost (ms) into the chart's
+        // sliding window. Eviction first to keep length stable, so Slint
+        // sees only an in-place scroll rather than a length change.
+        let frame_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        if self.frame_times_model.row_count() >= FRAME_HISTORY_LEN {
+            self.frame_times_model.remove(0);
+        }
+        self.frame_times_model.push(frame_ms);
     }
 
     /// Build the Slint `WindowItem` list from `WM` state + toplevel pixel buffers,
@@ -1171,7 +1713,7 @@ impl CompositorApp {
         // bound to this output and (re)fires preferred_buffer_scale, so
         // clients adapt without a per-surface push from us.
         if let Some(scale) = self.pending_output_scale.take() {
-            if let Some(out) = state.output.as_ref() {
+            if let Some(out) = state.primary_output() {
                 out.change_current_state(
                     None,
                     None,
@@ -1203,10 +1745,16 @@ impl CompositorApp {
 
         // First-render kick: any window awaiting its first buffer commit
         // starts its open animation NOW, so the user actually sees it play.
-        let kick_ids: Vec<i32> = self.wm.windows.values()
+        let kick_ids: Vec<i32> = self
+            .wm
+            .windows
+            .values()
             .filter(|w| w.awaiting_first_render)
             .filter(|w| {
-                state.toplevels.iter().find(|t| t.surface == w.surface)
+                state
+                    .toplevels
+                    .iter()
+                    .find(|t| t.surface == w.surface)
                     .map_or(false, |tl| tl.pixels.lock().unwrap().width > 0)
             })
             .map(|w| w.id)
@@ -1235,8 +1783,12 @@ impl CompositorApp {
         // shadow/border which we crop away, then wrap with our chrome.
         struct ToplevelMeta {
             surface: WlSurface,
-            gx: i32, gy: i32, gw: i32, gh: i32,
-            bw: i32, bh: i32,
+            gx: i32,
+            gy: i32,
+            gw: i32,
+            gh: i32,
+            bw: i32,
+            bh: i32,
             csd_now: bool,
             csd_verdict: bool,
             is_resizing: bool,
@@ -1251,17 +1803,24 @@ impl CompositorApp {
             if tl
                 .x11_surface
                 .as_ref()
-                .map(|x| x.user_data().get::<crate::wayland::xwayland::X11OverrideRedirect>().is_some())
+                .map(|x| {
+                    x.user_data()
+                        .get::<crate::wayland::xwayland::X11OverrideRedirect>()
+                        .is_some()
+                })
                 .unwrap_or(false)
             {
                 continue;
             }
             let (gx_xdg, gy_xdg, gw_xdg, gh_xdg, app_id) = with_states(&tl.surface, |states| {
                 let mut guard = states.cached_state.get::<SurfaceCachedState>();
-                let geom = guard.current().geometry
+                let geom = guard
+                    .current()
+                    .geometry
                     .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h))
                     .unwrap_or((0, 0, 0, 0));
-                let app_id = states.data_map
+                let app_id = states
+                    .data_map
                     .get::<XdgToplevelSurfaceData>()
                     .and_then(|d| d.lock().ok()?.app_id.clone())
                     .unwrap_or_default();
@@ -1269,9 +1828,7 @@ impl CompositorApp {
             });
             let (bw, bh, auto_bbox) = {
                 let p = tl.pixels.lock().unwrap();
-                let bbox = crate::wayland_state::detect_visible_bbox(
-                    &p.pixels, p.width, p.height,
-                );
+                let bbox = crate::wayland_state::detect_visible_bbox(&p.pixels, p.width, p.height);
                 (p.width as i32, p.height as i32, bbox)
             };
             let (gx, gy, gw, gh) = if gw_xdg > 0 && gh_xdg > 0 {
@@ -1281,11 +1838,15 @@ impl CompositorApp {
             } else {
                 (0, 0, bw, bh)
             };
-            let has_padding = bw > 0 && bh > 0
-                && (gx > 0 || gy > 0 || gw < bw || gh < bh);
+            let has_padding = bw > 0 && bh > 0 && (gx > 0 || gy > 0 || gw < bw || gh < bh);
             metas.push(ToplevelMeta {
                 surface: tl.surface.clone(),
-                gx, gy, gw, gh, bw, bh,
+                gx,
+                gy,
+                gw,
+                gh,
+                bw,
+                bh,
                 csd_now: tl.csd,
                 csd_verdict: tl.csd || has_padding,
                 is_resizing: Some(i) == resizing_idx,
@@ -1296,7 +1857,10 @@ impl CompositorApp {
         // Pass 2 — apply: write csd + geom_w/h to WindowState, mirror csd
         // back to ToplevelInfo, push buffer dims into WM geometry springs.
         for m in &metas {
-            if let Some(win) = self.wm.windows.values_mut()
+            if let Some(win) = self
+                .wm
+                .windows
+                .values_mut()
                 .find(|w| w.surface == m.surface)
             {
                 win.csd = m.csd_verdict;
@@ -1311,14 +1875,30 @@ impl CompositorApp {
                 }
             }
             if m.csd_verdict && !m.csd_now {
-                if let Some(t) = state.toplevels.iter_mut()
-                    .find(|t| t.surface == m.surface)
-                {
+                if let Some(t) = state.toplevels.iter_mut().find(|t| t.surface == m.surface) {
                     t.csd = true;
                 }
             }
+            // Push the VISIBLE window-geometry size to the WM, not the
+            // raw buffer dims. GTK CSD apps render a buffer that's
+            // larger than the visible window — typically ~30 px of
+            // shadow padding on every side — and report the actual
+            // visible rect via xdg_surface.set_window_geometry. If we
+            // store the buffer size in `win.w/h`, the chrome ends up
+            // sized to "visible + padding" and the WM hit-test rect
+            // (and outer-frame border) extend out into the shadow
+            // padding region, leaving the actual GTK content offset
+            // inside a too-large frame. Using `gw/gh` (when set)
+            // makes the chrome match the visible rect; the buffer
+            // still renders at `bw×bh` cropped to `gx,gy,gw,gh` via
+            // content-clip.
             if !m.is_resizing && m.bw > 0 && m.bh > 0 {
-                self.wm.update_geometry(&m.surface, m.bw, m.bh);
+                let (uw, uh) = if m.gw > 0 && m.gh > 0 {
+                    (m.gw, m.gh)
+                } else {
+                    (m.bw, m.bh)
+                };
+                self.wm.update_geometry(&m.surface, uw, uh);
             }
         }
 
@@ -1353,26 +1933,43 @@ impl CompositorApp {
                 continue;
             }
 
-            let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                &client_data.pixels,
-                client_data.width,
-                client_data.height,
-            );
             let buf_w = client_data.width as i32;
             let buf_h = client_data.height as i32;
-            let texture = slint::Image::from_rgba8_premultiplied(pixel_buf);
-            drop(client_data);
+            let current_version = client_data.version;
+            // Reuse the cached `slint::Image` whenever the toplevel's
+            // buffer hasn't advanced since we last built one. Allocating a
+            // fresh `SharedPixelBuffer` per frame for an unchanged client
+            // (e.g. during focus crossfade, drag, alt-tab) was a multi-MB
+            // memcpy + GPU re-upload for nothing.
+            let texture = match self.client_image_cache.get(&win.id) {
+                Some((cached_version, img)) if *cached_version == current_version => {
+                    drop(client_data);
+                    img.clone()
+                }
+                _ => {
+                    let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                        &client_data.pixels,
+                        client_data.width,
+                        client_data.height,
+                    );
+                    drop(client_data);
+                    let img = slint::Image::from_rgba8_premultiplied(pixel_buf);
+                    self.client_image_cache
+                        .insert(win.id, (current_version, img.clone()));
+                    img
+                }
+            };
 
             // Use the per-toplevel visible-rect we already worked out in
             // pass 1 (xdg geom rect → auto-detected bbox → full buffer).
             // Identical source-of-truth in Rust and Slint: source-clip on
             // the Image and the chrome size both come from this rect, so
             // image-fit:fill renders 1:1 and text stays crisp.
-            let (geom_x, geom_y, geom_w, geom_h) = metas.iter()
+            let (geom_x, geom_y, geom_w, geom_h) = metas
+                .iter()
                 .find(|m| m.surface == win.surface)
                 .map(|m| (m.gx, m.gy, m.gw, m.gh))
                 .unwrap_or((0, 0, buf_w, buf_h));
-
 
             // Get window title from xdg-toplevel surface data.
             // with_states<F, T>(...) returns T; closure returns Option<String>.
@@ -1383,12 +1980,141 @@ impl CompositorApp {
                     .and_then(|data| data.lock().ok()?.title.clone())
             })
             .unwrap_or_else(|| {
-                if win.title.is_empty() { "Window".to_string() } else { win.title.clone() }
+                if win.title.is_empty() {
+                    "Window".to_string()
+                } else {
+                    win.title.clone()
+                }
             });
 
             // Drive the per-window focus_t spring (200 ms) so the chrome
             // shader crossfades active → inactive (and vice versa) smoothly.
             self.theme.set_window_focused(win.id, win.focused);
+
+            // ── Build the per-surface render-element list (Phase 3). ───
+            // Walks the toplevel's surface tree (toplevel itself + every
+            // subsurface), pulls each surface's already-imported pixels
+            // from `toplevel.surface_pixels` (populated by
+            // `import_shm_per_surface` on commit), and emits one
+            // SurfaceItem per surface. Coordinates are in window-local
+            // space — i.e. (0, 0) is the geom rect's top-left, the
+            // toplevel surface's offset is (-geom_x, -geom_y) so its
+            // buffer origin aligns with the chrome rect.
+            //
+            // Subsurfaces use `surface_view.offset` (folds in subsurface
+            // location, wl_surface.offset() buffer_delta, viewporter
+            // position) so animated offsets work. dst size comes from
+            // `surface_view.dst` (post-buffer-scale logical pixels).
+            let surfaces_model: Vec<crate::SurfaceItem> = {
+                use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+                use smithay::reexports::wayland_server::Resource;
+                use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+                let surface_pixels = toplevel.surface_pixels.lock().unwrap();
+                let mut out: Vec<crate::SurfaceItem> = Vec::new();
+                with_surface_tree_downward(
+                    &win.surface,
+                    (0i32, 0i32),
+                    |sub, states, parent_offset| {
+                        let mut my_offset = *parent_offset;
+                        // Per-surface view_offset (skip for the root;
+                        // the root anchors to (0,0) in this local frame
+                        // and we shift the whole thing by -geom below).
+                        if sub != &win.surface {
+                            let view_off = states
+                                .data_map
+                                .get::<RendererSurfaceStateUserData>()
+                                .and_then(|d| {
+                                    d.lock().ok().and_then(|s| s.view()).map(|v| v.offset)
+                                });
+                            if let Some(o) = view_off {
+                                my_offset.0 += o.x;
+                                my_offset.1 += o.y;
+                            }
+                        }
+                        TraversalAction::DoChildren(my_offset)
+                    },
+                    |sub, states, parent_offset| {
+                        let mut my_offset = *parent_offset;
+                        let view = states
+                            .data_map
+                            .get::<RendererSurfaceStateUserData>()
+                            .and_then(|d| d.lock().ok().and_then(|s| s.view()));
+                        if sub != &win.surface {
+                            if let Some(v) = view {
+                                my_offset.0 += v.offset.x;
+                                my_offset.1 += v.offset.y;
+                            }
+                        }
+                        let key = sub.id().protocol_id();
+                        let Some(data) = surface_pixels.get(&key) else {
+                            return;
+                        };
+                        if data.width == 0 || data.height == 0 {
+                            return;
+                        }
+                        // dst size in compositor-logical px; falls back to
+                        // raw buffer dims if surface_view isn't populated
+                        // (e.g. before first renderer-side commit).
+                        let (dst_w, dst_h) = view
+                            .map(|v| (v.dst.w, v.dst.h))
+                            .filter(|(w, h)| *w > 0 && *h > 0)
+                            .unwrap_or((data.width as i32, data.height as i32));
+                        // Source-clip rect in BUFFER pixels — wp_viewporter
+                        // src crop. SurfaceView.src is in logical pixels;
+                        // we round to buffer integers. None / zero-sized
+                        // src means no crop.
+                        let (src_x, src_y, src_w, src_h) = match view.map(|v| v.src) {
+                            Some(r) if r.size.w > 0.0 && r.size.h > 0.0 => (
+                                r.loc.x.round() as i32,
+                                r.loc.y.round() as i32,
+                                r.size.w.round() as i32,
+                                r.size.h.round() as i32,
+                            ),
+                            _ => (0, 0, data.width as i32, data.height as i32),
+                        };
+                        // Convert from "compositor coords with toplevel at
+                        // (0,0)" to "window-local with geom-rect at (0,0)".
+                        // The toplevel surface's buffer origin sits
+                        // -geom_x, -geom_y from where we render.
+                        let x_in_window = my_offset.0 - geom_x;
+                        let y_in_window = my_offset.1 - geom_y;
+                        // Build / cache slint::Image keyed by (window_id,
+                        // surface_id, version). Reusing across frames
+                        // skips the per-frame SharedPixelBuffer copy.
+                        let cache_key = (win.id, key);
+                        let img = match self.client_image_cache_per_surface.get(&cache_key) {
+                            Some((v, img)) if *v == data.version => img.clone(),
+                            _ => {
+                                let pixel_buf =
+                                    slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                                        &data.pixels,
+                                        data.width,
+                                        data.height,
+                                    );
+                                let img = slint::Image::from_rgba8_premultiplied(pixel_buf);
+                                self.client_image_cache_per_surface
+                                    .insert(cache_key, (data.version, img.clone()));
+                                img
+                            }
+                        };
+                        out.push(crate::SurfaceItem {
+                            id: key as i32,
+                            x_in_window,
+                            y_in_window,
+                            w: dst_w,
+                            h: dst_h,
+                            src_x,
+                            src_y,
+                            src_w,
+                            src_h,
+                            texture: img,
+                        });
+                    },
+                    |_, _, _| true,
+                );
+                out
+            };
+            let surfaces = slint::ModelRc::new(slint::VecModel::from(surfaces_model));
 
             items.push(crate::WindowItem {
                 id: win.id,
@@ -1399,6 +2125,7 @@ impl CompositorApp {
                 h: win.anim.current_h(),
                 focused: win.focused,
                 texture,
+                surfaces,
                 icon: slint::Image::default(),
                 anim_opacity: win.anim.opacity.value_f32().clamp(0.0, 1.0),
                 anim_scale: win.anim.scale.value_f32().clamp(0.0, 2.0),
@@ -1414,8 +2141,10 @@ impl CompositorApp {
         // Push the focused window's title into the panel's "focused-app"
         // slot. Falls back to "Desktop" when nothing is focused so the panel
         // is never blank — matches GNOME's "Activities"/macOS finder pattern.
+        let slint_overlay_open = self.slint_pointer_overlay_open();
         if let Some(ui) = self.ui.as_ref() {
-            let focused_title: String = items.iter()
+            let focused_title: String = items
+                .iter()
                 .find(|it| it.focused)
                 .map(|it| it.title.to_string())
                 .unwrap_or_else(|| "Desktop".to_string());
@@ -1429,59 +2158,75 @@ impl CompositorApp {
             //               fields, pointer over links, wait spinners, etc.
             //   * Surface → not implemented yet; fall back to compositor
             //               default so users still see something.
-            use smithay::input::pointer::CursorImageStatus;
-            use smithay::input::pointer::CursorIcon;
-            match &state.cursor_status {
-                CursorImageStatus::Hidden => {
-                    ui.set_cursor_visible(false);
-                }
-                // Skip the default named cursor — that's what smithay sets on
-                // pointer.leave, and overriding it would clobber our own
-                // hit-zone-driven cursor (Move over titlebar, Resize on
-                // edges, etc.). Only honour explicit non-default names.
-                CursorImageStatus::Named(icon) if *icon != CursorIcon::Default => {
-                    ui.set_cursor_visible(true);
-                    if let Some((img, (hx, hy))) =
-                        self.cursor_renderer.get_dynamic(icon.name())
-                    {
-                        ui.set_cursor_image(img);
-                        ui.set_cursor_hotspot_x(hx);
-                        ui.set_cursor_hotspot_y(hy);
+            if slint_overlay_open {
+                self.current_cursor = CursorKind::Arrow;
+                let img = self.cursor_renderer.get(CursorKind::Arrow);
+                let (hx, hy) = self.cursor_renderer.hotspot(CursorKind::Arrow);
+                ui.set_cursor_visible(true);
+                ui.set_cursor_image(img);
+                ui.set_cursor_hotspot_x(hx);
+                ui.set_cursor_hotspot_y(hy);
+                ui.set_cursor_size(CursorRenderer::size());
+            } else {
+                use smithay::input::pointer::CursorIcon;
+                use smithay::input::pointer::CursorImageStatus;
+                match &state.cursor_status {
+                    CursorImageStatus::Hidden => {
+                        ui.set_cursor_visible(false);
                     }
-                }
-                CursorImageStatus::Named(_) => {
-                    // Default named → leave our own hit-zone cursor in place.
-                    ui.set_cursor_visible(true);
-                }
-                CursorImageStatus::Surface(surf) => {
-                    // Client supplied a wl_surface as its cursor (drawing
-                    // apps, custom carets, animated cursors). The commit
-                    // handler imported the pixels into
-                    // `state.cursor_surface_pixels`; we just need to
-                    // push them to Slint's cursor-image plus the hotspot
-                    // from CursorImageSurfaceData.
-                    ui.set_cursor_visible(true);
-                    let p = state.cursor_surface_pixels.lock().unwrap();
-                    if p.width > 0 && p.height > 0 {
-                        let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                            &p.pixels, p.width, p.height,
-                        );
-                        let img = slint::Image::from_rgba8_premultiplied(pixel_buf);
-                        let (cw, ch) = (p.width as f32, p.height as f32);
-                        drop(p);
-                        // Read hotspot from the surface's cached state.
-                        use smithay::input::pointer::CursorImageSurfaceData;
-                        use smithay::wayland::compositor::with_states;
-                        let (hx, hy) = with_states(surf, |states| {
-                            states.data_map.get::<CursorImageSurfaceData>()
-                                .and_then(|d| d.lock().ok().map(|attrs|
-                                    (attrs.hotspot.x as f32, attrs.hotspot.y as f32)))
-                                .unwrap_or((0.0, 0.0))
-                        });
-                        ui.set_cursor_image(img);
-                        ui.set_cursor_hotspot_x(hx);
-                        ui.set_cursor_hotspot_y(hy);
-                        ui.set_cursor_size(cw.max(ch));
+                    // Skip the default named cursor — that's what smithay sets on
+                    // pointer.leave, and overriding it would clobber our own
+                    // hit-zone-driven cursor (Move over titlebar, Resize on
+                    // edges, etc.). Only honour explicit non-default names.
+                    CursorImageStatus::Named(icon) if *icon != CursorIcon::Default => {
+                        ui.set_cursor_visible(true);
+                        if let Some((img, (hx, hy))) = self.cursor_renderer.get_dynamic(icon.name())
+                        {
+                            ui.set_cursor_image(img);
+                            ui.set_cursor_hotspot_x(hx);
+                            ui.set_cursor_hotspot_y(hy);
+                        }
+                    }
+                    CursorImageStatus::Named(_) => {
+                        // Default named → leave our own hit-zone cursor in place.
+                        ui.set_cursor_visible(true);
+                    }
+                    CursorImageStatus::Surface(surf) => {
+                        // Client supplied a wl_surface as its cursor (drawing
+                        // apps, custom carets, animated cursors). The commit
+                        // handler imported the pixels into
+                        // `state.cursor_surface_pixels`; we just need to
+                        // push them to Slint's cursor-image plus the hotspot
+                        // from CursorImageSurfaceData.
+                        ui.set_cursor_visible(true);
+                        let p = state.cursor_surface_pixels.lock().unwrap();
+                        if p.width > 0 && p.height > 0 {
+                            let pixel_buf =
+                                slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                                    &p.pixels, p.width, p.height,
+                                );
+                            let img = slint::Image::from_rgba8_premultiplied(pixel_buf);
+                            let (cw, ch) = (p.width as f32, p.height as f32);
+                            drop(p);
+                            // Read hotspot from the surface's cached state.
+                            use smithay::input::pointer::CursorImageSurfaceData;
+                            use smithay::wayland::compositor::with_states;
+                            let (hx, hy) = with_states(surf, |states| {
+                                states
+                                    .data_map
+                                    .get::<CursorImageSurfaceData>()
+                                    .and_then(|d| {
+                                        d.lock().ok().map(|attrs| {
+                                            (attrs.hotspot.x as f32, attrs.hotspot.y as f32)
+                                        })
+                                    })
+                                    .unwrap_or((0.0, 0.0))
+                            });
+                            ui.set_cursor_image(img);
+                            ui.set_cursor_hotspot_x(hx);
+                            ui.set_cursor_hotspot_y(hy);
+                            ui.set_cursor_size(cw.max(ch));
+                        }
                     }
                 }
             }
@@ -1512,8 +2257,8 @@ impl CompositorApp {
         // 2. Insert / update rows in `items` order so z-order matches.
         for (target_idx, item) in items.iter().enumerate() {
             // Locate existing row with same id (might be at any index).
-            let cur_idx = (0..model.row_count())
-                .find(|&j| model.row_data(j).map(|r| r.id) == Some(item.id));
+            let cur_idx =
+                (0..model.row_count()).find(|&j| model.row_data(j).map(|r| r.id) == Some(item.id));
             match cur_idx {
                 Some(j) if j == target_idx => {
                     // Same slot — just update the row data in place. This
@@ -1537,8 +2282,19 @@ impl CompositorApp {
                 }
             }
         }
-        debug!("update_windows: pushed {} items, wm has {} windows",
-               items.len(), self.wm.windows.len());
+        debug!(
+            "update_windows: pushed {} items, wm has {} windows",
+            items.len(),
+            self.wm.windows.len()
+        );
+
+        // Drop cached `slint::Image`s for windows that no longer exist
+        // (closed, swept) so the cache doesn't grow across a long session.
+        if self.client_image_cache.len() > self.wm.windows.len() {
+            let live: std::collections::HashSet<i32> =
+                self.wm.windows.values().map(|w| w.id).collect();
+            self.client_image_cache.retain(|id, _| live.contains(id));
+        }
 
         // ── Build PopupItem list from state.popups ──────────────────────────
         // Resolve each popup's compositor-space position by walking up the
@@ -1552,7 +2308,9 @@ impl CompositorApp {
                 let p = popup.pixels.lock().unwrap();
                 (p.width as i32, p.height as i32, p.width > 0)
             };
-            if !has_pixels { continue; }
+            if !has_pixels {
+                continue;
+            }
 
             // Walk parent chain to find the absolute compositor position.
             let mut abs_x = popup.rel_x;
@@ -1565,13 +2323,13 @@ impl CompositorApp {
                     cur_parent = p.parent.clone();
                     continue;
                 }
-                if let Some(tl_win) = self.wm.windows.values()
-                    .find(|w| w.surface == cur_parent)
-                {
+                if let Some(tl_win) = self.wm.windows.values().find(|w| w.surface == cur_parent) {
                     abs_x += tl_win.anim.current_x();
                     // For SSD parents the popup is positioned relative to
                     // the CONTENT area, which sits below our titlebar.
-                    let titlebar = if tl_win.csd { 0 } else {
+                    let titlebar = if tl_win.csd {
+                        0
+                    } else {
                         crate::wm::TITLEBAR_HEIGHT as i32
                     };
                     abs_y += tl_win.anim.current_y() + titlebar;
@@ -1579,13 +2337,106 @@ impl CompositorApp {
                 break;
             }
 
-            // Build the texture from the composited popup pixels.
+            // Build the legacy single-texture (still consumed by the
+            // PopupItem.texture fallback path).
             let p = popup.pixels.lock().unwrap();
             let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
                 &p.pixels, p.width, p.height,
             );
             let texture = slint::Image::from_rgba8_premultiplied(pixel_buf);
             drop(p);
+
+            // Per-surface render-element list for popups — same pattern
+            // as toplevels in update_windows. Walks the popup's surface
+            // tree, pulls each surface from `surface_pixels`, emits one
+            // SurfaceItem per visible wl_surface. Required for libadwaita
+            // popovers / GTK menus that animate via subsurfaces.
+            let popup_surfaces_model: Vec<crate::SurfaceItem> = {
+                use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+                use smithay::reexports::wayland_server::Resource;
+                use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+                let surface_pixels = popup.surface_pixels.lock().unwrap();
+                let mut out: Vec<crate::SurfaceItem> = Vec::new();
+                with_surface_tree_downward(
+                    &popup.surface,
+                    (0i32, 0i32),
+                    |sub, states, parent_offset| {
+                        let mut my_offset = *parent_offset;
+                        if sub != &popup.surface {
+                            let view_off = states
+                                .data_map
+                                .get::<RendererSurfaceStateUserData>()
+                                .and_then(|d| {
+                                    d.lock().ok().and_then(|s| s.view()).map(|v| v.offset)
+                                });
+                            if let Some(o) = view_off {
+                                my_offset.0 += o.x;
+                                my_offset.1 += o.y;
+                            }
+                        }
+                        TraversalAction::DoChildren(my_offset)
+                    },
+                    |sub, states, parent_offset| {
+                        let mut my_offset = *parent_offset;
+                        let view = states
+                            .data_map
+                            .get::<RendererSurfaceStateUserData>()
+                            .and_then(|d| d.lock().ok().and_then(|s| s.view()));
+                        if sub != &popup.surface {
+                            if let Some(v) = view {
+                                my_offset.0 += v.offset.x;
+                                my_offset.1 += v.offset.y;
+                            }
+                        }
+                        let key = sub.id().protocol_id();
+                        let Some(data) = surface_pixels.get(&key) else {
+                            return;
+                        };
+                        if data.width == 0 || data.height == 0 {
+                            return;
+                        }
+                        let (dst_w, dst_h) = view
+                            .map(|v| (v.dst.w, v.dst.h))
+                            .filter(|(w, h)| *w > 0 && *h > 0)
+                            .unwrap_or((data.width as i32, data.height as i32));
+                        let (src_x, src_y, src_w, src_h) = match view.map(|v| v.src) {
+                            Some(r) if r.size.w > 0.0 && r.size.h > 0.0 => (
+                                r.loc.x.round() as i32,
+                                r.loc.y.round() as i32,
+                                r.size.w.round() as i32,
+                                r.size.h.round() as i32,
+                            ),
+                            _ => (0, 0, data.width as i32, data.height as i32),
+                        };
+                        // Popups anchor at (0, 0) in their own local
+                        // coord system — Slint positions the whole popup
+                        // by its (x, y), and surface offsets stack from
+                        // that origin. No geom-rect inset like toplevels.
+                        let pixel_buf =
+                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                                &data.pixels,
+                                data.width,
+                                data.height,
+                            );
+                        let img = slint::Image::from_rgba8_premultiplied(pixel_buf);
+                        out.push(crate::SurfaceItem {
+                            id: key as i32,
+                            x_in_window: my_offset.0,
+                            y_in_window: my_offset.1,
+                            w: dst_w,
+                            h: dst_h,
+                            src_x,
+                            src_y,
+                            src_w,
+                            src_h,
+                            texture: img,
+                        });
+                    },
+                    |_, _, _| true,
+                );
+                out
+            };
+            let popup_surfaces = slint::ModelRc::new(slint::VecModel::from(popup_surfaces_model));
 
             let w = if popup.w > 0 { popup.w } else { bw };
             let h = if popup.h > 0 { popup.h } else { bh };
@@ -1596,6 +2447,7 @@ impl CompositorApp {
                 w,
                 h,
                 texture,
+                surfaces: popup_surfaces,
             });
         }
 
@@ -1610,7 +2462,9 @@ impl CompositorApp {
         //     (which are indices into `state.popups`, well below 1<<20).
         const X11_OR_ID_BASE: i32 = 1 << 20;
         for (oi, tl) in state.toplevels.iter().enumerate() {
-            let Some(x11) = tl.x11_surface.as_ref() else { continue };
+            let Some(x11) = tl.x11_surface.as_ref() else {
+                continue;
+            };
             if x11
                 .user_data()
                 .get::<crate::wayland::xwayland::X11OverrideRedirect>()
@@ -1641,6 +2495,12 @@ impl CompositorApp {
                 w,
                 h,
                 texture,
+                // X11 OR windows currently keep using the legacy single
+                // texture. Migrating them needs the same per-surface
+                // walk as xdg-popups but xwayland surfaces don't tend
+                // to use subsurfaces, so leaving them on the fallback
+                // path is fine for now.
+                surfaces: slint::ModelRc::new(slint::VecModel::<crate::SurfaceItem>::default()),
             });
         }
 
@@ -1650,8 +2510,12 @@ impl CompositorApp {
         let mut i = pmodel.row_count();
         while i > 0 {
             i -= 1;
-            let still = popup_items.iter().any(|it| Some(it.id) == pmodel.row_data(i).map(|r| r.id));
-            if !still { pmodel.remove(i); }
+            let still = popup_items
+                .iter()
+                .any(|it| Some(it.id) == pmodel.row_data(i).map(|r| r.id));
+            if !still {
+                pmodel.remove(i);
+            }
         }
         for (target_idx, item) in popup_items.iter().enumerate() {
             let cur_idx = (0..pmodel.row_count())
@@ -1826,7 +2690,10 @@ impl CompositorApp {
         for id in close_ids {
             info!("WM: close-window({})", id);
             // Find the surface for this id.
-            let surface = self.wm.windows.values()
+            let surface = self
+                .wm
+                .windows
+                .values()
                 .find(|w| w.id == id)
                 .map(|w| w.surface.clone());
             if let Some(surf) = surface {
@@ -1868,7 +2735,10 @@ impl CompositorApp {
             info!("WM: maximize-window({})", id);
             self.wm.toggle_maximize_by_id(id);
             // Send configure to client with new size.
-            let (new_w, new_h) = self.wm.windows.values()
+            let (new_w, new_h) = self
+                .wm
+                .windows
+                .values()
                 .find(|w| w.id == id)
                 .map(|w| (w.w, w.h))
                 .unwrap_or((800, 600));
@@ -1906,8 +2776,12 @@ impl CompositorApp {
         };
         for (app_id, action) in dock_actions {
             let ids = self.wm.ids_for_app(&app_id);
-            info!("WM: dock-action app={} action={} → {} window(s)",
-                app_id, action, ids.len());
+            info!(
+                "WM: dock-action app={} action={} → {} window(s)",
+                app_id,
+                action,
+                ids.len()
+            );
             match action {
                 2 => {
                     // Show All Windows — raise + focus the most-recent one
@@ -1922,7 +2796,10 @@ impl CompositorApp {
                     // Quit — close every window for this app via the same
                     // path Slint's close-window callback uses.
                     for id in ids {
-                        let surface = self.wm.windows.values()
+                        let surface = self
+                            .wm
+                            .windows
+                            .values()
                             .find(|w| w.id == id)
                             .map(|w| w.surface.clone());
                         if let Some(surf) = surface {
@@ -2014,7 +2891,9 @@ impl CompositorApp {
             // WM owns the authoritative logical size; fall back to buffer
             // dims if the window isn't tracked yet (shouldn't happen post-
             // sync_new_toplevels, but stays robust).
-            let (w, h) = self.wm.id_for_surface(&t.surface)
+            let (w, h) = self
+                .wm
+                .id_for_surface(&t.surface)
                 .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
                 .map(|w| (w.w, w.h))
                 .unwrap_or_else(|| {
@@ -2026,20 +2905,31 @@ impl CompositorApp {
                 edge,
                 start_ptr_x: px,
                 start_ptr_y: py,
-                start_geom: WindowGeomSnapshot { x: t.x, y: t.y, w, h },
+                start_geom: WindowGeomSnapshot {
+                    x: t.x,
+                    y: t.y,
+                    w,
+                    h,
+                },
                 last_configure_at: None,
                 dock_snap_engaged_at: None,
             });
-            debug!("xdg client resize_request {:?} → ActiveDrag::Resize on tl#{}", edge, idx);
+            debug!(
+                "xdg client resize_request {:?} → ActiveDrag::Resize on tl#{}",
+                edge, idx
+            );
         }
 
         // Maximize / unmaximize. Treat fullscreen identically — we have no
         // separate fullscreen geometry yet; honour the protocol state but
         // share the maximize geometry.
-        let mut max_actions: Vec<(WlSurface, bool)> = state.pending_xdg_maximize.drain(..).collect();
+        let mut max_actions: Vec<(WlSurface, bool)> =
+            state.pending_xdg_maximize.drain(..).collect();
         max_actions.extend(state.pending_xdg_fullscreen.drain(..));
         for (surface, want_max) in max_actions {
-            let Some(id) = self.wm.id_for_surface(&surface) else { continue };
+            let Some(id) = self.wm.id_for_surface(&surface) else {
+                continue;
+            };
             {
                 let win = match self.wm.windows.values_mut().find(|w| w.id == id) {
                     Some(w) => w,
@@ -2052,7 +2942,10 @@ impl CompositorApp {
                 }
             }
             // Reply with a configure carrying the new size.
-            let (new_w, new_h) = self.wm.windows.values()
+            let (new_w, new_h) = self
+                .wm
+                .windows
+                .values()
                 .find(|w| w.id == id)
                 .map(|w| (w.w, w.h))
                 .unwrap_or((800, 600));
@@ -2160,7 +3053,83 @@ impl CompositorApp {
         }
     }
 
-    /// Forward a pointer motion event to the wayland client whose window is under the pointer.
+    fn popup_rect(
+        &self,
+        state: &SpikeState,
+        popup: &crate::wayland_state::PopupInfo,
+    ) -> Option<(f64, f64, f64, f64)> {
+        let (bw, bh) = {
+            let p = popup.pixels.lock().unwrap();
+            (p.width as i32, p.height as i32)
+        };
+        let w = if popup.w > 0 { popup.w } else { bw };
+        let h = if popup.h > 0 { popup.h } else { bh };
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+
+        let mut abs_x = popup.rel_x;
+        let mut abs_y = popup.rel_y;
+        let mut cur_parent = popup.parent.clone();
+        let mut anchored = false;
+        for _ in 0..16 {
+            if let Some(parent_popup) = state.popups.iter().find(|p| p.surface == cur_parent) {
+                abs_x += parent_popup.rel_x;
+                abs_y += parent_popup.rel_y;
+                cur_parent = parent_popup.parent.clone();
+                continue;
+            }
+            if let Some(tl_win) = self.wm.windows.values().find(|w| w.surface == cur_parent) {
+                abs_x += tl_win.anim.current_x();
+                let titlebar = if tl_win.csd {
+                    0
+                } else {
+                    crate::wm::TITLEBAR_HEIGHT as i32
+                };
+                abs_y += tl_win.anim.current_y() + titlebar;
+                anchored = true;
+            }
+            break;
+        }
+
+        anchored.then_some((abs_x as f64, abs_y as f64, w as f64, h as f64))
+    }
+
+    fn popup_surface_under(
+        &self,
+        state: &SpikeState,
+        x: f64,
+        y: f64,
+    ) -> Option<(WlSurface, f64, f64)> {
+        use smithay::desktop::utils::under_from_surface_tree;
+        use smithay::desktop::WindowSurfaceType;
+        use smithay::utils::Point;
+
+        for popup in state.popups.iter().rev() {
+            let Some((px, py, pw, ph)) = self.popup_rect(state, popup) else {
+                continue;
+            };
+            if x < px || x >= px + pw || y < py || y >= py + ph {
+                continue;
+            }
+
+            let popup_origin = Point::<i32, smithay::utils::Logical>::from((px as i32, py as i32));
+            if let Some((surface, origin)) = under_from_surface_tree(
+                &popup.surface,
+                Point::from((x, y)),
+                popup_origin,
+                WindowSurfaceType::ALL,
+            ) {
+                return Some((surface, origin.x as f64, origin.y as f64));
+            }
+
+            return Some((popup.surface.clone(), px, py));
+        }
+
+        None
+    }
+
+    /// Forward a pointer motion event to the wayland client whose surface is under the pointer.
     fn forward_pointer_motion(&self, state: &mut SpikeState, x: f64, y: f64) {
         use smithay::input::pointer::MotionEvent;
         use smithay::utils::Point;
@@ -2176,17 +3145,38 @@ impl CompositorApp {
         // Session-lock gate: while locked, the only valid pointer focus is
         // the lock surface for this output. WM surfaces are completely
         // hidden — sending events there would leak input across the lock
-        // boundary.
+        // boundary. Lock surfaces span the full output starting at (0, 0)
+        // so their surface origin in compositor coords is (0, 0).
         let hit = if state.session_locked {
-            state.lock_surfaces.first().map(|li| (li.surface.wl_surface().clone(), x, y))
+            state
+                .lock_surfaces
+                .first()
+                .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0))
         } else {
-            self.wm.surface_under(x, y)
+            self.popup_surface_under(state, x, y)
+                .or_else(|| self.wm.surface_under(x, y))
         };
 
-        if let Some((surface, local_x, local_y)) = hit {
+        // Smithay expects `focus.1` to be the SURFACE ORIGIN in compositor
+        // space (NOT the surface-local position). It computes
+        // surface_local = event.location - focus.1 internally and ships
+        // that as wl_pointer.motion. Passing the surface-local position
+        // here makes smithay double-subtract and the client receives
+        // garbage coordinates that never update — clicks land in the
+        // wrong widget or get ignored as out-of-bounds. wm::surface_under
+        // returns the surface origin; we forward it untouched.
+        if let Some((surface, origin_x, origin_y)) = hit {
+            use smithay::reexports::wayland_server::Resource;
+            tracing::debug!(
+                "pointer.motion → surface_id={} pid={} comp=({:.1},{:.1}) origin=({:.1},{:.1}) implied_local=({:.1},{:.1})",
+                surface.id().protocol_id(),
+                surface.client().and_then(|c| c.get_credentials(&state.display_handle).ok())
+                    .map(|c| c.pid).unwrap_or(0),
+                x, y, origin_x, origin_y, x - origin_x, y - origin_y,
+            );
             pointer.motion(
                 state,
-                Some((surface, Point::from((local_x, local_y)))),
+                Some((surface, Point::from((origin_x, origin_y)))),
                 &MotionEvent {
                     location: Point::from((x, y)),
                     serial,
@@ -2195,6 +3185,7 @@ impl CompositorApp {
             );
             pointer.frame(state);
         } else {
+            tracing::debug!("pointer.motion → no surface at ({:.1},{:.1})", x, y);
             pointer.motion(
                 state,
                 None,
@@ -2206,6 +3197,57 @@ impl CompositorApp {
             );
             pointer.frame(state);
         }
+    }
+
+    /// Forward a wl_pointer.axis frame to whatever surface currently has
+    /// pointer focus. Wires winit MouseWheel / touchpad scroll events into
+    /// the wayland client — without this, scrolling does literally nothing
+    /// inside any wayland window.
+    fn forward_pointer_axis(
+        &self,
+        state: &mut SpikeState,
+        dx: f64,
+        dy: f64,
+        discrete_v120: Option<(i32, i32)>,
+        is_wheel: bool,
+    ) {
+        use smithay::backend::input::{Axis, AxisSource};
+        use smithay::input::pointer::AxisFrame;
+
+        let pointer = match state.seat.get_pointer() {
+            Some(p) => p,
+            None => return,
+        };
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+
+        let time = state.clock.now().as_millis() as u32;
+        let mut frame = AxisFrame::new(time).source(if is_wheel {
+            AxisSource::Wheel
+        } else {
+            AxisSource::Finger
+        });
+        if dx != 0.0 {
+            frame = frame.value(Axis::Horizontal, dx);
+        }
+        if dy != 0.0 {
+            frame = frame.value(Axis::Vertical, dy);
+        }
+        if let Some((vx, vy)) = discrete_v120 {
+            if vx != 0 {
+                frame = frame.v120(Axis::Horizontal, vx);
+            }
+            if vy != 0 {
+                frame = frame.v120(Axis::Vertical, vy);
+            }
+        }
+        // Touchpad scroll-stop signalling (wayland requires it for Finger
+        // sources) is left to a future pass; winit's TouchPhase::Ended
+        // would be the natural trigger.
+
+        pointer.axis(state, frame);
+        pointer.frame(state);
     }
 
     /// Forward a pointer button event, and on left-press update WM focus.
@@ -2229,10 +3271,21 @@ impl CompositorApp {
             } else {
                 smithay::backend::input::ButtonState::Released
             };
-            pointer.button(state, &ButtonEvent { serial, time, button, state: button_state });
+            pointer.button(
+                state,
+                &ButtonEvent {
+                    serial,
+                    time,
+                    button,
+                    state: button_state,
+                },
+            );
             pointer.frame(state);
             return;
         }
+
+        let (x, y) = self.pointer_pos;
+        let over_client_popup = self.popup_surface_under(state, x, y).is_some();
 
         // On left press: update WM focus.
         // - Click on a window  → focus it (existing behaviour).
@@ -2240,13 +3293,10 @@ impl CompositorApp {
         //   panel or dock) → unfocus all windows so the panel's focused-app
         //   text clears and keyboard focus is dropped.
         // - Click on panel/dock → leave focus alone (those are shell areas).
-        if button == 0x110 && pressed {
-            let (x, y) = self.pointer_pos;
+        if button == 0x110 && pressed && !over_client_popup {
             let panel_h = crate::wm::PANEL_HEIGHT as f64;
-            let dock_h  = crate::wm::DOCK_HEIGHT as f64;
-            let oh      = self.wm.output_h as f64;
             let in_panel = y < panel_h;
-            let in_dock  = y >= oh - dock_h;
+            let in_dock = self.point_in_dock_pill(x, y);
             if let Some(focused_surface) = self.wm.pointer_click_focus(x, y) {
                 state.active_surface = Some(focused_surface.clone());
                 if let Some(kb) = state.seat.get_keyboard() {
@@ -2279,34 +3329,133 @@ impl CompositorApp {
             }
         }
 
+        // (Right-click dismiss is handled in the winit MouseInput
+        //  branch — it short-circuits before this point if a menu was
+        //  open, so by the time we get here there's nothing open and
+        //  it's safe to OPEN a new menu at the cursor.)
+
+        // Right-click on a window TITLEBAR opens the per-window
+        // context menu (Minimize / Maximize / Close). We test the hit
+        // zone before the desktop check below; only fall through if
+        // the cursor wasn't on a titlebar.
+        if button == 0x111 && pressed {
+            if !over_client_popup {
+                let win_rects = self.window_rects(state);
+                if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
+                    if hit.zone == cursor::HitZone::TitleBar {
+                        self.open_window_menu(hit.window_id, x, y);
+                        return;
+                    }
+                }
+            }
+        }
+
         // Right-click on the desktop opens our generic context menu.
         if button == 0x111 && pressed {
-            let (x, y) = self.pointer_pos;
             let panel_h = crate::wm::PANEL_HEIGHT as f64;
-            let oh      = self.wm.output_h as f64;
-            let ow      = self.wm.output_w as f64;
-            let dock_h  = crate::wm::DOCK_HEIGHT as f64;
-            let on_window = self.wm.pointer_click_focus(x, y).is_some();
+            let oh = self.wm.output_h as f64;
+            let ow = self.wm.output_w as f64;
+            let dock_h = crate::wm::DOCK_HEIGHT as f64;
+            let on_window = !over_client_popup && self.wm.pointer_click_focus(x, y).is_some();
             let in_panel = y < panel_h;
-            let in_dock  = y >= oh - dock_h;
-            if !on_window && !in_panel && !in_dock {
+            let in_dock = self.point_in_dock_pill(x, y);
+            if !over_client_popup && !on_window && !in_panel && !in_dock {
                 if let Some(ui) = self.ui.as_ref() {
-                    // Clamp the menu position so the rect (220 × ~260)
-                    // stays fully on screen — flips horizontally near the
-                    // right edge and vertically near the bottom edge,
-                    // matching macOS / GNOME behaviour.
+                    // Position the menu at the cursor's top-left, then
+                    // clamp it inside the screen with a margin (GNOME-
+                    // style). The clamp can shift the menu away from
+                    // the cursor — the cursor then sits *inside* the
+                    // menu rather than on its corner. Scale-origin =
+                    // cursor offset within the menu rect, so the
+                    // animation still grows out of the click point.
                     let menu_w = 220.0;
-                    let menu_h = 260.0;
-                    let mx = if x + menu_w > ow { (x - menu_w).max(0.0) } else { x };
-                    let my = if y + menu_h > oh - dock_h
-                        { (y - menu_h).max(panel_h) }
-                        else { y.max(panel_h) };
+                    let items_model = ui.get_desktop_menu_items();
+                    let menu_h = compute_menu_height(&items_model);
+                    // Flip when the menu would overflow on either axis,
+                    // so the cursor lands exactly at the corresponding
+                    // CORNER of the menu (top-left default, top-right
+                    // when x-flipped, bottom-left when y-flipped,
+                    // bottom-right when both). Matches the GNOME look:
+                    // the menu grows AWAY from the cursor, not "fills
+                    // toward it from the screen edge". Side fallback
+                    // clamps prevent off-screen rectangles when the
+                    // cursor is near the screen edge AND the menu is
+                    // larger than the available room on either side.
+                    let side_pad = 8.0;
+                    let bot_pad = 4.0; // gap to dock pill (drop-shadow has its own blur)
+                    let x_flipped = x + menu_w + side_pad > ow;
+                    let mut mx = if x_flipped { x - menu_w } else { x };
+                    mx = mx.clamp(side_pad, (ow - menu_w - side_pad).max(side_pad));
+                    let y_flipped = y + menu_h + bot_pad > oh - dock_h;
+                    let mut my = if y_flipped { y - menu_h } else { y };
+                    my = my.clamp(
+                        panel_h + 4.0,
+                        (oh - dock_h - menu_h - bot_pad).max(panel_h + 4.0),
+                    );
+                    let origin_x = (x - mx).clamp(0.0, menu_w);
+                    let origin_y = (y - my).clamp(0.0, menu_h);
                     ui.set_desktop_menu_x(mx as i32);
                     ui.set_desktop_menu_y(my as i32);
+                    ui.set_desktop_menu_h(menu_h as i32);
+                    ui.set_desktop_menu_origin_x(origin_x as i32);
+                    ui.set_desktop_menu_origin_y(origin_y as i32);
                     ui.set_desktop_menu_open(true);
                     if let Some(gpu_window) = self.gpu_window.as_ref() {
                         gpu_window.mark_dirty();
                     }
+                }
+            }
+        }
+
+        // Defensive focus refresh: re-run surface_under at the click point
+        // and force a pointer.motion if it disagrees with the cached focus.
+        // Without this, a button event is silently dropped whenever the
+        // immediately-preceding motion happened to land outside the window
+        // (e.g. user moves cursor 0.1 px above the geom top, presses), or
+        // when the WM's animated geometry shifted between the last motion
+        // and this press. The motion call also synthesises the wl_pointer.
+        // enter that the client needs before any button event will route.
+        if pressed {
+            use smithay::input::pointer::MotionEvent;
+            use smithay::reexports::wayland_server::Resource;
+            use smithay::utils::Point;
+            let hit = self
+                .popup_surface_under(state, x, y)
+                .or_else(|| self.wm.surface_under(x, y));
+            let want_id = hit.as_ref().map(|(s, _, _)| s.id().protocol_id() as i64);
+            let have_id = pointer.current_focus().map(|s| s.id().protocol_id() as i64);
+            if want_id != have_id {
+                let serial_m = SERIAL_COUNTER.next_serial();
+                let time_m = state.clock.now().as_millis() as u32;
+                if let Some((surface, ox, oy)) = hit {
+                    tracing::debug!(
+                        "pointer focus refresh on press: forcing motion to surface_id={} origin=({:.1},{:.1})",
+                        surface.id().protocol_id(), ox, oy,
+                    );
+                    pointer.motion(
+                        state,
+                        Some((surface, Point::from((ox, oy)))),
+                        &MotionEvent {
+                            location: Point::from((x, y)),
+                            serial: serial_m,
+                            time: time_m,
+                        },
+                    );
+                    pointer.frame(state);
+                } else {
+                    tracing::debug!(
+                        "pointer focus refresh on press: clearing (no hit at click point)"
+                    );
+                    pointer.motion(
+                        state,
+                        None,
+                        &MotionEvent {
+                            location: Point::from((x, y)),
+                            serial: serial_m,
+                            time: time_m,
+                        },
+                    );
+                    pointer.frame(state);
                 }
             }
         }
@@ -2319,9 +3468,26 @@ impl CompositorApp {
             smithay::backend::input::ButtonState::Released
         };
 
+        tracing::debug!(
+            "pointer.button → button=0x{:x} pressed={} ptr_focus={}",
+            button,
+            pressed,
+            pointer
+                .current_focus()
+                .map(|s| {
+                    use smithay::reexports::wayland_server::Resource;
+                    s.id().protocol_id() as i64
+                })
+                .unwrap_or(-1),
+        );
         pointer.button(
             state,
-            &ButtonEvent { serial, time, button, state: button_state },
+            &ButtonEvent {
+                serial,
+                time,
+                button,
+                state: button_state,
+            },
         );
         pointer.frame(state);
     }
@@ -2333,20 +3499,23 @@ impl CompositorApp {
 
         let app_id_for = |surf: &WlSurface| -> Option<String> {
             with_states(surf, |states| {
-                states.data_map.get::<XdgToplevelSurfaceData>()
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
                     .and_then(|d| d.lock().ok()?.app_id.clone())
             })
         };
 
-        let focused_app_id: Option<String> = state
-            .active_surface.as_ref().and_then(|s| app_id_for(s));
+        let focused_app_id: Option<String> =
+            state.active_surface.as_ref().and_then(|s| app_id_for(s));
 
         // Collect every running app_id from the toplevel list.
-        let mut running_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut running_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for tl in &state.toplevels {
             if let Some(id) = app_id_for(&tl.surface) {
-                if !id.is_empty() { running_ids.insert(id); }
+                if !id.is_empty() {
+                    running_ids.insert(id);
+                }
             }
         }
 
@@ -2358,9 +3527,7 @@ impl CompositorApp {
         let Some(ui) = self.ui.as_ref() else { return };
 
         let matches_pinned = |a: &str, b: &str| -> bool {
-            a == b
-                || a.rsplit('.').next() == Some(b)
-                || b.rsplit('.').next() == Some(a)
+            a == b || a.rsplit('.').next() == Some(b) || b.rsplit('.').next() == Some(a)
         };
 
         let mut items: Vec<DockItem> = self
@@ -2368,13 +3535,16 @@ impl CompositorApp {
             .iter()
             .map(|entry| {
                 let app_id_str = entry.item.app_id.as_str();
-                let running = running_ids.iter().any(|rid| matches_pinned(rid, app_id_str));
-                let focused = focused_app_id.as_deref()
+                let running = running_ids
+                    .iter()
+                    .any(|rid| matches_pinned(rid, app_id_str));
+                let focused = focused_app_id
+                    .as_deref()
                     .map_or(false, |fid| matches_pinned(fid, app_id_str));
                 DockItem {
                     icon: entry.item.icon.clone(),
                     app_id: entry.item.app_id.clone(),
-                    name:  entry.item.name.clone(),
+                    name: entry.item.name.clone(),
                     running,
                     focused,
                     pinned: entry.item.pinned,
@@ -2383,11 +3553,16 @@ impl CompositorApp {
             .collect();
 
         // Append non-pinned running apps after the pinned ones.
-        let pinned_ids: Vec<String> = self.dock_entries.iter()
-            .map(|e| e.item.app_id.to_string()).collect();
-        let mut extras: Vec<String> = running_ids.iter()
+        let pinned_ids: Vec<String> = self
+            .dock_entries
+            .iter()
+            .map(|e| e.item.app_id.to_string())
+            .collect();
+        let mut extras: Vec<String> = running_ids
+            .iter()
             .filter(|rid| !pinned_ids.iter().any(|pid| matches_pinned(rid, pid)))
-            .cloned().collect();
+            .cloned()
+            .collect();
         extras.sort();
         for app_id in &extras {
             let info = desktop::resolve(app_id);
@@ -2397,12 +3572,13 @@ impl CompositorApp {
                     .map(|p| desktop::load_icon(&p))
                     .unwrap_or_default(),
             };
-            let focused = focused_app_id.as_deref()
+            let focused = focused_app_id
+                .as_deref()
                 .map_or(false, |fid| matches_pinned(fid, app_id));
             items.push(DockItem {
                 icon,
                 app_id: SharedString::from(app_id.as_str()),
-                name:  SharedString::from(info.name.as_str()),
+                name: SharedString::from(info.name.as_str()),
                 running: true,
                 focused,
                 pinned: false,
@@ -2411,8 +3587,10 @@ impl CompositorApp {
 
         let model = std::rc::Rc::new(VecModel::from(items));
         ui.set_dock_items(slint::ModelRc::from(model));
-        debug!("dock running state updated, focused={:?}, running={:?}",
-            focused_app_id, running_ids);
+        debug!(
+            "dock running state updated, focused={:?}, running={:?}",
+            focused_app_id, running_ids
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -2425,6 +3603,35 @@ impl CompositorApp {
     /// libadwaita) commit buffers larger than the visible window so they
     /// can paint their own shadow. Using `pix.width/height` here would
     /// extend resize/move zones into our compositor-drawn shadow band.
+    /// True when `(x, y)` lies inside the visible dock pill rectangle.
+    ///
+    /// The dock is a centred pill at the bottom of the screen — it does
+    /// NOT span the full output width. Left- and right-click handlers
+    /// gate "click is on the dock" on this rect so clicks on the empty
+    /// wallpaper strips beside the pill (and on the `dock-outer-gap`
+    /// band below it) fall through to the desktop handler — without
+    /// this, the desktop right-click context menu refused to open
+    /// anywhere in the bottom 96 px of the screen.
+    ///
+    /// Width / padding constants mirror `Dock.slint`:
+    ///   * each slot is 64 px wide
+    ///   * `dock-padding` is 8 px on each side of the items row
+    ///   * `dock-outer-gap` is 8 px above and below the pill
+    fn point_in_dock_pill(&self, x: f64, y: f64) -> bool {
+        const DOCK_SLOT_W: f64 = 64.0;
+        const DOCK_PADDING: f64 = 8.0;
+        const DOCK_OUTER_GAP: f64 = 8.0;
+        let oh = self.wm.output_h as f64;
+        let ow = self.wm.output_w as f64;
+        let dock_h = crate::wm::DOCK_HEIGHT as f64;
+        let n_slots = self.dock_entries.len() as f64;
+        let pill_w = n_slots * DOCK_SLOT_W + 2.0 * DOCK_PADDING;
+        let pill_x = (ow - pill_w) / 2.0;
+        let pill_y_top = oh - dock_h + DOCK_OUTER_GAP;
+        let pill_y_bot = oh - DOCK_OUTER_GAP;
+        y >= pill_y_top && y < pill_y_bot && x >= pill_x && x < pill_x + pill_w
+    }
+
     fn window_rects(&self, state: &SpikeState) -> Vec<WindowRect> {
         let mut rects: Vec<WindowRect> = Vec::new();
         // Front-to-back: highest z_order first.
@@ -2432,18 +3639,29 @@ impl CompositorApp {
         wins.sort_by_key(|w| std::cmp::Reverse(w.z_order));
         for win in wins {
             // Skip windows the user can't actually click on.
-            if win.closing { continue; }
-            if win.minimized && win.anim.is_settled() { continue; }
+            if win.closing {
+                continue;
+            }
+            if win.minimized && win.anim.is_settled() {
+                continue;
+            }
             // Match this WM window to a state.toplevels index — needed for
             // find_toplevel_idx callers that index by toplevel position.
-            let Some(idx) = state.toplevels.iter().position(|t| t.surface == win.surface) else { continue };
+            let Some(idx) = state
+                .toplevels
+                .iter()
+                .position(|t| t.surface == win.surface)
+            else {
+                continue;
+            };
             let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
             rects.push(WindowRect {
                 id: idx as i32,
-                x:  win.anim.current_x() as f64,
-                y:  win.anim.current_y() as f64,
-                w:  win.geom_w.max(1) as f64,
-                h:  win.geom_h.max(1) as f64 + titlebar,
+                x: win.anim.current_x() as f64,
+                y: win.anim.current_y() as f64,
+                w: win.geom_w.max(1) as f64,
+                h: win.geom_h.max(1) as f64 + titlebar,
+                csd: win.csd,
             });
         }
         rects
@@ -2457,8 +3675,12 @@ impl CompositorApp {
         let mut wins: Vec<&crate::wm::WindowState> = self.wm.windows.values().collect();
         wins.sort_by_key(|w| std::cmp::Reverse(w.z_order));
         for win in wins {
-            if win.closing { continue; }
-            if win.minimized && win.anim.is_settled() { continue; }
+            if win.closing {
+                continue;
+            }
+            if win.minimized && win.anim.is_settled() {
+                continue;
+            }
             let wx = win.anim.current_x() as f64;
             let wy = win.anim.current_y() as f64;
             let ww = win.geom_w.max(1) as f64;
@@ -2469,7 +3691,11 @@ impl CompositorApp {
                 && ptr_y >= wy - cursor::EDGE_ZONE
                 && ptr_y < wy + wh + cursor::EDGE_ZONE
             {
-                if let Some(idx) = state.toplevels.iter().position(|t| t.surface == win.surface) {
+                if let Some(idx) = state
+                    .toplevels
+                    .iter()
+                    .position(|t| t.surface == win.surface)
+                {
                     return Some(idx);
                 }
             }
@@ -2486,17 +3712,24 @@ impl CompositorApp {
         // If there's an active drag, handle it.
         if let Some(drag) = self.active_drag.clone() {
             match &drag {
-                ActiveDrag::Resize { toplevel_idx, edge, start_geom, .. } => {
+                ActiveDrag::Resize {
+                    toplevel_idx,
+                    edge,
+                    start_geom,
+                    ..
+                } => {
                     if let Some((nx, mut ny, nw, mut nh)) = resize::compute_resize(&drag, x, y) {
                         // ── Top-edge constraint ───────────────────────────
                         // Block the top edge from sliding under the panel.
                         // Adjust height so the bottom edge stays where the
                         // resize math wanted it.
                         let panel = crate::wm::PANEL_HEIGHT;
-                        if matches!(*edge, resize::ResizeEdge::North
-                                          | resize::ResizeEdge::NorthWest
-                                          | resize::ResizeEdge::NorthEast)
-                            && ny < panel
+                        if matches!(
+                            *edge,
+                            resize::ResizeEdge::North
+                                | resize::ResizeEdge::NorthWest
+                                | resize::ResizeEdge::NorthEast
+                        ) && ny < panel
                         {
                             let desired_bottom = start_geom.y + start_geom.h;
                             ny = panel;
@@ -2509,16 +3742,20 @@ impl CompositorApp {
                         // the user must travel further than the threshold
                         // from the snap-engagement pointer position.
                         let dock_top = self.wm.output_h - crate::wm::DOCK_HEIGHT;
-                        let edge_is_south = matches!(*edge,
+                        let edge_is_south = matches!(
+                            *edge,
                             resize::ResizeEdge::South
-                            | resize::ResizeEdge::SouthEast
-                            | resize::ResizeEdge::SouthWest,
+                                | resize::ResizeEdge::SouthEast
+                                | resize::ResizeEdge::SouthWest,
                         );
                         if edge_is_south {
                             let raw_bottom = ny + nh;
                             // Snap engages when bottom reaches dock-top line.
                             let mut engaged_at = match &self.active_drag {
-                                Some(ActiveDrag::Resize { dock_snap_engaged_at, .. }) => *dock_snap_engaged_at,
+                                Some(ActiveDrag::Resize {
+                                    dock_snap_engaged_at,
+                                    ..
+                                }) => *dock_snap_engaged_at,
                                 _ => None,
                             };
                             if engaged_at.is_none() && raw_bottom >= dock_top {
@@ -2533,8 +3770,10 @@ impl CompositorApp {
                                     nh = (dock_top - ny).max(resize::MIN_WINDOW_SIZE);
                                 }
                             }
-                            if let Some(ActiveDrag::Resize { dock_snap_engaged_at, .. })
-                                = &mut self.active_drag
+                            if let Some(ActiveDrag::Resize {
+                                dock_snap_engaged_at,
+                                ..
+                            }) = &mut self.active_drag
                             {
                                 *dock_snap_engaged_at = engaged_at;
                             }
@@ -2551,30 +3790,40 @@ impl CompositorApp {
                             // the client with size churn.
                             let now = std::time::Instant::now();
                             let should_send = match &mut self.active_drag {
-                                Some(ActiveDrag::Resize { last_configure_at, .. }) => {
-                                    let send = last_configure_at
-                                        .map_or(true, |t| now.duration_since(t)
-                                            >= std::time::Duration::from_millis(16));
-                                    if send { *last_configure_at = Some(now); }
+                                Some(ActiveDrag::Resize {
+                                    last_configure_at, ..
+                                }) => {
+                                    let send = last_configure_at.map_or(true, |t| {
+                                        now.duration_since(t)
+                                            >= std::time::Duration::from_millis(16)
+                                    });
+                                    if send {
+                                        *last_configure_at = Some(now);
+                                    }
                                     send
                                 }
                                 _ => true,
                             };
                             if should_send {
-                                let maybe_ts = state.xdg_shell_state
-                                    .toplevel_surfaces().iter()
-                                    .find(|ts| ts.wl_surface() == &surface).cloned();
+                                let maybe_ts = state
+                                    .xdg_shell_state
+                                    .toplevel_surfaces()
+                                    .iter()
+                                    .find(|ts| ts.wl_surface() == &surface)
+                                    .cloned();
                                 if let Some(toplevel) = maybe_ts {
                                     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-                                    toplevel.with_pending_state(|s: &mut smithay::wayland::shell::xdg::ToplevelState| {
-                                        s.size = Some((cw, ch).into());
-                                        // Tell the client it's actively being
-                                        // resized; many clients (kitty, gtk,
-                                        // qt) gate their redraw path on this
-                                        // and won't repaint at the new size
-                                        // without it.
-                                        s.states.set(xdg_toplevel::State::Resizing);
-                                    });
+                                    toplevel.with_pending_state(
+                                        |s: &mut smithay::wayland::shell::xdg::ToplevelState| {
+                                            s.size = Some((cw, ch).into());
+                                            // Tell the client it's actively being
+                                            // resized; many clients (kitty, gtk,
+                                            // qt) gate their redraw path on this
+                                            // and won't repaint at the new size
+                                            // without it.
+                                            s.states.set(xdg_toplevel::State::Resizing);
+                                        },
+                                    );
                                     toplevel.send_configure();
                                     debug!("resize configure: {}×{} at ({},{})", cw, ch, nx, ny);
                                 }
@@ -2591,7 +3840,12 @@ impl CompositorApp {
                     }
                     return; // Don't update cursor during resize drag.
                 }
-                ActiveDrag::Move { toplevel_idx, offset_x, offset_y, pending_unmaximize } => {
+                ActiveDrag::Move {
+                    toplevel_idx,
+                    offset_x,
+                    offset_y,
+                    pending_unmaximize,
+                } => {
                     let (ox, oy) = (*offset_x, *offset_y);
 
                     // If this drag started on a maximized window, gate motion
@@ -2604,21 +3858,23 @@ impl CompositorApp {
                             return;
                         }
                         let toplevel_idx = *toplevel_idx;
-                        let surface = state.toplevels.get(toplevel_idx)
-                            .map(|t| t.surface.clone());
+                        let surface = state.toplevels.get(toplevel_idx).map(|t| t.surface.clone());
                         if let Some(surface) = surface {
                             let wm_id_opt = self.wm.id_for_surface(&surface);
                             if let Some(wm_id) = wm_id_opt {
-                                let restore = self.wm.windows.values()
+                                let restore = self
+                                    .wm
+                                    .windows
+                                    .values()
                                     .find(|w| w.id == wm_id)
                                     .and_then(|w| w.pre_maximize);
                                 if let Some((_rx, _ry, rw, rh)) = restore {
-                                    let rel_x = ((x - 0.0) / self.wm.output_w as f64)
-                                        .clamp(0.0, 1.0);
+                                    let rel_x =
+                                        ((x - 0.0) / self.wm.output_w as f64).clamp(0.0, 1.0);
                                     let new_x = (x - rel_x * rw as f64) as i32;
                                     let new_y = (y - (crate::wm::TITLEBAR_HEIGHT / 2.0)) as i32;
-                                    if let Some(win_mut) = self.wm.windows.values_mut()
-                                        .find(|w| w.id == wm_id)
+                                    if let Some(win_mut) =
+                                        self.wm.windows.values_mut().find(|w| w.id == wm_id)
                                     {
                                         win_mut.start_unmaximize();
                                     }
@@ -2627,9 +3883,12 @@ impl CompositorApp {
                                         tl_mut.x = new_x;
                                         tl_mut.y = new_y;
                                     }
-                                    let maybe_ts = state.xdg_shell_state
-                                        .toplevel_surfaces().iter()
-                                        .find(|ts| ts.wl_surface() == &surface).cloned();
+                                    let maybe_ts = state
+                                        .xdg_shell_state
+                                        .toplevel_surfaces()
+                                        .iter()
+                                        .find(|ts| ts.wl_surface() == &surface)
+                                        .cloned();
                                     if let Some(toplevel) = maybe_ts {
                                         toplevel.with_pending_state(
                                             |s: &mut smithay::wayland::shell::xdg::ToplevelState| {
@@ -2644,10 +3903,18 @@ impl CompositorApp {
                                     // xdg_toplevel.configure — push the state
                                     // change to them directly.
                                     self.sync_x11_window_state(
-                                        &surface, state, Some(false), None, None,
+                                        &surface,
+                                        state,
+                                        Some(false),
+                                        None,
+                                        None,
                                     );
-                                    if let Some(ActiveDrag::Move { offset_x, offset_y, pending_unmaximize, .. })
-                                        = &mut self.active_drag
+                                    if let Some(ActiveDrag::Move {
+                                        offset_x,
+                                        offset_y,
+                                        pending_unmaximize,
+                                        ..
+                                    }) = &mut self.active_drag
                                     {
                                         *offset_x = x - new_x as f64;
                                         *offset_y = y - new_y as f64;
@@ -2675,13 +3942,13 @@ impl CompositorApp {
                         // able to drag windows down behind the dock; the
                         // dock's post-chrome re-blit makes them visually
                         // disappear behind it without us cutting them off.
-                        let panel  = crate::wm::PANEL_HEIGHT;
-                        let oh     = self.wm.output_h;
+                        let panel = crate::wm::PANEL_HEIGHT;
+                        let oh = self.wm.output_h;
                         let raw_ny = (y - oy) as i32;
                         // Allow the window to push down so just its titlebar
                         // remains visible on screen.
                         let max_ny = (oh - 24).max(panel);
-                        let ny     = raw_ny.clamp(panel, max_ny);
+                        let ny = raw_ny.clamp(panel, max_ny);
                         tl.x = nx;
                         tl.y = ny;
                         let surface = tl.surface.clone();
@@ -2730,10 +3997,16 @@ impl CompositorApp {
         // If the hovered window is maximized, suppress edge/corner zones so
         // the cursor stays a normal arrow / titlebar and a press never fires
         // a resize drag — maximized windows aren't user-resizable.
-        let zone = if matches!(raw_zone,
-            HitZone::EdgeNorth | HitZone::EdgeSouth | HitZone::EdgeEast | HitZone::EdgeWest
-            | HitZone::CornerNW { .. } | HitZone::CornerNE { .. }
-            | HitZone::CornerSW { .. } | HitZone::CornerSE { .. }
+        let zone = if matches!(
+            raw_zone,
+            HitZone::EdgeNorth
+                | HitZone::EdgeSouth
+                | HitZone::EdgeEast
+                | HitZone::EdgeWest
+                | HitZone::CornerNW { .. }
+                | HitZone::CornerNE { .. }
+                | HitZone::CornerSW { .. }
+                | HitZone::CornerSE { .. }
         ) {
             let idx_opt = self.find_toplevel_idx(state, x, y);
             let maximized = idx_opt
@@ -2741,7 +4014,11 @@ impl CompositorApp {
                 .and_then(|tl| self.wm.id_for_surface(&tl.surface))
                 .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
                 .map_or(false, |w| w.maximized);
-            if maximized { HitZone::None } else { raw_zone }
+            if maximized {
+                HitZone::None
+            } else {
+                raw_zone
+            }
         } else {
             raw_zone
         };
@@ -2760,9 +4037,15 @@ impl CompositorApp {
                 if let Some(idx) = idx_opt {
                     // Win+drag — Super held + left-press anywhere → Move.
                     if self.super_held {
-                        let maximized = self.wm.windows.values()
-                            .find(|w| state.toplevels.get(idx)
-                                .map_or(false, |t| self.wm.id_for_surface(&t.surface) == Some(w.id)))
+                        let maximized = self
+                            .wm
+                            .windows
+                            .values()
+                            .find(|w| {
+                                state.toplevels.get(idx).map_or(false, |t| {
+                                    self.wm.id_for_surface(&t.surface) == Some(w.id)
+                                })
+                            })
                             .map_or(false, |w| w.maximized);
                         let (ox, oy) = self.maybe_unsnap_for_move(state, idx, x, y);
                         self.active_drag = Some(ActiveDrag::Move {
@@ -2771,7 +4054,10 @@ impl CompositorApp {
                             offset_y: oy,
                             pending_unmaximize: if maximized { Some((x, y)) } else { None },
                         });
-                        debug!("Win+drag move started on window #{} (maximized={})", idx, maximized);
+                        debug!(
+                            "Win+drag move started on window #{} (maximized={})",
+                            idx, maximized
+                        );
                         let _ = hit_result;
                         return;
                     }
@@ -2780,11 +4066,10 @@ impl CompositorApp {
                     // `clicked` and route through close-clicked /
                     // minimize-clicked / maximize-clicked. We just need to
                     // avoid hijacking the press into a move drag.
-                    if matches!(zone,
-                        HitZone::CloseButton
-                        | HitZone::MinimizeButton
-                        | HitZone::MaximizeButton)
-                    {
+                    if matches!(
+                        zone,
+                        HitZone::CloseButton | HitZone::MinimizeButton | HitZone::MaximizeButton
+                    ) {
                         let _ = hit_result;
                         return;
                     }
@@ -2797,10 +4082,16 @@ impl CompositorApp {
                         // dims back to the client at non-1.0 scales would
                         // double the size each drag. The WM's per-window
                         // geometry is the authoritative logical size.
-                        let (w, h) = self.wm.id_for_surface(&t.surface)
-                            .and_then(|wm_id| self.wm.windows.values()
-                                .find(|w| w.id == wm_id)
-                                .map(|w| (w.w, w.h)))
+                        let (w, h) = self
+                            .wm
+                            .id_for_surface(&t.surface)
+                            .and_then(|wm_id| {
+                                self.wm
+                                    .windows
+                                    .values()
+                                    .find(|w| w.id == wm_id)
+                                    .map(|w| (w.w, w.h))
+                            })
                             .unwrap_or_else(|| {
                                 let pix = t.pixels.lock().unwrap();
                                 (pix.width as i32, pix.height as i32)
@@ -2810,13 +4101,23 @@ impl CompositorApp {
                             edge,
                             start_ptr_x: x,
                             start_ptr_y: y,
-                            start_geom: WindowGeomSnapshot { x: t.x, y: t.y, w, h },
+                            start_geom: WindowGeomSnapshot {
+                                x: t.x,
+                                y: t.y,
+                                w,
+                                h,
+                            },
                             last_configure_at: None,
                             dock_snap_engaged_at: None,
                         });
-                        debug!("resize drag started: {:?} on window #{} from {}x{}", edge, idx, w, h);
+                        debug!(
+                            "resize drag started: {:?} on window #{} from {}x{}",
+                            edge, idx, w, h
+                        );
                     } else if zone == HitZone::TitleBar {
-                        let maximized = state.toplevels.get(idx)
+                        let maximized = state
+                            .toplevels
+                            .get(idx)
                             .and_then(|t| self.wm.id_for_surface(&t.surface))
                             .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
                             .map_or(false, |w| w.maximized);
@@ -2827,7 +4128,10 @@ impl CompositorApp {
                             offset_y: oy,
                             pending_unmaximize: if maximized { Some((x, y)) } else { None },
                         });
-                        debug!("move drag started on window #{} (maximized={})", idx, maximized);
+                        debug!(
+                            "move drag started on window #{} (maximized={})",
+                            idx, maximized
+                        );
                     }
                 }
                 let _ = hit_result;
@@ -2838,29 +4142,41 @@ impl CompositorApp {
     /// Build the debug-overlay text dump (Super+I).
     fn build_debug_dump(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("theme: {:?}  mode_t={:.2}\n",
-            self.theme.current_mode, self.theme.mode_t));
-        out.push_str(&format!("output: {}×{}\n", self.wm.output_w, self.wm.output_h));
-        out.push_str(&format!("frames: {}  fps: {:.1}\n",
-            self.frame_count, self.fps));
-        out.push_str(&format!("cursor: {:?} at ({:.0},{:.0})\n",
-            self.current_cursor, self.pointer_pos.0, self.pointer_pos.1));
-        out.push_str(&format!("drag: {}\n", match &self.active_drag {
-            None    => "none".to_string(),
-            Some(d) => format!("{:?}", d),
-        }));
+        out.push_str(&format!(
+            "theme: {:?}  mode_t={:.2}\n",
+            self.theme.current_mode, self.theme.mode_t
+        ));
+        out.push_str(&format!(
+            "output: {}×{}\n",
+            self.wm.output_w, self.wm.output_h
+        ));
+        out.push_str(&format!(
+            "frames: {}  fps: {:.1}\n",
+            self.frame_count, self.fps
+        ));
+        out.push_str(&format!(
+            "cursor: {:?} at ({:.0},{:.0})\n",
+            self.current_cursor, self.pointer_pos.0, self.pointer_pos.1
+        ));
+        out.push_str(&format!(
+            "drag: {}\n",
+            match &self.active_drag {
+                None => "none".to_string(),
+                Some(d) => format!("{:?}", d),
+            }
+        ));
         out.push_str(&format!("\nWindows ({}):\n", self.wm.windows.len()));
         let mut wins: Vec<&crate::wm::WindowState> = self.wm.windows.values().collect();
         wins.sort_by_key(|w| w.id);
         for w in &wins {
             out.push_str(&format!(
                 "  #{}  z={}  {}×{}+{}+{}  focus={}  min={}  max={}  closing={}\n",
-                w.id, w.z_order, w.w, w.h, w.x, w.y,
-                w.focused, w.minimized, w.maximized, w.closing,
+                w.id, w.z_order, w.w, w.h, w.x, w.y, w.focused, w.minimized, w.maximized, w.closing,
             ));
             out.push_str(&format!(
                 "        opacity={:.2}  scale={:.2}  awaiting_first={}\n",
-                w.anim.opacity.value_f32(), w.anim.scale.value_f32(),
+                w.anim.opacity.value_f32(),
+                w.anim.scale.value_f32(),
                 w.awaiting_first_render,
             ));
         }
@@ -2874,28 +4190,150 @@ impl CompositorApp {
     pub fn swap_wallpaper_for_current_mode(&mut self) {
         let tag = match self.theme.current_mode {
             ThemeMode::Light => "light",
-            ThemeMode::Dark  => "dark",
+            ThemeMode::Dark => "dark",
         };
-        let Some(p) = wallpaper::find_wallpaper_for_mode(tag) else { return };
+        let Some(p) = wallpaper::find_wallpaper_for_mode(tag) else {
+            return;
+        };
         if let Some(img) = wallpaper::load_from_path(&p) {
-            if let Some(ui) = self.ui.as_ref() { ui.set_wallpaper(img); }
+            if let Some(ui) = self.ui.as_ref() {
+                ui.set_wallpaper(img);
+            }
         }
         if let Some(b) = wallpaper::load_blurred_from_path(&p, 24.0) {
-            if let Some(ui) = self.ui.as_ref() { ui.set_wallpaper_blurred(b); }
+            if let Some(ui) = self.ui.as_ref() {
+                ui.set_wallpaper_blurred(b);
+            }
         }
         self.backdrop.load_wallpaper(&p);
-        if let Some(gpu_window) = self.gpu_window.as_ref() { gpu_window.mark_dirty(); }
-        info!("wallpaper swapped for mode {:?} → {:?}", self.theme.current_mode, p);
+        if let Some(gpu_window) = self.gpu_window.as_ref() {
+            gpu_window.mark_dirty();
+        }
+        info!(
+            "wallpaper swapped for mode {:?} → {:?}",
+            self.theme.current_mode, p
+        );
+    }
+
+    /// Publish layer surfaces (panel / dock / wallpaper / overlays) to Slint
+    /// only when the model would actually change — a layer was added or
+    /// removed, its rect moved, or a client committed new pixels. Without
+    /// this gate, the layers model was rebuilt and re-uploaded every main-
+    /// loop iteration, which marked Slint dirty every frame and forced a
+    /// full GPU re-render at vsync rate. Cached `Image`s for unchanged
+    /// surfaces are reused so Slint doesn't re-upload their textures.
+    pub fn update_layers(&mut self, state: &mut SpikeState) {
+        use smithay::reexports::wayland_server::Resource;
+        use smithay::wayland::shell::wlr_layer::Layer;
+
+        let Some(ui) = self.ui.as_ref() else { return };
+
+        // Pass 1 — for each layer surface, decide whether its cached Image
+        // is still good. We pull `dirty` out of `pixels` (and reset it) so
+        // the next idle iteration sees no pending update. Build the model's
+        // fingerprint (id + rect + ordinal) along the way so we can skip
+        // the Slint set_layers call when nothing changed.
+        let mut fingerprint: Vec<(u32, i32, i32, i32, i32, i32)> =
+            Vec::with_capacity(state.layer_surfaces.len());
+        let mut any_dirty = false;
+        let mut visible_ids: std::collections::HashSet<u32> =
+            std::collections::HashSet::with_capacity(state.layer_surfaces.len());
+
+        for li in &state.layer_surfaces {
+            let id = li.surface.wl_surface().id().protocol_id();
+            let (pw, ph, dirty) = {
+                let mut pix = li.pixels.lock().unwrap();
+                let was_dirty = pix.dirty;
+                if was_dirty {
+                    pix.dirty = false;
+                }
+                (pix.width, pix.height, was_dirty)
+            };
+            if pw == 0 || ph == 0 || li.w <= 0 || li.h <= 0 {
+                // Drop any stale cached Image so a remap with a fresh buffer
+                // re-uploads from scratch.
+                self.layer_image_cache.remove(&id);
+                continue;
+            }
+            visible_ids.insert(id);
+            if dirty || !self.layer_image_cache.contains_key(&id) {
+                let pix = li.pixels.lock().unwrap();
+                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                    &pix.pixels,
+                    pix.width,
+                    pix.height,
+                );
+                drop(pix);
+                let img = slint::Image::from_rgba8_premultiplied(buf);
+                self.layer_image_cache.insert(id, img);
+                any_dirty = true;
+            }
+            let ordinal: i32 = match li.layer {
+                Layer::Background => 0,
+                Layer::Bottom => 1,
+                Layer::Top => 2,
+                Layer::Overlay => 3,
+            };
+            fingerprint.push((id, li.x, li.y, li.w, li.h, ordinal));
+        }
+
+        // Evict cached Images for surfaces that disappeared (unmap, destroy)
+        // so the cache doesn't grow unbounded across a long session.
+        if self.layer_image_cache.len() > visible_ids.len() {
+            self.layer_image_cache
+                .retain(|id, _| visible_ids.contains(id));
+        }
+
+        // No add/remove/move and no surface re-painted → nothing to publish.
+        if !any_dirty && fingerprint == self.last_layers_fingerprint {
+            return;
+        }
+
+        // Build + publish the model from the cache.
+        let items: Vec<crate::LayerItem> = fingerprint
+            .iter()
+            .filter_map(|&(id, x, y, w, h, ordinal)| {
+                let img = self.layer_image_cache.get(&id)?.clone();
+                Some(crate::LayerItem {
+                    id: id as i32,
+                    surface: img,
+                    x,
+                    y,
+                    w,
+                    h,
+                    layer_ordinal: ordinal,
+                })
+            })
+            .collect();
+        let model = std::rc::Rc::new(VecModel::from(items));
+        ui.set_layers(slint::ModelRc::from(model));
+        self.last_layers_fingerprint = fingerprint;
+        if let Some(gpu_window) = self.gpu_window.as_ref() {
+            gpu_window.mark_dirty();
+        }
     }
 
     /// Refresh the panel/dock backdrop on a throttled cadence.
     pub fn refresh_backdrop(&mut self, state: &SpikeState) {
+        // Bail out before the per-window pixel clone if the throttle window
+        // hasn't elapsed — the snapshot vector below is megabytes per
+        // visible window, and pegging the render thread's memcpy bandwidth
+        // for work we'd throw away is what was capping framerate.
+        if !self.backdrop.should_refresh() {
+            return;
+        }
         let mut snapshots: Vec<(i32, i32, i32, i32, Vec<u8>, u32, u32)> = Vec::new();
         for win in self.wm.windows_sorted() {
-            if win.minimized && win.anim.is_settled() { continue }
-            let Some(tl) = state.toplevels.iter().find(|t| t.surface == win.surface) else { continue };
+            if win.minimized && win.anim.is_settled() {
+                continue;
+            }
+            let Some(tl) = state.toplevels.iter().find(|t| t.surface == win.surface) else {
+                continue;
+            };
             let pix = tl.pixels.lock().unwrap();
-            if pix.width == 0 || pix.height == 0 { continue }
+            if pix.width == 0 || pix.height == 0 {
+                continue;
+            }
             snapshots.push((
                 win.anim.current_x(),
                 win.anim.current_y(),
@@ -2906,12 +4344,22 @@ impl CompositorApp {
                 pix.height,
             ));
         }
-        let snaps: Vec<WindowSnapshot<'_>> = snapshots.iter().map(|t| WindowSnapshot {
-            x: t.0, y: t.1, w: t.2, h: t.3,
-            pixels: &t.4, buf_w: t.5, buf_h: t.6,
-        }).collect();
+        let snaps: Vec<WindowSnapshot<'_>> = snapshots
+            .iter()
+            .map(|t| WindowSnapshot {
+                x: t.0,
+                y: t.1,
+                w: t.2,
+                h: t.3,
+                pixels: &t.4,
+                buf_w: t.5,
+                buf_h: t.6,
+            })
+            .collect();
         if let Some(img) = self.backdrop.try_synth(&snaps) {
-            if let Some(ui) = self.ui.as_ref() { ui.set_wallpaper_blurred(img); }
+            if let Some(ui) = self.ui.as_ref() {
+                ui.set_wallpaper_blurred(img);
+            }
         }
     }
 
@@ -2923,18 +4371,26 @@ impl CompositorApp {
         if let Some(ActiveDrag::Resize { toplevel_idx, .. }) = self.active_drag.clone() {
             if let Some(tl) = state.toplevels.get(toplevel_idx) {
                 let surface = tl.surface.clone();
-                let size = self.wm.id_for_surface(&surface)
+                let size = self
+                    .wm
+                    .id_for_surface(&surface)
                     .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
                     .map(|w| (w.w, w.h));
                 if let Some((cw, ch)) = size {
-                    let maybe_ts = state.xdg_shell_state.toplevel_surfaces().iter()
-                        .find(|ts| ts.wl_surface() == &surface).cloned();
+                    let maybe_ts = state
+                        .xdg_shell_state
+                        .toplevel_surfaces()
+                        .iter()
+                        .find(|ts| ts.wl_surface() == &surface)
+                        .cloned();
                     if let Some(toplevel) = maybe_ts {
                         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-                        toplevel.with_pending_state(|s: &mut smithay::wayland::shell::xdg::ToplevelState| {
-                            s.size = Some((cw, ch).into());
-                            s.states.unset(xdg_toplevel::State::Resizing);
-                        });
+                        toplevel.with_pending_state(
+                            |s: &mut smithay::wayland::shell::xdg::ToplevelState| {
+                                s.size = Some((cw, ch).into());
+                                s.states.unset(xdg_toplevel::State::Resizing);
+                            },
+                        );
                         toplevel.send_configure();
                         debug!("resize-end configure: {}×{} (Resizing cleared)", cw, ch);
                     }
@@ -2947,7 +4403,13 @@ impl CompositorApp {
     /// If the toplevel is currently snapped, restore it to its pre-snap rect
     /// at a position that keeps the cursor proportionally on the titlebar.
     /// Returns the (offset_x, offset_y) for the resulting Move drag.
-    fn maybe_unsnap_for_move(&mut self, state: &mut SpikeState, idx: usize, x: f64, y: f64) -> (f64, f64) {
+    fn maybe_unsnap_for_move(
+        &mut self,
+        state: &mut SpikeState,
+        idx: usize,
+        x: f64,
+        y: f64,
+    ) -> (f64, f64) {
         let t = match state.toplevels.get(idx) {
             Some(t) => t,
             None => return (0.0, 0.0),
@@ -2960,7 +4422,10 @@ impl CompositorApp {
             return (x - start_x, y - start_y);
         };
 
-        let restore = self.wm.windows.values()
+        let restore = self
+            .wm
+            .windows
+            .values()
             .find(|w| w.id == wm_id)
             .and_then(|w| w.pre_snap.map(|p| (p, w.x as f64, w.w as f64)));
 
@@ -2977,14 +4442,23 @@ impl CompositorApp {
                 tl_mut.x = new_x;
                 tl_mut.y = new_y;
             }
-            let maybe_ts = state.xdg_shell_state.toplevel_surfaces().iter()
-                .find(|ts| ts.wl_surface() == &surface).cloned();
+            let maybe_ts = state
+                .xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .find(|ts| ts.wl_surface() == &surface)
+                .cloned();
             if let Some(toplevel) = maybe_ts {
-                toplevel.with_pending_state(|s: &mut smithay::wayland::shell::xdg::ToplevelState| {
-                    s.size = Some((ow, oh).into());
-                });
+                toplevel.with_pending_state(
+                    |s: &mut smithay::wayland::shell::xdg::ToplevelState| {
+                        s.size = Some((ow, oh).into());
+                    },
+                );
                 toplevel.send_configure();
-                debug!("snap-out: restored to {}×{} at ({},{})", ow, oh, new_x, new_y);
+                debug!(
+                    "snap-out: restored to {}×{} at ({},{})",
+                    ow, oh, new_x, new_y
+                );
             }
             start_x = new_x as f64;
             start_y = new_y as f64;
@@ -3010,9 +4484,14 @@ impl CompositorApp {
                 self.update_cursor_position(x, y);
                 self.handle_pointer_update(state, x, y);
                 self.forward_pointer_motion(state, x, y);
-                if let Some(gw) = self.gpu_window.as_ref() { gw.mark_dirty(); }
+                if let Some(gw) = self.gpu_window.as_ref() {
+                    gw.mark_dirty();
+                }
             }
-            IpcCommand::PointerButton { button_evdev, pressed } => {
+            IpcCommand::PointerButton {
+                button_evdev,
+                pressed,
+            } => {
                 if button_evdev == 0x110 {
                     self.left_button_down = pressed;
                     if !pressed {
@@ -3026,28 +4505,52 @@ impl CompositorApp {
                 self.forward_pointer_button(state, button_evdev, pressed);
             }
             IpcCommand::KeyEvent { scancode, pressed } => {
-                self.pending_keys.lock().unwrap().push_back(PendingKeyEvent { scancode, pressed });
+                self.pending_keys
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingKeyEvent { scancode, pressed });
             }
             IpcCommand::TypeText { text } => {
                 let mut keys = self.pending_keys.lock().unwrap();
                 for ch in text.chars() {
                     if let Some((sc, shift)) = ascii_to_scancode(ch) {
                         if shift {
-                            keys.push_back(PendingKeyEvent { scancode: 42, pressed: true });
+                            keys.push_back(PendingKeyEvent {
+                                scancode: 42,
+                                pressed: true,
+                            });
                         }
-                        keys.push_back(PendingKeyEvent { scancode: sc, pressed: true });
-                        keys.push_back(PendingKeyEvent { scancode: sc, pressed: false });
+                        keys.push_back(PendingKeyEvent {
+                            scancode: sc,
+                            pressed: true,
+                        });
+                        keys.push_back(PendingKeyEvent {
+                            scancode: sc,
+                            pressed: false,
+                        });
                         if shift {
-                            keys.push_back(PendingKeyEvent { scancode: 42, pressed: false });
+                            keys.push_back(PendingKeyEvent {
+                                scancode: 42,
+                                pressed: false,
+                            });
                         }
                     }
                 }
             }
-            IpcCommand::Screenshot { save_path } => {
+            IpcCommand::Screenshot {
+                save_path,
+                response,
+            } => {
                 if let Err(e) = self.save_screenshot(&save_path) {
                     warn!("ipc: screenshot failed: {}", e);
+                    if let Some(response) = response {
+                        let _ = response.send(Err(e.to_string()));
+                    }
                 } else {
                     info!("ipc: screenshot saved to {}", save_path);
+                    if let Some(response) = response {
+                        let _ = response.send(Ok(save_path));
+                    }
                 }
             }
             IpcCommand::ActivateWindow { wm_id } => {
@@ -3061,30 +4564,57 @@ impl CompositorApp {
             }
             IpcCommand::MoveWindow { wm_id, x, y } => {
                 self.wm.set_position_by_id(wm_id, x, y);
-                if let Some(surf) = self.wm.windows.values().find(|w| w.id == wm_id).map(|w| w.surface.clone()) {
+                if let Some(surf) = self
+                    .wm
+                    .windows
+                    .values()
+                    .find(|w| w.id == wm_id)
+                    .map(|w| w.surface.clone())
+                {
                     if let Some(tl) = state.toplevels.iter_mut().find(|t| t.surface == surf) {
-                        tl.x = x; tl.y = y;
+                        tl.x = x;
+                        tl.y = y;
                     }
                 }
-                if let Some(gw) = self.gpu_window.as_ref() { gw.mark_dirty(); }
+                if let Some(gw) = self.gpu_window.as_ref() {
+                    gw.mark_dirty();
+                }
             }
             IpcCommand::ResizeWindow { wm_id, w, h } => {
-                let pos = self.wm.windows.values().find(|win| win.id == wm_id)
+                let pos = self
+                    .wm
+                    .windows
+                    .values()
+                    .find(|win| win.id == wm_id)
                     .map(|win| (win.x, win.y));
                 if let Some((wx, wy)) = pos {
                     self.wm.set_geometry_by_id(wm_id, wx, wy, w, h);
                 }
-                if let Some(surf) = self.wm.windows.values().find(|win| win.id == wm_id).map(|win| win.surface.clone()) {
-                    let maybe_ts = state.xdg_shell_state.toplevel_surfaces().iter()
-                        .find(|ts| ts.wl_surface() == &surf).cloned();
+                if let Some(surf) = self
+                    .wm
+                    .windows
+                    .values()
+                    .find(|win| win.id == wm_id)
+                    .map(|win| win.surface.clone())
+                {
+                    let maybe_ts = state
+                        .xdg_shell_state
+                        .toplevel_surfaces()
+                        .iter()
+                        .find(|ts| ts.wl_surface() == &surf)
+                        .cloned();
                     if let Some(toplevel) = maybe_ts {
-                        toplevel.with_pending_state(|s: &mut smithay::wayland::shell::xdg::ToplevelState| {
-                            s.size = Some((w, h).into());
-                        });
+                        toplevel.with_pending_state(
+                            |s: &mut smithay::wayland::shell::xdg::ToplevelState| {
+                                s.size = Some((w, h).into());
+                            },
+                        );
                         toplevel.send_configure();
                     }
                 }
-                if let Some(gw) = self.gpu_window.as_ref() { gw.mark_dirty(); }
+                if let Some(gw) = self.gpu_window.as_ref() {
+                    gw.mark_dirty();
+                }
             }
             IpcCommand::DumpWindows { save_path } => {
                 let mut entries: Vec<serde_json::Value> = Vec::new();
@@ -3110,7 +4640,7 @@ impl CompositorApp {
             IpcCommand::SetTheme { mode } => {
                 let want = match mode.to_ascii_lowercase().as_str() {
                     "light" => ThemeMode::Light,
-                    _       => ThemeMode::Dark,
+                    _ => ThemeMode::Dark,
                 };
                 if self.theme.current_mode != want {
                     self.theme.toggle_mode();
@@ -3126,13 +4656,17 @@ impl CompositorApp {
     pub fn save_screenshot(&self, save_path: &str) -> anyhow::Result<()> {
         // Read final_texture (post-chrome) so the screenshot matches what's
         // on display. Falls back to render_texture if final isn't allocated.
-        let render_tex = self.final_texture.as_ref()
+        let render_tex = self
+            .final_texture
+            .as_ref()
             .or(self.render_texture.as_ref())
             .ok_or_else(|| anyhow::anyhow!("no render texture yet"))?;
-        let gpu = self.gpu_window.as_ref()
+        let gpu = self
+            .gpu_window
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no gpu adapter"))?;
         let device = &gpu.wgpu_device;
-        let queue  = &gpu.wgpu_queue;
+        let queue = &gpu.wgpu_queue;
         let (w, h) = self.render_texture_size;
 
         // wgpu requires bytes_per_row to be a multiple of 256.
@@ -3165,16 +4699,23 @@ impl CompositorApp {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         queue.submit(std::iter::once(encoder.finish()));
 
         // Block until the copy is done + the buffer is mappable.
         let slice = buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        rx.recv().map_err(|e| anyhow::anyhow!("map_async channel: {}", e))?
+        rx.recv()
+            .map_err(|e| anyhow::anyhow!("map_async channel: {}", e))?
             .map_err(|e| anyhow::anyhow!("map_async failed: {:?}", e))?;
         let data = slice.get_mapped_range();
 
@@ -3188,16 +4729,14 @@ impl CompositorApp {
         buf.unmap();
 
         // Some swapchain formats are BGRA — swap channels if needed so PNG looks right.
-        if matches!(self.swapchain_format, Some(wgpu::TextureFormat::Bgra8Unorm))
-        {
+        if matches!(self.swapchain_format, Some(wgpu::TextureFormat::Bgra8Unorm)) {
             for px in rgba.chunks_exact_mut(4) {
                 px.swap(0, 2);
             }
         }
 
-        image::save_buffer(
-            save_path, &rgba, w, h, image::ColorType::Rgba8,
-        ).map_err(|e| anyhow::anyhow!("save_buffer: {}", e))?;
+        image::save_buffer(save_path, &rgba, w, h, image::ColorType::Rgba8)
+            .map_err(|e| anyhow::anyhow!("save_buffer: {}", e))?;
         Ok(())
     }
 
@@ -3207,9 +4746,14 @@ impl CompositorApp {
         if let Some(ui) = self.ui.as_ref() {
             ui.set_snap_preview_visible(false);
         }
-        let Some((wm_id, rect)) = self.pending_snap.take() else { return };
+        let Some((wm_id, rect)) = self.pending_snap.take() else {
+            return;
+        };
 
-        let surface = self.wm.windows.values()
+        let surface = self
+            .wm
+            .windows
+            .values()
             .find(|w| w.id == wm_id)
             .map(|w| w.surface.clone());
         let Some(surface) = surface else { return };
@@ -3227,14 +4771,21 @@ impl CompositorApp {
             win.anim.set_geometry_target(rect.x, rect.y, rect.w, rect.h);
         }
 
-        let maybe_ts = state.xdg_shell_state.toplevel_surfaces().iter()
-            .find(|ts| ts.wl_surface() == &surface).cloned();
+        let maybe_ts = state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|ts| ts.wl_surface() == &surface)
+            .cloned();
         if let Some(toplevel) = maybe_ts {
             toplevel.with_pending_state(|s: &mut smithay::wayland::shell::xdg::ToplevelState| {
                 s.size = Some((rect.w, rect.h).into());
             });
             toplevel.send_configure();
-            debug!("snap: configure {}×{} at ({},{})", rect.w, rect.h, rect.x, rect.y);
+            debug!(
+                "snap: configure {}×{} at ({},{})",
+                rect.w, rect.h, rect.x, rect.y
+            );
         }
         for tl in state.toplevels.iter_mut() {
             if tl.surface == surface {
@@ -3243,7 +4794,9 @@ impl CompositorApp {
                 break;
             }
         }
-        if let Some(gpu_window) = self.gpu_window.as_ref() { gpu_window.mark_dirty(); }
+        if let Some(gpu_window) = self.gpu_window.as_ref() {
+            gpu_window.mark_dirty();
+        }
     }
 
     /// Push the current cursor image to the Slint UI.
@@ -3282,12 +4835,48 @@ impl CompositorApp {
     pub fn apply_theme_to_slint(&self) {
         if let Some(ui) = self.ui.as_ref() {
             let token_mode = match self.theme.current_mode {
-                ThemeMode::Dark  => TokenMode::Dark,
+                ThemeMode::Dark => TokenMode::Dark,
                 ThemeMode::Light => TokenMode::Light,
             };
             ui.set_theme_mode(token_mode);
         }
     }
+
+    /// Push the popout calendar grid + month label for the currently
+    /// browsed month (today + `calendar_month_offset` months). Called
+    /// on the daily clock tick AND on every prev/next chevron click.
+    pub fn refresh_calendar(&self) {
+        let Some(ui) = self.ui.as_ref() else { return };
+        let today = chrono::Local::now().date_naive();
+        let displayed = add_months(today, self.calendar_month_offset);
+        ui.set_popout_calendar_month_text(SharedString::from(
+            displayed.format("%B %Y").to_string(),
+        ));
+        let cal = build_calendar_grid_for(displayed, today);
+        let model = std::rc::Rc::new(VecModel::from(cal));
+        ui.set_popout_calendar_days(slint::ModelRc::from(model));
+    }
+}
+
+/// Add `delta` months to `base`, clamping the day to whatever the
+/// destination month actually has (so e.g. Jan 31 + 1 month = Feb 28).
+fn add_months(base: chrono::NaiveDate, delta: i32) -> chrono::NaiveDate {
+    use chrono::{Datelike, NaiveDate};
+    let total = base.year() * 12 + (base.month() as i32 - 1) + delta;
+    let year = total.div_euclid(12);
+    let month = (total.rem_euclid(12) + 1) as u32;
+    let last_day = {
+        let next = if month == 12 {
+            NaiveDate::from_ymd_opt(year + 1, 1, 1)
+        } else {
+            NaiveDate::from_ymd_opt(year, month + 1, 1)
+        }
+        .expect("valid next month");
+        let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
+        (next - first).num_days() as u32
+    };
+    let day = base.day().min(last_day);
+    NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3305,22 +4894,33 @@ pub struct ResolvedDockEntry {
 /// trail days so every cell has a number — `is_other_month` flags the
 /// padding for muted rendering.
 fn build_calendar_grid(today: chrono::NaiveDate) -> Vec<crate::CalendarDay> {
+    build_calendar_grid_for(today, today)
+}
+
+/// Build a 42-cell grid for the month containing `displayed`. Today's
+/// cell is highlighted iff `today` falls within that month — when
+/// browsing prev/next via the popout chevrons, the highlight
+/// disappears and reappears as the user scrolls back.
+fn build_calendar_grid_for(
+    displayed: chrono::NaiveDate,
+    today: chrono::NaiveDate,
+) -> Vec<crate::CalendarDay> {
     use chrono::{Datelike, NaiveDate};
-    let year = today.year();
-    let month = today.month();
+    let year = displayed.year();
+    let month = displayed.month();
     let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
-    // chrono Mon=0..Sun=6 — matches our Mon-first layout.
     let lead = first.weekday().num_days_from_monday() as i64;
     let days_in_month: u32 = {
         let next_month = if month == 12 {
             NaiveDate::from_ymd_opt(year + 1, 1, 1)
         } else {
             NaiveDate::from_ymd_opt(year, month + 1, 1)
-        }.expect("valid next month");
+        }
+        .expect("valid next month");
         (next_month - first).num_days() as u32
     };
+    let highlight_today = today.year() == year && today.month() == month;
     let mut cells = Vec::with_capacity(42);
-    // Prev-month trail.
     let prev_last = first - chrono::Duration::days(1);
     let prev_total = prev_last.day();
     for i in 0..lead {
@@ -3331,15 +4931,13 @@ fn build_calendar_grid(today: chrono::NaiveDate) -> Vec<crate::CalendarDay> {
             is_other_month: true,
         });
     }
-    // This month.
     for d in 1..=days_in_month {
         cells.push(crate::CalendarDay {
             day_num: d as i32,
-            is_today: d == today.day(),
+            is_today: highlight_today && d == today.day(),
             is_other_month: false,
         });
     }
-    // Next-month trail to fill 42 cells.
     let mut trail = 1u32;
     while cells.len() < 42 {
         cells.push(crate::CalendarDay {
@@ -3362,18 +4960,16 @@ pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
 
         let icon = match &info.icon {
             Some(path) => desktop::load_icon(path),
-            None => {
-                desktop::generic_app_icon()
-                    .map(|p| desktop::load_icon(&p))
-                    .unwrap_or_default()
-            }
+            None => desktop::generic_app_icon()
+                .map(|p| desktop::load_icon(&p))
+                .unwrap_or_default(),
         };
 
         entries.push(ResolvedDockEntry {
             item: DockItem {
                 icon,
                 app_id: SharedString::from(app_id.as_str()),
-                name:   SharedString::from(info.name.as_str()),
+                name: SharedString::from(info.name.as_str()),
                 running: false,
                 focused: false,
                 pinned: true,
@@ -3386,7 +4982,8 @@ pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
         warn!("dock config produced no entries, using hardcoded fallback");
         for app_id in ["org.gnome.Nautilus", "org.mozilla.firefox", "kitty", "code"] {
             let info = desktop::resolve(app_id);
-            let icon = info.icon
+            let icon = info
+                .icon
                 .as_deref()
                 .map(desktop::load_icon)
                 .unwrap_or_default();
@@ -3394,7 +4991,7 @@ pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
                 item: DockItem {
                     icon,
                     app_id: SharedString::from(app_id),
-                    name:   SharedString::from(info.name.as_str()),
+                    name: SharedString::from(info.name.as_str()),
                     running: false,
                     focused: false,
                     pinned: true,
@@ -3412,10 +5009,11 @@ pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub fn run() -> Result<()> {
-    // 1. calloop
-    let mut calloop = EventLoop::<SpikeState>::try_new()
-        .context("failed to create calloop event loop")?;
-    let loop_signal = calloop.get_signal();
+    // 1. Wayland display/socket + calloop.
+    let wayland = WaylandRuntime::new()?;
+    let loop_signal = wayland.loop_signal.clone();
+    let display_handle = wayland.display_handle.clone();
+    let socket_name = wayland.socket_name.clone();
 
     // 2. wgpu instance/adapter/device/queue — ONE set, shared.
     let slint_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -3432,16 +5030,15 @@ pub fn run() -> Result<()> {
     .context("no wgpu adapter for Slint platform")?;
     info!("wgpu adapter: {}", slint_adapter.get_info().name);
 
-    let (slint_device, slint_queue) = pollster::block_on(slint_adapter.request_device(
-        &wgpu::DeviceDescriptor {
+    let (slint_device, slint_queue) =
+        pollster::block_on(slint_adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("compositor-slint-shared"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                .using_resolution(slint_adapter.limits()),
+            required_limits:
+                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(slint_adapter.limits()),
             ..Default::default()
-        },
-    ))
-    .context("failed to create shared wgpu device")?;
+        }))
+        .context("failed to create shared wgpu device")?;
 
     // 3. Slint GPU platform.
     let platform = CalloopPlatform::new(
@@ -3461,14 +5058,17 @@ pub fn run() -> Result<()> {
     let ui = Compositor::new().context("failed to create Compositor UI")?;
 
     ui.set_clock_text(SharedString::from(
-        chrono::Local::now().format("%H:%M:%S").to_string()
+        chrono::Local::now().format("%H:%M:%S").to_string(),
     ));
 
     // Wallpaper. If the resolved wallpaper is named *_light.* we also default
     // the theme to Light so the chrome matches the desktop's overall mood.
     let wallpaper_path = wallpaper::find_wallpaper_path();
     let mut start_in_light_mode = false;
-    match wallpaper_path.as_ref().and_then(|p| wallpaper::load_from_path(p)) {
+    match wallpaper_path
+        .as_ref()
+        .and_then(|p| wallpaper::load_from_path(p))
+    {
         Some(img) => {
             info!("setting wallpaper image");
             ui.set_wallpaper(img);
@@ -3483,7 +5083,8 @@ pub fn run() -> Result<()> {
             warn!("no wallpaper found on disk, using default #1e1e2e background");
         }
     }
-    if let Some(blurred) = wallpaper_path.as_ref()
+    if let Some(blurred) = wallpaper_path
+        .as_ref()
         .and_then(|p| wallpaper::load_blurred_from_path(p, 24.0))
     {
         ui.set_wallpaper_blurred(blurred);
@@ -3506,22 +5107,62 @@ pub fn run() -> Result<()> {
     {
         use crate::MenuItem;
         let items = vec![
-            MenuItem { id: 1, label: SharedString::from("New Folder"),
-                accelerator: SharedString::from("⇧⌘N"), separator: false, enabled: true },
-            MenuItem { id: 2, label: SharedString::from("Get Info"),
-                accelerator: SharedString::from("⌘I"), separator: false, enabled: false },
-            MenuItem { id: -1, label: SharedString::default(),
-                accelerator: SharedString::default(), separator: true, enabled: false },
-            MenuItem { id: 3, label: SharedString::from("Change Wallpaper…"),
-                accelerator: SharedString::default(), separator: false, enabled: true },
-            MenuItem { id: 4, label: SharedString::from("Toggle Theme"),
-                accelerator: SharedString::from("⌃T"), separator: false, enabled: true },
-            MenuItem { id: -1, label: SharedString::default(),
-                accelerator: SharedString::default(), separator: true, enabled: false },
-            MenuItem { id: 5, label: SharedString::from("Show Debug Overlay"),
-                accelerator: SharedString::from("⌃I"), separator: false, enabled: true },
-            MenuItem { id: 6, label: SharedString::from("About this DE"),
-                accelerator: SharedString::default(), separator: false, enabled: true },
+            MenuItem {
+                id: 1,
+                label: SharedString::from("New Folder"),
+                accelerator: SharedString::from("⇧⌘N"),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: 2,
+                label: SharedString::from("Get Info"),
+                accelerator: SharedString::from("⌘I"),
+                separator: false,
+                enabled: false,
+            },
+            MenuItem {
+                id: -1,
+                label: SharedString::default(),
+                accelerator: SharedString::default(),
+                separator: true,
+                enabled: false,
+            },
+            MenuItem {
+                id: 3,
+                label: SharedString::from("Change Wallpaper…"),
+                accelerator: SharedString::default(),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: 4,
+                label: SharedString::from("Toggle Theme"),
+                accelerator: SharedString::from("⌃T"),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: -1,
+                label: SharedString::default(),
+                accelerator: SharedString::default(),
+                separator: true,
+                enabled: false,
+            },
+            MenuItem {
+                id: 5,
+                label: SharedString::from("Show Debug Overlay"),
+                accelerator: SharedString::from("⌃I"),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: 6,
+                label: SharedString::from("About this DE"),
+                accelerator: SharedString::default(),
+                separator: false,
+                enabled: true,
+            },
         ];
         let model = std::rc::Rc::new(VecModel::from(items));
         ui.set_desktop_menu_items(slint::ModelRc::from(model));
@@ -3549,25 +5190,120 @@ pub fn run() -> Result<()> {
     {
         use crate::MenuItem;
         let items = vec![
-            MenuItem { id: 1, label: SharedString::from("Open New Window"),
-                accelerator: SharedString::default(), separator: false, enabled: true },
-            MenuItem { id: 2, label: SharedString::from("Show All Windows"),
-                accelerator: SharedString::default(), separator: false, enabled: true },
-            MenuItem { id: -1, label: SharedString::default(),
-                accelerator: SharedString::default(), separator: true, enabled: false },
-            MenuItem { id: 3, label: SharedString::from("Keep in Dock"),
-                accelerator: SharedString::default(), separator: false, enabled: false },
-            MenuItem { id: 4, label: SharedString::from("Show in Files"),
-                accelerator: SharedString::default(), separator: false, enabled: false },
-            MenuItem { id: -1, label: SharedString::default(),
-                accelerator: SharedString::default(), separator: true, enabled: false },
-            MenuItem { id: 5, label: SharedString::from("Quit"),
-                accelerator: SharedString::from("⌘Q"), separator: false, enabled: true },
+            MenuItem {
+                id: 1,
+                label: SharedString::from("Open New Window"),
+                accelerator: SharedString::default(),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: 2,
+                label: SharedString::from("Show All Windows"),
+                accelerator: SharedString::default(),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: -1,
+                label: SharedString::default(),
+                accelerator: SharedString::default(),
+                separator: true,
+                enabled: false,
+            },
+            MenuItem {
+                id: 3,
+                label: SharedString::from("Keep in Dock"),
+                accelerator: SharedString::default(),
+                separator: false,
+                enabled: false,
+            },
+            MenuItem {
+                id: 4,
+                label: SharedString::from("Show in Files"),
+                accelerator: SharedString::default(),
+                separator: false,
+                enabled: false,
+            },
+            MenuItem {
+                id: -1,
+                label: SharedString::default(),
+                accelerator: SharedString::default(),
+                separator: true,
+                enabled: false,
+            },
+            MenuItem {
+                id: 5,
+                label: SharedString::from("Quit"),
+                accelerator: SharedString::from("⌘Q"),
+                separator: false,
+                enabled: true,
+            },
         ];
         let model = std::rc::Rc::new(VecModel::from(items));
-        ui.set_dock_menu_items(slint::ModelRc::from(model));
+        let model_rc: slint::ModelRc<crate::MenuItem> = slint::ModelRc::from(model);
+        // Push the rendered height to slint so the icon-right-click
+        // flip-up math anchors the menu bottom at the cursor (slint
+        // can't easily count separators vs normal rows).
+        ui.set_dock_menu_h(compute_menu_height(&model_rc) as i32);
+        ui.set_dock_menu_items(model_rc);
     }
     // dock-menu-clicked is wired AFTER `exec_map` is built (just below).
+
+    // Window context menu (right-click on titlebar / Menu key). Static
+    // items; the WM id of the target window is held separately on the
+    // popup (`window-menu-target-id`) and routed back through the
+    // `window-menu-clicked(target_id, action_id)` callback.
+    {
+        use crate::MenuItem;
+        let items = vec![
+            MenuItem {
+                id: 1,
+                label: SharedString::from("Minimize"),
+                accelerator: SharedString::from("⌘M"),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: 2,
+                label: SharedString::from("Maximize"),
+                accelerator: SharedString::default(),
+                separator: false,
+                enabled: true,
+            },
+            MenuItem {
+                id: -1,
+                label: SharedString::default(),
+                accelerator: SharedString::default(),
+                separator: true,
+                enabled: false,
+            },
+            MenuItem {
+                id: 3,
+                label: SharedString::from("Close"),
+                accelerator: SharedString::from("⌘W"),
+                separator: false,
+                enabled: true,
+            },
+        ];
+        let model = std::rc::Rc::new(VecModel::from(items));
+        ui.set_window_menu_items(slint::ModelRc::from(model));
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_window_menu_clicked(move |target_id, action_id| {
+            let Some(ui) = weak.upgrade() else { return };
+            // Wire each action to the existing per-window callbacks the
+            // chrome buttons use, so we don't have to duplicate the
+            // pending-queue plumbing.
+            match action_id {
+                1 => ui.invoke_minimize_window(target_id),
+                2 => ui.invoke_maximize_window(target_id),
+                3 => ui.invoke_close_window(target_id),
+                _ => {}
+            }
+        });
+    }
 
     // Launch-app callback.
     let exec_map: std::collections::HashMap<String, String> = dock_entries
@@ -3597,24 +5333,38 @@ pub fn run() -> Result<()> {
     // the query verbatim through `sh -c` so users can also dispatch any
     // command-line invocation via Super+Space.
     {
-        let dock_entries_q = dock_entries.iter()
-            .map(|e| (e.item.app_id.to_string(), e.item.name.to_string(), e.exec.clone()))
+        let dock_entries_q = dock_entries
+            .iter()
+            .map(|e| {
+                (
+                    e.item.app_id.to_string(),
+                    e.item.name.to_string(),
+                    e.exec.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         ui.on_launcher_submit(move |q| {
             let query = q.trim().to_string();
-            if query.is_empty() { return; }
+            if query.is_empty() {
+                return;
+            }
             let lq = query.to_lowercase();
             // Find a pinned-app match by id or name prefix.
-            let exec = dock_entries_q.iter().find_map(|(id, name, exec)| {
-                if id.to_lowercase().contains(&lq)
-                   || name.to_lowercase().contains(&lq)
-                {
-                    Some(exec.clone())
-                } else { None }
-            }).unwrap_or(query);
+            let exec = dock_entries_q
+                .iter()
+                .find_map(|(id, name, exec)| {
+                    if id.to_lowercase().contains(&lq) || name.to_lowercase().contains(&lq) {
+                        Some(exec.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(query);
             tracing::info!("launcher: launching {:?}", exec);
             let _ = std::process::Command::new("sh")
-                .arg("-c").arg(&exec).spawn();
+                .arg("-c")
+                .arg(&exec)
+                .spawn();
         });
     }
 
@@ -3634,7 +5384,8 @@ pub fn run() -> Result<()> {
                         crate::tray::activate(
                             it.service.to_string(),
                             it.object_path.to_string(),
-                            0, 0,
+                            0,
+                            0,
                         );
                         break;
                     }
@@ -3665,7 +5416,9 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
-            let Some((service, object_path, cx, cy)) = endpoint else { return };
+            let Some((service, object_path, cx, cy)) = endpoint else {
+                return;
+            };
             let weak2 = weak.clone();
             crate::dbusmenu::fetch_layout(service, object_path, move |items| {
                 let weak3 = weak2.clone();
@@ -3673,36 +5426,44 @@ pub fn run() -> Result<()> {
                     let Some(ui) = weak3.upgrade() else { return };
                     use crate::MenuItem;
                     let mut row_id: i32 = 1_000_000;
-                    let menu_items: Vec<MenuItem> = items.into_iter().map(|it| {
-                        if it.separator {
-                            MenuItem {
-                                id: -1,
-                                label: SharedString::default(),
-                                accelerator: SharedString::default(),
-                                separator: true,
-                                enabled: false,
+                    let menu_items: Vec<MenuItem> = items
+                        .into_iter()
+                        .map(|it| {
+                            if it.separator {
+                                MenuItem {
+                                    id: -1,
+                                    label: SharedString::default(),
+                                    accelerator: SharedString::default(),
+                                    separator: true,
+                                    enabled: false,
+                                }
+                            } else {
+                                // The DBusMenu item id can be 0 (synthetic
+                                // root has 0; some apps reuse it). MenuItem
+                                // requires non-(-1) for clickable rows so
+                                // shift positive ids by an offset and stash
+                                // the real id in a side table — but we can
+                                // just trust the numeric id here as long as
+                                // it's not -1, which dbusmenu uses for "no
+                                // id". Map any negative or zero ids onto a
+                                // monotonically growing fallback so the
+                                // ContextMenu doesn't think they're separators.
+                                let id = if it.id <= 0 {
+                                    row_id += 1;
+                                    row_id - 1
+                                } else {
+                                    it.id
+                                };
+                                MenuItem {
+                                    id,
+                                    label: SharedString::from(it.label),
+                                    accelerator: SharedString::default(),
+                                    separator: false,
+                                    enabled: it.enabled,
+                                }
                             }
-                        } else {
-                            // The DBusMenu item id can be 0 (synthetic
-                            // root has 0; some apps reuse it). MenuItem
-                            // requires non-(-1) for clickable rows so
-                            // shift positive ids by an offset and stash
-                            // the real id in a side table — but we can
-                            // just trust the numeric id here as long as
-                            // it's not -1, which dbusmenu uses for "no
-                            // id". Map any negative or zero ids onto a
-                            // monotonically growing fallback so the
-                            // ContextMenu doesn't think they're separators.
-                            let id = if it.id <= 0 { row_id += 1; row_id - 1 } else { it.id };
-                            MenuItem {
-                                id,
-                                label: SharedString::from(it.label),
-                                accelerator: SharedString::default(),
-                                separator: false,
-                                enabled: it.enabled,
-                            }
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     let model = std::rc::Rc::new(VecModel::from(menu_items));
                     ui.set_tray_menu_items(slint::ModelRc::from(model));
                     // Position the popup just below + slightly right of
@@ -3754,8 +5515,7 @@ pub fn run() -> Result<()> {
                 1 => {
                     // Open New Window — fire the .desktop exec directly.
                     if let Some(exec) = exec_map_q.get(app_id.as_str()) {
-                        let _ = std::process::Command::new("sh")
-                            .arg("-c").arg(exec).spawn();
+                        let _ = std::process::Command::new("sh").arg("-c").arg(exec).spawn();
                     }
                 }
                 _ => {
@@ -3811,21 +5571,32 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // Calendar prev/next chevrons in the datetime popout — accumulate
+    // the month delta in an atomic int the main loop reads + applies
+    // to `app.calendar_month_offset`. Day-clicks are no-op stubs for
+    // now (placeholder for "open today's events"-style behaviour).
+    let pending_calendar_delta: Arc<std::sync::atomic::AtomicI32> =
+        Arc::new(std::sync::atomic::AtomicI32::new(0));
+    {
+        let d = pending_calendar_delta.clone();
+        ui.on_popout_calendar_prev(move || {
+            d.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    {
+        let d = pending_calendar_delta.clone();
+        ui.on_popout_calendar_next(move || {
+            d.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    ui.on_popout_calendar_day_clicked(|day| {
+        tracing::info!("calendar day clicked: {}", day);
+    });
+
     // ── Cursor: prime initial cursor image so overlay is visible on first frame.
     // We call this after the main loop starts via the CompositorApp init path.
     // The actual first render happens in resumed() → render_frame().
     info!("Slint GPU platform ready — production Compositor UI");
-
-    // 4. Wayland display + socket.
-    let display = Display::<SpikeState>::new()
-        .context("failed to create wayland display")?;
-    let display_handle = display.handle();
-
-    let socket_source = ListeningSocketSource::new_auto()
-        .context("failed to bind wayland socket")?;
-    let socket_name = socket_source.socket_name().to_os_string();
-    info!("Wayland socket: {:?}", socket_name);
-    println!("WAYLAND_DISPLAY={}", socket_name.to_string_lossy());
 
     // Wire launch-app now that the socket exists. Spawned apps inherit OUR
     // WAYLAND_DISPLAY so they connect to this compositor, not the host.
@@ -3839,7 +5610,11 @@ pub fn run() -> Result<()> {
                 let info = desktop::resolve(&app);
                 info.exec
             });
-            info!("  exec: {} (WAYLAND_DISPLAY={})", exec_line, socket_name.to_string_lossy());
+            info!(
+                "  exec: {} (WAYLAND_DISPLAY={})",
+                exec_line,
+                socket_name.to_string_lossy()
+            );
             let _ = std::process::Command::new("setsid")
                 .args(["-f", "sh", "-c", &exec_line])
                 .env("WAYLAND_DISPLAY", &socket_name)
@@ -3849,72 +5624,78 @@ pub fn run() -> Result<()> {
         });
     }
 
-    calloop
-        .handle()
-        .insert_source(
-            Generic::new(display, Interest::READ, CalloopMode::Level),
-            |_event, display, state| {
-                unsafe { display.get_mut().dispatch_clients(state)? };
-                Ok(PostAction::Continue)
-            },
-        )
-        .context("failed to insert wayland source")?;
-
-    calloop
-        .handle()
-        .insert_source(socket_source, |stream, _, state| {
-            state.display_handle
-                .insert_client(stream, Arc::new(ClientState::default()))
-                .unwrap();
-        })
-        .context("failed to insert socket source")?;
-
-    info!("Wayland socket ready");
-
     // 5. Compositor state + virtual output.
-    let mut state = SpikeState::new(display_handle.clone(), calloop.handle(), loop_signal.clone());
+    let mut calloop = wayland.event_loop;
+    let mut state = wayland.state;
 
     // Advertise DMA-BUF support to clients.  We advertise common 8-bit formats
     // with the LINEAR modifier; the GLES renderer (surfaceless EGL) will accept
     // any format that EGL/Mesa supports at runtime.  Clients that want
     // non-linear (tiled/compressed) formats will fall back to SHM.
     {
-        use smithay::backend::allocator::{Fourcc, Format, Modifier};
+        use smithay::backend::allocator::{Format, Fourcc, Modifier};
 
         // DrmModifier::Linear == 0
         let linear = Modifier::Linear;
         let formats: Vec<Format> = vec![
-            Format { code: Fourcc::Argb8888, modifier: linear },
-            Format { code: Fourcc::Xrgb8888, modifier: linear },
-            Format { code: Fourcc::Abgr8888, modifier: linear },
-            Format { code: Fourcc::Xbgr8888, modifier: linear },
+            Format {
+                code: Fourcc::Argb8888,
+                modifier: linear,
+            },
+            Format {
+                code: Fourcc::Xrgb8888,
+                modifier: linear,
+            },
+            Format {
+                code: Fourcc::Abgr8888,
+                modifier: linear,
+            },
+            Format {
+                code: Fourcc::Xbgr8888,
+                modifier: linear,
+            },
         ];
 
-        let _dmabuf_global = state.dmabuf_state.create_global::<SpikeState>(
-            &display_handle,
-            formats,
-        );
+        let _dmabuf_global = state
+            .dmabuf_state
+            .create_global::<SpikeState>(&display_handle, formats);
         info!("DMA-BUF global advertised (Option B: EGL/GLES two-stage import)");
     }
 
+    // wl_output.physical_size is MILLIMETRES, not pixels. Anvil computes
+    // this from the real monitor's EDID; on our virtual swapchain we
+    // approximate from the logical size assuming ~96 DPI (1 inch ≈ 25.4 mm,
+    // 96 px/in → 1 mm ≈ 3.78 px). Without this DPI-aware clients (Firefox,
+    // GNOME, libadwaita) infer a ridiculous DPI from `WIDTH mm` and either
+    // render at 50× their normal scale or refuse to scale at all.
+    let physical_w_mm = (WIDTH as f32 / 3.78).round() as i32;
+    let physical_h_mm = (HEIGHT as f32 / 3.78).round() as i32;
     let output = Output::new(
         "slint-gpu-output".to_owned(),
         PhysicalProperties {
-            size: (WIDTH as i32, HEIGHT as i32).into(),
+            size: (physical_w_mm, physical_h_mm).into(),
             subpixel: Subpixel::Unknown,
             make: "SlintGPU".into(),
             model: "Virtual".into(),
             serial_number: "0001".into(),
         },
     );
-    let mode = Mode { size: (WIDTH as i32, HEIGHT as i32).into(), refresh: 60_000 };
-    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+    let mode = Mode {
+        size: (WIDTH as i32, HEIGHT as i32).into(),
+        refresh: 60_000,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
     output.create_global::<SpikeState>(&display_handle);
-    // Stash the output on the compositor state so handlers can drive
+    // Register the output on the compositor state so handlers can drive
     // surface↔output binding (which is what triggers smithay to emit
     // wl_surface.preferred_buffer_scale / preferred_buffer_transform).
-    state.output = Some(output.clone());
+    state.register_output(output.clone());
 
     // 5b. XWayland — spawn the Xwayland binary so X11 clients can connect
     // through us. The X11Wm + X11 display number land on `state` via the
@@ -3923,11 +5704,13 @@ pub fn run() -> Result<()> {
     crate::wayland::xwayland::start_xwayland(&mut state);
 
     // 6. winit event loop.
-    let mut winit_event_loop = WinitEventLoop::new().context("failed to create winit event loop")?;
+    let mut winit_event_loop =
+        WinitEventLoop::new().context("failed to create winit event loop")?;
     winit_event_loop.set_control_flow(ControlFlow::Poll);
 
     let pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
     let mut app = CompositorApp::new(
         window_ref,
         ui,
@@ -3962,7 +5745,7 @@ pub fn run() -> Result<()> {
     app.update_cursor_overlay();
 
     // Wire the pending WM-action queues from Slint callbacks into the app.
-    app.pending_close    = pending_close;
+    app.pending_close = pending_close;
     app.pending_minimize = pending_minimize;
     app.pending_maximize = pending_maximize;
     app.pending_activate = pending_activate;
@@ -3972,11 +5755,15 @@ pub fn run() -> Result<()> {
     info!("Entering GPU compositor main loop");
     loop {
         match winit_event_loop.pump_app_events(Some(Duration::from_millis(1)), &mut app) {
-            PumpStatus::Exit(_) => { info!("winit exited"); break; }
+            PumpStatus::Exit(_) => {
+                info!("winit exited");
+                break;
+            }
             PumpStatus::Continue => {}
         }
 
-        calloop.dispatch(Some(Duration::ZERO), &mut state)
+        calloop
+            .dispatch(Some(Duration::ZERO), &mut state)
             .context("calloop dispatch error")?;
 
         // Drain any tray-host events accumulated since last tick; the
@@ -4000,7 +5787,9 @@ pub fn run() -> Result<()> {
         }
         if tray_changed {
             if let Some(ui) = app.ui.as_ref() {
-                let items: Vec<crate::TrayIconItem> = app.tray_items.iter()
+                let items: Vec<crate::TrayIconItem> = app
+                    .tray_items
+                    .iter()
                     .map(|t| crate::TrayIconItem {
                         id: t.id as i32,
                         title: SharedString::from(t.title.as_str()),
@@ -4010,8 +5799,7 @@ pub fn run() -> Result<()> {
                         } else {
                             // Resolve by icon-theme name (e.g. "telegram",
                             // "discord") via the existing desktop helper.
-                            desktop::load_icon_by_name(&t.icon_name)
-                                .unwrap_or_default()
+                            desktop::load_icon_by_name(&t.icon_name).unwrap_or_default()
                         },
                         service: SharedString::from(t.service.as_str()),
                         object_path: SharedString::from(t.object_path.as_str()),
@@ -4022,7 +5810,9 @@ pub fn run() -> Result<()> {
             }
         }
 
-        if state.should_exit { break; }
+        if state.should_exit {
+            break;
+        }
 
         // Refresh surface↔output bindings once per frame so newly-mapped
         // surfaces get a wl_surface.enter (and the matching
@@ -4039,40 +5829,9 @@ pub fn run() -> Result<()> {
         // them at the right rect.
         state.refresh_layer_layout(app.wm.output_w, app.wm.output_h);
         let reserved = state.reserved_zones();
-        app.wm.set_reserved_zones(reserved.top, reserved.bottom, reserved.left, reserved.right);
-        if let Some(ui) = app.ui.as_ref() {
-            use smithay::reexports::wayland_server::Resource;
-            use smithay::wayland::shell::wlr_layer::Layer;
-            let mut items: Vec<crate::LayerItem> = Vec::with_capacity(state.layer_surfaces.len());
-            for li in &state.layer_surfaces {
-                let pix = li.pixels.lock().unwrap();
-                if pix.width == 0 || pix.height == 0 || li.w <= 0 || li.h <= 0 {
-                    continue;
-                }
-                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                    &pix.pixels, pix.width, pix.height,
-                );
-                drop(pix);
-                let surface = slint::Image::from_rgba8_premultiplied(buf);
-                let ordinal: i32 = match li.layer {
-                    Layer::Background => 0,
-                    Layer::Bottom => 1,
-                    Layer::Top => 2,
-                    Layer::Overlay => 3,
-                };
-                items.push(crate::LayerItem {
-                    id: li.surface.wl_surface().id().protocol_id() as i32,
-                    surface,
-                    x: li.x,
-                    y: li.y,
-                    w: li.w,
-                    h: li.h,
-                    layer_ordinal: ordinal,
-                });
-            }
-            let model = std::rc::Rc::new(VecModel::from(items));
-            ui.set_layers(slint::ModelRc::from(model));
-        }
+        app.wm
+            .set_reserved_zones(reserved.top, reserved.bottom, reserved.left, reserved.right);
+        app.update_layers(&mut state);
         // ── END layer-shell layout block ───────────────────────────────────
 
         // Visibility gate: only frame-callback surfaces the renderer
@@ -4082,17 +5841,20 @@ pub fn run() -> Result<()> {
         // AND with a non-zero client buffer", plus all layer surfaces
         // (always visible if mapped). Without this gate every mapped
         // client gets driven at full output framerate even when invisible.
-        let mut visible_surfaces: Vec<WlSurface> = Vec::with_capacity(
-            app.wm.windows.len() + state.layer_surfaces.len()
-        );
+        let mut visible_surfaces: Vec<WlSurface> =
+            Vec::with_capacity(app.wm.windows.len() + state.layer_surfaces.len());
         for win in app.wm.windows_sorted() {
-            if win.minimized || win.closing { continue; }
+            if win.minimized || win.closing {
+                continue;
+            }
             if let Some(tl) = state.toplevels.iter().find(|t| t.surface == win.surface) {
                 let (bw, bh) = {
                     let p = tl.pixels.lock().unwrap();
                     (p.width, p.height)
                 };
-                if bw == 0 || bh == 0 { continue; }
+                if bw == 0 || bh == 0 {
+                    continue;
+                }
                 visible_surfaces.push(tl.surface.clone());
             }
         }
@@ -4145,7 +5907,24 @@ pub fn run() -> Result<()> {
                 app.theme.toggle_mode();
                 app.apply_theme_to_slint();
                 app.swap_wallpaper_for_current_mode();
-                info!("control-centre: toggled theme to {:?}", app.theme.current_mode);
+                info!(
+                    "control-centre: toggled theme to {:?}",
+                    app.theme.current_mode
+                );
+            }
+        }
+
+        // Calendar navigation — drain the prev/next chevron deltas
+        // accumulated since last tick, apply, and push the rebuilt
+        // grid back to slint.
+        {
+            let delta = pending_calendar_delta.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if delta != 0 {
+                app.calendar_month_offset += delta;
+                app.refresh_calendar();
+                if let Some(gpu) = app.gpu_window.as_ref() {
+                    gpu.mark_dirty();
+                }
             }
         }
 
@@ -4195,6 +5974,14 @@ pub fn run() -> Result<()> {
                             app.release_drag(&mut state);
                         }
                         app.forward_pointer_button(&mut state, button, pressed);
+                    }
+                    PendingPointerEvent::Axis {
+                        dx,
+                        dy,
+                        discrete_v120,
+                        is_wheel,
+                    } => {
+                        app.forward_pointer_axis(&mut state, dx, dy, discrete_v120, is_wheel);
                     }
                 }
             }
@@ -4249,6 +6036,21 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
         }
     }
 
+    // The WM places windows via `smart_cascade_position` (centres the first
+    // window, cascades the rest), but xdg_shell's `new_toplevel` seeded
+    // `ToplevelInfo.x/y` with its own naive cascade before the WM ran. Pull
+    // the WM's authoritative position back into ToplevelInfo so callers that
+    // read `tl.x/tl.y` (drag-offset computation, popup positioning) match the
+    // rendered/hit-tested position. Without this, the *first* drag on a freshly
+    // mapped window has its grab anchor offset by (wm_pos - cascade_seed).
+    for toplevel in &mut state.toplevels {
+        let key = toplevel.surface.id().protocol_id() as usize;
+        if let Some(win) = wm.windows.get(&key) {
+            toplevel.x = win.x;
+            toplevel.y = win.y;
+        }
+    }
+
     // Sync focus: if SpikeState has an active_surface that isn't the WM focus, align them.
     if let Some(active) = &state.active_surface {
         let key = active.id().protocol_id() as usize;
@@ -4262,6 +6064,32 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Menu sizing helper
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Compute the rendered height of a `ContextMenu` from its item list.
+///
+/// Matches `ContextMenu.slint`'s layout exactly:
+///   * separator row: 7 px
+///   * normal row: 28 px
+///   * outer chrome (6 px top + 6 px bottom padding around items-col): 12 px
+///
+/// Used by the right-click placement code so menus that have to flip up
+/// (cursor too close to the bottom of the screen) anchor their bottom
+/// edge AT the cursor, not 60–70 px above it. The previous hardcoded
+/// estimate of 260 px was systematically too tall.
+fn compute_menu_height(items_model: &slint::ModelRc<crate::MenuItem>) -> f64 {
+    let n = items_model.row_count();
+    let mut h = 12.0_f64; // top + bottom chrome padding
+    for i in 0..n {
+        if let Some(it) = items_model.row_data(i) {
+            h += if it.separator { 7.0 } else { 28.0 };
+        }
+    }
+    h.max(28.0 + 12.0)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Input forwarding
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -4272,7 +6100,10 @@ fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
     // the user could keep typing into a focused toplevel that's hidden
     // behind the lock — a textbook lock-screen bypass.
     let surface = if state.session_locked {
-        state.lock_surfaces.first().map(|li| li.surface.wl_surface().clone())
+        state
+            .lock_surfaces
+            .first()
+            .map(|li| li.surface.wl_surface().clone())
     } else {
         // ── BEGIN layer-shell keyboard-routing block ───────────────────
         // A mapped Top/Overlay layer surface with
@@ -4281,18 +6112,25 @@ fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
         // focused toplevel. OnDemand layer surfaces still rely on
         // active_surface being set by click-to-focus. None layer
         // surfaces never receive keys.
-        state.exclusive_keyboard_layer()
+        state
+            .exclusive_keyboard_layer()
             .cloned()
             .or_else(|| state.active_surface.clone())
         // ── END layer-shell keyboard-routing block ─────────────────────
     };
     let Some(surface) = surface else { return };
-    let Some(keyboard) = state.seat.get_keyboard() else { return };
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return;
+    };
     keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
     let serial = SERIAL_COUNTER.next_serial();
     let time = state.clock.now().as_millis() as u32;
     let keycode = Keycode::new(key_event.scancode + 8);
-    let ks = if key_event.pressed { KeyState::Pressed } else { KeyState::Released };
+    let ks = if key_event.pressed {
+        KeyState::Pressed
+    } else {
+        KeyState::Released
+    };
     keyboard.input_forward(state, keycode, ks, serial, time, false);
 }
 
@@ -4302,59 +6140,106 @@ fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
 fn ascii_to_scancode(ch: char) -> Option<(u32, bool)> {
     Some(match ch {
         // letters (lowercase + shifted uppercase)
-        'a' => (30, false), 'A' => (30, true),
-        'b' => (48, false), 'B' => (48, true),
-        'c' => (46, false), 'C' => (46, true),
-        'd' => (32, false), 'D' => (32, true),
-        'e' => (18, false), 'E' => (18, true),
-        'f' => (33, false), 'F' => (33, true),
-        'g' => (34, false), 'G' => (34, true),
-        'h' => (35, false), 'H' => (35, true),
-        'i' => (23, false), 'I' => (23, true),
-        'j' => (36, false), 'J' => (36, true),
-        'k' => (37, false), 'K' => (37, true),
-        'l' => (38, false), 'L' => (38, true),
-        'm' => (50, false), 'M' => (50, true),
-        'n' => (49, false), 'N' => (49, true),
-        'o' => (24, false), 'O' => (24, true),
-        'p' => (25, false), 'P' => (25, true),
-        'q' => (16, false), 'Q' => (16, true),
-        'r' => (19, false), 'R' => (19, true),
-        's' => (31, false), 'S' => (31, true),
-        't' => (20, false), 'T' => (20, true),
-        'u' => (22, false), 'U' => (22, true),
-        'v' => (47, false), 'V' => (47, true),
-        'w' => (17, false), 'W' => (17, true),
-        'x' => (45, false), 'X' => (45, true),
-        'y' => (21, false), 'Y' => (21, true),
-        'z' => (44, false), 'Z' => (44, true),
+        'a' => (30, false),
+        'A' => (30, true),
+        'b' => (48, false),
+        'B' => (48, true),
+        'c' => (46, false),
+        'C' => (46, true),
+        'd' => (32, false),
+        'D' => (32, true),
+        'e' => (18, false),
+        'E' => (18, true),
+        'f' => (33, false),
+        'F' => (33, true),
+        'g' => (34, false),
+        'G' => (34, true),
+        'h' => (35, false),
+        'H' => (35, true),
+        'i' => (23, false),
+        'I' => (23, true),
+        'j' => (36, false),
+        'J' => (36, true),
+        'k' => (37, false),
+        'K' => (37, true),
+        'l' => (38, false),
+        'L' => (38, true),
+        'm' => (50, false),
+        'M' => (50, true),
+        'n' => (49, false),
+        'N' => (49, true),
+        'o' => (24, false),
+        'O' => (24, true),
+        'p' => (25, false),
+        'P' => (25, true),
+        'q' => (16, false),
+        'Q' => (16, true),
+        'r' => (19, false),
+        'R' => (19, true),
+        's' => (31, false),
+        'S' => (31, true),
+        't' => (20, false),
+        'T' => (20, true),
+        'u' => (22, false),
+        'U' => (22, true),
+        'v' => (47, false),
+        'V' => (47, true),
+        'w' => (17, false),
+        'W' => (17, true),
+        'x' => (45, false),
+        'X' => (45, true),
+        'y' => (21, false),
+        'Y' => (21, true),
+        'z' => (44, false),
+        'Z' => (44, true),
         // digits + shifted symbols (US layout)
-        '1' => (2, false),  '!' => (2, true),
-        '2' => (3, false),  '@' => (3, true),
-        '3' => (4, false),  '#' => (4, true),
-        '4' => (5, false),  '$' => (5, true),
-        '5' => (6, false),  '%' => (6, true),
-        '6' => (7, false),  '^' => (7, true),
-        '7' => (8, false),  '&' => (8, true),
-        '8' => (9, false),  '*' => (9, true),
-        '9' => (10, false), '(' => (10, true),
-        '0' => (11, false), ')' => (11, true),
+        '1' => (2, false),
+        '!' => (2, true),
+        '2' => (3, false),
+        '@' => (3, true),
+        '3' => (4, false),
+        '#' => (4, true),
+        '4' => (5, false),
+        '$' => (5, true),
+        '5' => (6, false),
+        '%' => (6, true),
+        '6' => (7, false),
+        '^' => (7, true),
+        '7' => (8, false),
+        '&' => (8, true),
+        '8' => (9, false),
+        '*' => (9, true),
+        '9' => (10, false),
+        '(' => (10, true),
+        '0' => (11, false),
+        ')' => (11, true),
         // punctuation
-        '-'  => (12, false), '_' => (12, true),
-        '='  => (13, false), '+' => (13, true),
-        '['  => (26, false), '{' => (26, true),
-        ']'  => (27, false), '}' => (27, true),
-        '\\' => (43, false), '|' => (43, true),
-        ';'  => (39, false), ':' => (39, true),
-        '\'' => (40, false), '"' => (40, true),
-        '`'  => (41, false), '~' => (41, true),
-        ','  => (51, false), '<' => (51, true),
-        '.'  => (52, false), '>' => (52, true),
-        '/'  => (53, false), '?' => (53, true),
+        '-' => (12, false),
+        '_' => (12, true),
+        '=' => (13, false),
+        '+' => (13, true),
+        '[' => (26, false),
+        '{' => (26, true),
+        ']' => (27, false),
+        '}' => (27, true),
+        '\\' => (43, false),
+        '|' => (43, true),
+        ';' => (39, false),
+        ':' => (39, true),
+        '\'' => (40, false),
+        '"' => (40, true),
+        '`' => (41, false),
+        '~' => (41, true),
+        ',' => (51, false),
+        '<' => (51, true),
+        '.' => (52, false),
+        '>' => (52, true),
+        '/' => (53, false),
+        '?' => (53, true),
         // whitespace
-        ' '  => (57, false),  // space
-        '\n' => (28, false),  // enter
-        '\t' => (15, false),  // tab
+        ' ' => (57, false),  // space
+        '\n' => (28, false), // enter
+        '\t' => (15, false), // tab
         _ => return None,
     })
 }

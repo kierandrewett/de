@@ -47,9 +47,9 @@ use tracing::debug;
 
 /// A simple 200 ms ease-in-out tween for a scalar value in [0, 1].
 struct EaseTween {
-    from:     f32,
-    to:       f32,
-    elapsed:  Duration,
+    from: f32,
+    to: f32,
+    elapsed: Duration,
     duration: Duration,
 }
 
@@ -57,7 +57,12 @@ impl EaseTween {
     const DURATION: Duration = Duration::from_millis(200);
 
     fn new(from: f32, to: f32) -> Self {
-        Self { from, to, elapsed: Duration::ZERO, duration: Self::DURATION }
+        Self {
+            from,
+            to,
+            elapsed: Duration::ZERO,
+            duration: Self::DURATION,
+        }
     }
 
     /// Advance by `dt`, return the current interpolated value.
@@ -108,7 +113,7 @@ impl ThemeMode {
     /// Target value for `mode_t`.
     pub fn mode_t(self) -> f32 {
         match self {
-            ThemeMode::Dark  => 0.0,
+            ThemeMode::Dark => 0.0,
             ThemeMode::Light => 1.0,
         }
     }
@@ -125,7 +130,10 @@ struct AutoConfig {
 
 impl Default for AutoConfig {
     fn default() -> Self {
-        Self { auto_times: None, explicit_mode: None }
+        Self {
+            auto_times: None,
+            explicit_mode: None,
+        }
     }
 }
 
@@ -161,14 +169,33 @@ fn parse_theme_json(text: &str) -> AutoConfig {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
         let mode_str = v.get("mode").and_then(|m| m.as_str()).unwrap_or("dark");
         match mode_str {
-            "light" => return AutoConfig { auto_times: None, explicit_mode: Some(ThemeMode::Light) },
-            "dark"  => return AutoConfig { auto_times: None, explicit_mode: Some(ThemeMode::Dark) },
-            "auto"  => {
-                let sunrise_str = v.get("auto_sunrise").and_then(|s| s.as_str()).unwrap_or("06:00");
-                let sunset_str  = v.get("auto_sunset").and_then(|s| s.as_str()).unwrap_or("18:00");
+            "light" => {
+                return AutoConfig {
+                    auto_times: None,
+                    explicit_mode: Some(ThemeMode::Light),
+                }
+            }
+            "dark" => {
+                return AutoConfig {
+                    auto_times: None,
+                    explicit_mode: Some(ThemeMode::Dark),
+                }
+            }
+            "auto" => {
+                let sunrise_str = v
+                    .get("auto_sunrise")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("06:00");
+                let sunset_str = v
+                    .get("auto_sunset")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("18:00");
                 let sunrise_h = parse_hour(sunrise_str).unwrap_or(6);
-                let sunset_h  = parse_hour(sunset_str).unwrap_or(18);
-                return AutoConfig { auto_times: Some((sunrise_h, sunset_h)), explicit_mode: None };
+                let sunset_h = parse_hour(sunset_str).unwrap_or(18);
+                return AutoConfig {
+                    auto_times: Some((sunrise_h, sunset_h)),
+                    explicit_mode: None,
+                };
             }
             _ => {}
         }
@@ -211,7 +238,12 @@ impl ThemeState {
         let initial_t = initial_mode.mode_t();
         Self {
             current_mode: initial_mode,
-            mode_tween: EaseTween { from: initial_t, to: initial_t, elapsed: EaseTween::DURATION, duration: EaseTween::DURATION },
+            mode_tween: EaseTween {
+                from: initial_t,
+                to: initial_t,
+                elapsed: EaseTween::DURATION,
+                duration: EaseTween::DURATION,
+            },
             window_tweens: HashMap::new(),
             focus_values: HashMap::new(),
             mode_t: initial_t,
@@ -224,7 +256,7 @@ impl ThemeState {
     /// Toggle between dark and light mode, triggering a 200 ms crossfade.
     pub fn toggle_mode(&mut self) {
         let new_mode = match self.current_mode {
-            ThemeMode::Dark  => ThemeMode::Light,
+            ThemeMode::Dark => ThemeMode::Light,
             ThemeMode::Light => ThemeMode::Dark,
         };
         self.set_mode(new_mode);
@@ -245,11 +277,16 @@ impl ThemeState {
     /// Starts a 200 ms ease-in-out crossfade on that window's focus_t.
     pub fn set_window_focused(&mut self, window_id: i32, focused: bool) {
         let target = if focused { 1.0_f32 } else { 0.0_f32 };
-        let current = self.focus_values.get(&window_id).copied().unwrap_or(if focused { 0.0 } else { 1.0 });
+        let current = self
+            .focus_values
+            .get(&window_id)
+            .copied()
+            .unwrap_or(if focused { 0.0 } else { 1.0 });
         if (current - target).abs() < 0.001 {
             return; // already there
         }
-        self.window_tweens.insert(window_id, EaseTween::new(current, target));
+        self.window_tweens
+            .insert(window_id, EaseTween::new(current, target));
     }
 
     /// Remove tracking for a window (called when window closes).
@@ -270,7 +307,11 @@ impl ThemeState {
             let hour = chrono::Local::now().hour();
             let hour = hour as u8;
             let is_day = hour >= sunrise_h && hour < sunset_h;
-            let expected = if is_day { ThemeMode::Light } else { ThemeMode::Dark };
+            let expected = if is_day {
+                ThemeMode::Light
+            } else {
+                ThemeMode::Dark
+            };
             if expected != self.current_mode {
                 self.set_mode(expected);
             }
@@ -364,7 +405,8 @@ mod tests {
 
     #[test]
     fn parse_theme_json_auto() {
-        let cfg = parse_theme_json(r#"{"mode":"auto","auto_sunrise":"07:00","auto_sunset":"19:00"}"#);
+        let cfg =
+            parse_theme_json(r#"{"mode":"auto","auto_sunrise":"07:00","auto_sunset":"19:00"}"#);
         assert_eq!(cfg.auto_times, Some((7, 19)));
     }
 }

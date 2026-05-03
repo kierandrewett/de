@@ -34,26 +34,28 @@ use tracing::info;
 // `slint/Compositor.slint`.
 slint::include_modules!();
 
-mod wayland_state;
-mod wayland;
+mod backend;
 mod platform;
 mod renderer;
+mod wayland;
+mod wayland_runtime;
+mod wayland_state;
 // chrome_shader retired in favour of `mod render` (separate single-purpose
 // passes). The old src/chrome_shader.rs + shaders/chrome.wgsl files remain on
 // disk for reference but are no longer compiled.
-mod theme;
-mod wallpaper;
-mod desktop;
+mod backdrop;
 mod cursor;
 mod cursor_render;
-mod resize;
-mod snap;
-mod backdrop;
-mod ipc_server;
-mod tray;
 mod dbusmenu;
+mod desktop;
+mod ipc_server;
 mod render;
+mod resize;
 mod screencopy;
+mod snap;
+mod theme;
+mod tray;
+mod wallpaper;
 pub mod wm;
 
 fn main() -> Result<()> {
@@ -64,6 +66,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    info!("starting compositor-slint");
-    renderer::run()
+    let backend_kind = backend::BackendKind::from_env_and_args()?;
+    info!(?backend_kind, "starting compositor-slint");
+    backend::run(backend_kind)
 }

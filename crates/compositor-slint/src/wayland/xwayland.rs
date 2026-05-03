@@ -162,35 +162,40 @@ pub fn start_xwayland(state: &mut SpikeState) {
     };
 
     let display_handle = state.display_handle.clone();
-    let result = state.loop_handle.insert_source(xwayland, move |event, _, data| match event {
-        XWaylandEvent::Ready { x11_socket, display_number } => {
-            info!("XWayland: ready, display=:{display_number}");
-            // Make :N visible to the rest of the compositor + any child
-            // processes we spawn (their env is inherited from us).
-            // SAFETY: single-threaded compositor at this point — calloop
-            // dispatches main-thread callbacks serially.
-            unsafe { std::env::set_var("DISPLAY", format!(":{display_number}")) };
-
-            match X11Wm::start_wm(
-                data.loop_handle.clone(),
-                &display_handle,
+    let result = state
+        .loop_handle
+        .insert_source(xwayland, move |event, _, data| match event {
+            XWaylandEvent::Ready {
                 x11_socket,
-                client.clone(),
-            ) {
-                Ok(wm) => {
-                    data.xwm = Some(wm);
-                    data.xdisplay = Some(display_number);
-                    info!("XWayland: X11Wm attached on :{display_number}");
+                display_number,
+            } => {
+                info!("XWayland: ready, display=:{display_number}");
+                // Make :N visible to the rest of the compositor + any child
+                // processes we spawn (their env is inherited from us).
+                // SAFETY: single-threaded compositor at this point — calloop
+                // dispatches main-thread callbacks serially.
+                unsafe { std::env::set_var("DISPLAY", format!(":{display_number}")) };
+
+                match X11Wm::start_wm(
+                    data.loop_handle.clone(),
+                    &display_handle,
+                    x11_socket,
+                    client.clone(),
+                ) {
+                    Ok(wm) => {
+                        data.xwm = Some(wm);
+                        data.xdisplay = Some(display_number);
+                        info!("XWayland: X11Wm attached on :{display_number}");
+                    }
+                    Err(e) => warn!("XWayland: X11Wm::start_wm failed: {e}"),
                 }
-                Err(e) => warn!("XWayland: X11Wm::start_wm failed: {e}"),
             }
-        }
-        XWaylandEvent::Error => {
-            warn!("XWayland: process exited unexpectedly");
-            data.xwm = None;
-            data.xdisplay = None;
-        }
-    });
+            XWaylandEvent::Error => {
+                warn!("XWayland: process exited unexpectedly");
+                data.xwm = None;
+                data.xdisplay = None;
+            }
+        });
     if let Err(e) = result {
         warn!("XWayland: failed to insert calloop source: {e}");
     }
@@ -205,12 +210,7 @@ impl XWaylandShellHandler for SpikeState {
         &mut self.xwayland_shell_state
     }
 
-    fn surface_associated(
-        &mut self,
-        _xwm: XwmId,
-        wl_surface: WlSurface,
-        x11_surface: X11Surface,
-    ) {
+    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, x11_surface: X11Surface) {
         // The wl_surface for this X11 window has just been resolved. If we
         // saw `map_window_request` first (no wl_surface available) we
         // never registered the toplevel; do it now.
@@ -240,6 +240,7 @@ impl XWaylandShellHandler for SpikeState {
             x,
             y,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             csd: !x11_surface.is_decorated(),
         });
         // OR windows aren't focusable / managed — they piggyback on the
@@ -327,10 +328,7 @@ impl XwmHandler for SpikeState {
         // `mapped_override_redirect_window` / on first commit. For a
         // managed window with a known wl_surface we go ahead and track.
         if let Some(wl_surface) = window.wl_surface() {
-            let already_tracked = self
-                .toplevels
-                .iter()
-                .any(|t| t.surface == wl_surface);
+            let already_tracked = self.toplevels.iter().any(|t| t.surface == wl_surface);
             if !already_tracked {
                 let cascade = self.toplevels.len() as i32;
                 let x = 100 + cascade * 40;
@@ -342,6 +340,7 @@ impl XwmHandler for SpikeState {
                     x,
                     y,
                     pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+                    surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     csd: !window.is_decorated(),
                 });
                 self.active_surface = Some(wl_surface.clone());
@@ -379,18 +378,13 @@ impl XwmHandler for SpikeState {
         // Tag the X11Surface so the renderer's WM-sync skips it (we don't
         // want OR windows in `WindowManager::windows`) and `update_windows`
         // routes its pixels through the popup pipeline instead.
-        window
-            .user_data()
-            .insert_if_missing(|| X11OverrideRedirect);
+        window.user_data().insert_if_missing(|| X11OverrideRedirect);
 
         // Track the surface in `state.toplevels` so the SHM/dmabuf import
         // path on `commit` (in wayland/compositor.rs) finds it and fills its
         // pixel buffer — that's the same buffer the popup pipeline reads.
         if let Some(wl_surface) = window.wl_surface() {
-            let already_tracked = self
-                .toplevels
-                .iter()
-                .any(|t| t.surface == wl_surface);
+            let already_tracked = self.toplevels.iter().any(|t| t.surface == wl_surface);
             if !already_tracked {
                 self.toplevels.push(ToplevelInfo {
                     surface: wl_surface.clone(),
@@ -401,6 +395,7 @@ impl XwmHandler for SpikeState {
                     x: geo.loc.x,
                     y: geo.loc.y,
                     pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+                    surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     // OR windows always paint everything they need themselves
                     // — never add SSD chrome.
                     csd: true,
@@ -421,10 +416,7 @@ impl XwmHandler for SpikeState {
             self.destroyed_surfaces.push(wl_surface.clone());
             self.toplevels.retain(|t| t.surface != wl_surface);
             if self.active_surface.as_ref() == Some(&wl_surface) {
-                self.active_surface = self
-                    .toplevels
-                    .last()
-                    .map(|t| t.surface.clone());
+                self.active_surface = self.toplevels.last().map(|t| t.surface.clone());
             }
         }
         if !window.is_override_redirect() {
@@ -438,10 +430,7 @@ impl XwmHandler for SpikeState {
             self.destroyed_surfaces.push(wl_surface.clone());
             self.toplevels.retain(|t| t.surface != wl_surface);
             if self.active_surface.as_ref() == Some(&wl_surface) {
-                self.active_surface = self
-                    .toplevels
-                    .last()
-                    .map(|t| t.surface.clone());
+                self.active_surface = self.toplevels.last().map(|t| t.surface.clone());
             }
         }
     }
@@ -489,7 +478,11 @@ impl XwmHandler for SpikeState {
         _button: u32,
         edges: X11ResizeEdge,
     ) {
-        debug!("X11: resize_request id={:?} edges={:?}", window.window_id(), edges);
+        debug!(
+            "X11: resize_request id={:?} edges={:?}",
+            window.window_id(),
+            edges
+        );
         if let Some(wl_surface) = window.wl_surface() {
             // Map the X11 resize edge to our internal `ResizeEdge`. The bit
             // values aren't identical between protocols but the semantics are.
@@ -559,10 +552,18 @@ impl XwmHandler for SpikeState {
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
         match property {
             WmWindowProperty::Title => {
-                debug!("X11: title -> {:?} (id={:?})", window.title(), window.window_id());
+                debug!(
+                    "X11: title -> {:?} (id={:?})",
+                    window.title(),
+                    window.window_id()
+                );
             }
             WmWindowProperty::Class => {
-                debug!("X11: class -> {:?} (id={:?})", window.class(), window.window_id());
+                debug!(
+                    "X11: class -> {:?} (id={:?})",
+                    window.class(),
+                    window.window_id()
+                );
             }
             WmWindowProperty::TransientFor => {
                 // Re-resolve: the parent may have only just been mapped, or

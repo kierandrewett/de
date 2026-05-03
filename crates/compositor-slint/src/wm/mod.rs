@@ -31,17 +31,28 @@ pub const DEFAULT_WINDOW_W: i32 = 800;
 pub const DEFAULT_WINDOW_H: i32 = 600;
 
 /// Spring stiffness for open/close/min/max animations.
-/// Tuned for a macOS-feel: ~250 ms total animation with no overshoot.
-pub const SPRING_STIFFNESS: f64 = 200.0;
+///
+/// Calibrated against the panel/popout cubic-bezier (160 ms duration).
+/// Critically-damped spring with stiffness ω² has 99 %-settle time
+/// `5 / ω`; ω = √700 ≈ 26.5 rad/s gives ~190 ms. Reads as the same
+/// "snappy without bounce" beat the panels use.
+///
+/// Bumped from 200 (≈ 350 ms) — that felt sluggish next to the
+/// panels and made every window open look like it was easing into
+/// place from a long way off.
+pub const SPRING_STIFFNESS: f64 = 700.0;
 /// Damping ratio. 1.0 = critically damped (no bounce, smooth ease-out feel).
 pub const SPRING_DAMPING: f64 = 1.0;
 /// Spring settle epsilon.
 pub const SPRING_EPSILON: f64 = 0.001;
 
-/// Open animation start scale (window scales from this to 1.0 as it opens).
-pub const OPEN_SCALE_FROM: f64 = 0.85;
-/// Close animation end scale.
-pub const CLOSE_SCALE_TO: f64 = 0.85;
+/// Open animation start scale. Bumped 0.85 → 0.94 to match the
+/// panels' subtler 0.95 scale-from — windows are big enough that a
+/// 15 % shrink read as "popping in from far away" instead of "easing
+/// in".
+pub const OPEN_SCALE_FROM: f64 = 0.94;
+/// Close animation end scale — mirrors `OPEN_SCALE_FROM` for symmetry.
+pub const CLOSE_SCALE_TO: f64 = 0.94;
 /// Minimize animation end scale.
 pub const MINIMIZE_SCALE_TO: f64 = 0.40;
 
@@ -186,7 +197,14 @@ impl WindowAnimState {
         let mut geo_h = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
         geo_h.set_instant(h as f64);
 
-        Self { opacity, scale, geo_x, geo_y, geo_w, geo_h }
+        Self {
+            opacity,
+            scale,
+            geo_x,
+            geo_y,
+            geo_w,
+            geo_h,
+        }
     }
 
     pub fn tick(&mut self, dt: f64) {
@@ -224,10 +242,18 @@ impl WindowAnimState {
     }
 
     /// Current interpolated geometry.
-    pub fn current_x(&self) -> i32 { self.geo_x.value() as i32 }
-    pub fn current_y(&self) -> i32 { self.geo_y.value() as i32 }
-    pub fn current_w(&self) -> i32 { self.geo_w.value().max(1.0) as i32 }
-    pub fn current_h(&self) -> i32 { self.geo_h.value().max(1.0) as i32 }
+    pub fn current_x(&self) -> i32 {
+        self.geo_x.value() as i32
+    }
+    pub fn current_y(&self) -> i32 {
+        self.geo_y.value() as i32
+    }
+    pub fn current_w(&self) -> i32 {
+        self.geo_w.value().max(1.0) as i32
+    }
+    pub fn current_h(&self) -> i32 {
+        self.geo_h.value().max(1.0) as i32
+    }
 }
 
 // ── WindowState ────────────────────────────────────────────────────────────────
@@ -295,7 +321,15 @@ pub struct WindowState {
 }
 
 impl WindowState {
-    pub fn new(id: i32, surface: WlSurface, x: i32, y: i32, w: i32, h: i32, z_order: usize) -> Self {
+    pub fn new(
+        id: i32,
+        surface: WlSurface,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        z_order: usize,
+    ) -> Self {
         // Spring at PARKED start values (target = current, done = true).
         // start_open() is fired from the renderer when the first buffer
         // commits so the user sees the animation play.
@@ -311,7 +345,14 @@ impl WindowState {
         geo_w.set_instant(w as f64);
         let mut geo_h = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
         geo_h.set_instant(h as f64);
-        let anim = WindowAnimState { opacity, scale, geo_x, geo_y, geo_w, geo_h };
+        let anim = WindowAnimState {
+            opacity,
+            scale,
+            geo_x,
+            geo_y,
+            geo_w,
+            geo_h,
+        };
 
         Self {
             id,
@@ -364,7 +405,8 @@ impl WindowState {
         self.pre_minimize = Some((self.x, self.y, self.w, self.h));
         self.anim.opacity.set_target(0.0);
         self.anim.scale.set_target(MINIMIZE_SCALE_TO);
-        self.anim.set_geometry_target(self.x + self.w / 4, dock_target_y, self.w / 2, self.h / 2);
+        self.anim
+            .set_geometry_target(self.x + self.w / 4, dock_target_y, self.w / 2, self.h / 2);
         self.minimized = true;
         self.phase = AnimPhase::Minimized;
     }
@@ -435,7 +477,10 @@ impl WindowState {
     /// Advance springs by `dt` seconds; returns true when the open phase settles.
     pub fn tick(&mut self, dt: f64) {
         self.anim.tick(dt);
-        if self.phase == AnimPhase::Opening && self.anim.opacity.is_done() && self.anim.scale.is_done() {
+        if self.phase == AnimPhase::Opening
+            && self.anim.opacity.is_done()
+            && self.anim.scale.is_done()
+        {
             self.phase = AnimPhase::Open;
         }
         if self.phase == AnimPhase::Restoring && self.anim.is_settled() {
@@ -558,9 +603,20 @@ impl WindowManager {
         let key = Self::key(&surface);
         // Spring stays parked until the renderer sees the first buffer commit
         // and calls start_open() — keeps the open animation visible.
-        let win = WindowState::new(id, surface.clone(), x, y, DEFAULT_WINDOW_W, DEFAULT_WINDOW_H, z);
+        let win = WindowState::new(
+            id,
+            surface.clone(),
+            x,
+            y,
+            DEFAULT_WINDOW_W,
+            DEFAULT_WINDOW_H,
+            z,
+        );
 
-        info!("WM: add window id={} key={} at ({},{}) z={}", id, key, x, y, z);
+        info!(
+            "WM: add window id={} key={} at ({},{}) z={}",
+            id, key, x, y, z
+        );
         self.windows.insert(key, win);
         self.focus_stack.push(key);
         id
@@ -626,7 +682,9 @@ impl WindowManager {
 
     /// Begin close by window ID.
     pub fn begin_close_by_id(&mut self, id: i32) {
-        let key = self.windows.iter()
+        let key = self
+            .windows
+            .iter()
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
@@ -686,7 +744,9 @@ impl WindowManager {
 
     /// Focus a window by its stable ID.
     pub fn focus_by_id(&mut self, id: i32) {
-        let key = self.windows.iter()
+        let key = self
+            .windows
+            .iter()
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
@@ -724,7 +784,10 @@ impl WindowManager {
 
     /// Look up the currently focused surface.
     pub fn focused_surface(&self) -> Option<WlSurface> {
-        self.focus_stack.last().and_then(|k| self.windows.get(k)).map(|w| w.surface.clone())
+        self.focus_stack
+            .last()
+            .and_then(|k| self.windows.get(k))
+            .map(|w| w.surface.clone())
     }
 
     /// Look up the currently focused window's stable ID.
@@ -736,7 +799,8 @@ impl WindowManager {
     /// `app_id` matches `target` exactly. Used by the dock context menu's
     /// "Show All Windows" / "Quit" actions.
     pub fn ids_for_app(&self, target: &str) -> Vec<i32> {
-        self.windows.values()
+        self.windows
+            .values()
             .filter(|w| !w.closing && w.app_id == target)
             .map(|w| w.id)
             .collect()
@@ -770,8 +834,7 @@ impl WindowManager {
             // Visual chrome footprint = client's geom rect (excludes CSD
             // shadow padding) + our titlebar for SSD.
             let total_w = win.geom_w.max(1) as f64;
-            let total_h = win.geom_h.max(1) as f64
-                + if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let total_h = win.geom_h.max(1) as f64 + if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
             if x >= wx && x < wx + total_w && y >= wy && y < wy + total_h {
                 if best.map_or(true, |(_, z)| win.z_order > z) {
                     best = Some((key, win.z_order));
@@ -798,7 +861,9 @@ impl WindowManager {
     /// Begin minimize.
     pub fn minimize_by_id(&mut self, id: i32) {
         let dock_target_y = self.output_h - DOCK_HEIGHT;
-        let key = self.windows.iter()
+        let key = self
+            .windows
+            .iter()
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
@@ -812,7 +877,9 @@ impl WindowManager {
 
     /// Restore (un-minimize) by ID.
     pub fn restore_by_id(&mut self, id: i32) {
-        let key = self.windows.iter()
+        let key = self
+            .windows
+            .iter()
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
@@ -838,7 +905,9 @@ impl WindowManager {
 
     /// Toggle maximize/restore for a window by ID.
     pub fn toggle_maximize_by_id(&mut self, id: i32) {
-        let key = self.windows.iter()
+        let key = self
+            .windows
+            .iter()
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
@@ -862,7 +931,11 @@ impl WindowManager {
     /// Snap a window's position to (x, y) immediately (no animation).
     /// Called during a title-bar drag so the visual follows the pointer 1:1.
     pub fn set_position_by_id(&mut self, id: i32, x: i32, y: i32) {
-        let key = self.windows.iter().find(|(_, w)| w.id == id).map(|(&k, _)| k);
+        let key = self
+            .windows
+            .iter()
+            .find(|(_, w)| w.id == id)
+            .map(|(&k, _)| k);
         if let Some(key) = key {
             if let Some(win) = self.windows.get_mut(&key) {
                 win.x = x;
@@ -876,7 +949,11 @@ impl WindowManager {
     /// Snap a window's full geometry to (x, y, w, h) immediately. Used during
     /// edge/corner resize drags.
     pub fn set_geometry_by_id(&mut self, id: i32, x: i32, y: i32, w: i32, h: i32) {
-        let key = self.windows.iter().find(|(_, w)| w.id == id).map(|(&k, _)| k);
+        let key = self
+            .windows
+            .iter()
+            .find(|(_, w)| w.id == id)
+            .map(|(&k, _)| k);
         if let Some(key) = key {
             if let Some(win) = self.windows.get_mut(&key) {
                 win.x = x;
@@ -945,9 +1022,13 @@ impl WindowManager {
     /// returned so wl_pointer events route to the right surface; the
     /// toplevel itself only wins when nothing else covers the point.
     pub fn surface_under(&self, x: f64, y: f64) -> Option<(WlSurface, f64, f64)> {
-        use smithay::wayland::compositor::{with_surface_tree_downward, SubsurfaceCachedState, TraversalAction};
-        use smithay::backend::renderer::utils::with_renderer_surface_state;
+        use smithay::desktop::utils::under_from_surface_tree;
+        use smithay::desktop::WindowSurfaceType;
+        use smithay::utils::Point;
 
+        // ── Topmost-window pick ─────────────────────────────────────────
+        // Pure rectangular hit-test on visible chrome. Picks the highest
+        // z_order window whose chrome rect contains (x, y).
         let mut best: Option<(usize, usize)> = None;
         for (&key, win) in &self.windows {
             if win.closing || (win.minimized && win.anim.is_settled()) {
@@ -966,86 +1047,74 @@ impl WindowManager {
         }
         let (key, _) = best?;
         let win = self.windows.get(&key)?;
-        let wx = win.anim.current_x() as f64;
         let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
         let wy = win.anim.current_y() as f64 + titlebar;
-        let chrome_local_x = x - wx;
         let chrome_local_y = y - wy;
-        // Pointer is in the SSD titlebar zone — handled by the chrome, not
-        // forwarded to the client.
+        // SSD titlebar — handled by Slint chrome, not forwarded to client.
         if chrome_local_y < 0.0 {
             return None;
         }
-        // Buffer-space position the user is pointing at.
-        let buffer_x = chrome_local_x + win.geom_x as f64;
-        let buffer_y = chrome_local_y + win.geom_y as f64;
 
-        // Walk the toplevel's subsurface tree and find the topmost wl_surface
-        // whose buffer rect contains the pointer. wayland clients expect
-        // pointer events at the surface ACTUALLY under the cursor (toplevel
-        // OR subsurface), with surface-local coords.
+        // ── Subsurface tree walk via smithay's reference helper ─────────
+        // `under_from_surface_tree` walks the surface tree using each
+        // surface's `surface_view` (which folds together: subsurface
+        // location, `wl_surface.offset()` buffer_delta, viewporter dst
+        // crop, and buffer_scale). Our own hand-rolled walk only read
+        // `SubsurfaceCachedState.location`, so:
+        //   - animated subsurface offsets via `wl_surface.offset()` were
+        //     ignored (animated cursors / sprite sheets / parallax),
+        //   - viewporter-cropped subsurfaces were hit-tested at the wrong
+        //     buffer coords,
+        //   - HiDPI subsurfaces with `set_buffer_scale` landed events at
+        //     half/double position.
         //
-        // Two-pass like import_shm_buffer: collect (surface, offset) inside
-        // the traversal, then resolve each surface's buffer dims OUTSIDE.
-        // Calling with_renderer_surface_state INSIDE the tree walk holds
-        // surface-state locks on top of the locks the walk itself already
-        // owns — that deadlocks the wayland thread.
-        let mut surfaces_and_offsets: Vec<(WlSurface, (i32, i32), u32)> = Vec::new();
-        let mut depth: u32 = 0;
-        with_surface_tree_downward(
+        // The toplevel surface anchors at:
+        //   x = win.x - geom_x
+        //   y = win.y + titlebar - geom_y    ← SSD must add the titlebar
+        //                                      because the wayland surface
+        //                                      starts BELOW our chrome's
+        //                                      titlebar; the buffer (0, 0)
+        //                                      sits there. Forgetting the
+        //                                      titlebar offset here makes
+        //                                      every motion event Y the
+        //                                      client receives look 33 px
+        //                                      lower than the actual host
+        //                                      cursor — wing's pointer
+        //                                      trail leads ~33 px below
+        //                                      the real I-beam.
+        // `WindowSurfaceType::ALL` includes both toplevel and subsurfaces.
+        let toplevel_origin = Point::<i32, smithay::utils::Logical>::from((
+            (win.anim.current_x() - win.geom_x) as i32,
+            (win.anim.current_y() as f64 + titlebar - win.geom_y as f64) as i32,
+        ));
+        let hit = under_from_surface_tree(
             &win.surface,
-            (0i32, 0i32),
-            |sub, states, parent_offset| {
-                let mut my_offset = *parent_offset;
-                if sub != &win.surface {
-                    let mut sub_state = states.cached_state.get::<SubsurfaceCachedState>();
-                    let loc = sub_state.current().location;
-                    my_offset.0 += loc.x;
-                    my_offset.1 += loc.y;
-                }
-                TraversalAction::DoChildren(my_offset)
-            },
-            |sub, _, parent_offset| {
-                depth += 1;
-                surfaces_and_offsets.push((sub.clone(), *parent_offset, depth));
-            },
-            |_, _, _| true,
+            Point::from((x, y)),
+            toplevel_origin,
+            WindowSurfaceType::ALL,
         );
 
-        // Pass 2 — find topmost surface whose buffer rect contains the point.
-        let mut deepest: Option<(WlSurface, f64, f64, u32)> = None;
-        for (sub, off, d) in &surfaces_and_offsets {
-            let (sw, sh) = with_renderer_surface_state(sub, |st| {
-                st.buffer_size().map(|sz| (sz.w, sz.h)).unwrap_or((0, 0))
-            }).unwrap_or((0, 0));
-            if sw == 0 || sh == 0 { continue; }
-            let sx = off.0 as f64;
-            let sy = off.1 as f64;
-            let lx = buffer_x - sx;
-            let ly = buffer_y - sy;
-            if lx >= 0.0 && lx < sw as f64 && ly >= 0.0 && ly < sh as f64 {
-                deepest = Some((sub.clone(), lx, ly, *d));
-            }
-        }
-
-        let (focus_surface, local_x, local_y, target_depth) = match deepest {
-            Some(h) => h,
-            // No subsurface contained the point — fall back to the toplevel.
-            None => (win.surface.clone(), buffer_x, buffer_y, 0),
+        // smithay's `under_from_surface_tree` returns
+        // (surface, surface_origin_in_compositor_space). That's exactly
+        // what `pointer.motion` wants as `focus.1`. If the helper returns
+        // None (point outside any surface's input region), fall back to
+        // the toplevel anchor — keeps cursor focus on the window even when
+        // the buffer's input region is sparse, which matches what most
+        // compositors do for "click on shadow padding" cases.
+        let hit_subsurface = hit.is_some();
+        let (focus_surface, origin_x, origin_y) = match hit {
+            Some((s, p)) => (s, p.x as f64, p.y as f64),
+            None => (
+                win.surface.clone(),
+                toplevel_origin.x as f64,
+                toplevel_origin.y as f64,
+            ),
         };
-
         debug!(
-            "surface_under: ptr=({:.1},{:.1}) win={} chrome=({},{}) chrome_local=({:.1},{:.1}) geom=({},{},{},{}) csd={} buffer=({:.1},{:.1}) target_depth={} -> local=({:.1},{:.1})",
-            x, y, win.id,
-            win.anim.current_x(), win.anim.current_y(),
-            chrome_local_x, chrome_local_y,
-            win.geom_x, win.geom_y, win.geom_w, win.geom_h,
-            win.csd,
-            buffer_x, buffer_y,
-            target_depth,
-            local_x, local_y,
+            "surface_under: ptr=({:.1},{:.1}) win={} csd={} hit_subsurface={} origin=({:.1},{:.1})",
+            x, y, win.id, win.csd, hit_subsurface, origin_x, origin_y,
         );
-        Some((focus_surface, local_x, local_y))
+        Some((focus_surface, origin_x, origin_y))
     }
 
     /// Return windows sorted by z_order (ascending = back to front) for rendering.
@@ -1059,8 +1128,14 @@ impl WindowManager {
 
     /// Start alt-tab cycling. Returns the ID of the next window to preview.
     pub fn alt_tab_start(&mut self) -> Option<i32> {
-        let visible_count = self.focus_stack.iter()
-            .filter(|&&k| self.windows.get(&k).map_or(false, |w| !w.minimized && !w.closing))
+        let visible_count = self
+            .focus_stack
+            .iter()
+            .filter(|&&k| {
+                self.windows
+                    .get(&k)
+                    .map_or(false, |w| !w.minimized && !w.closing)
+            })
             .count();
         if visible_count < 2 {
             return None;
@@ -1069,7 +1144,10 @@ impl WindowManager {
         let idx = self.focus_stack.len().saturating_sub(2);
         self.alt_tab_idx = Some(idx);
         self.update_alt_tab_selection();
-        self.focus_stack.get(idx).and_then(|k| self.windows.get(k)).map(|w| w.id)
+        self.focus_stack
+            .get(idx)
+            .and_then(|k| self.windows.get(k))
+            .map(|w| w.id)
     }
 
     /// Step to the next window in alt-tab order.
@@ -1078,12 +1156,15 @@ impl WindowManager {
         if len == 0 {
             return None;
         }
-        let idx = self.alt_tab_idx.map_or(0, |i| {
-            if i == 0 { len - 1 } else { i - 1 }
-        });
+        let idx = self
+            .alt_tab_idx
+            .map_or(0, |i| if i == 0 { len - 1 } else { i - 1 });
         self.alt_tab_idx = Some(idx);
         self.update_alt_tab_selection();
-        self.focus_stack.get(idx).and_then(|k| self.windows.get(k)).map(|w| w.id)
+        self.focus_stack
+            .get(idx)
+            .and_then(|k| self.windows.get(k))
+            .map(|w| w.id)
     }
 
     /// Commit alt-tab: focus the currently selected window.
@@ -1111,7 +1192,8 @@ impl WindowManager {
     }
 
     fn update_alt_tab_selection(&mut self) {
-        let selected_key = self.alt_tab_idx
+        let selected_key = self
+            .alt_tab_idx
             .and_then(|i| self.focus_stack.get(i))
             .copied();
         for (&k, win) in &mut self.windows {

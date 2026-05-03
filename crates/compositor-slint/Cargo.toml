@@ -12,7 +12,13 @@ edition = "2021"
 # Wayland compositor plumbing
 smithay = { git = "https://github.com/Smithay/smithay.git", features = [
     "wayland_frontend",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
     "renderer_gl",
+    "renderer_multi",
     "use_system_lib",
     "backend_egl",
     "desktop",
@@ -53,6 +59,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+libc = "0.2"
 
 # bytemuck — safe bytes casting for wgpu uniform buffers
 bytemuck = { version = "1", features = ["derive"] }

@@ -116,7 +116,16 @@ export component Panel {
             clock-touch := TouchArea {
                 width: parent.width;
                 height: parent.height;
-                clicked => { root.toggle-datetime-popout(); }
+                // Open on mouse-DOWN so the popout follows immediately,
+                // matching how macOS / GNOME open menus on press. Using
+                // `clicked` waits for mouse-up which feels laggy for a
+                // peek-style overlay.
+                pointer-event(e) => {
+                    if (e.button == PointerEventButton.left
+                        && e.kind == PointerEventKind.down) {
+                        root.toggle-datetime-popout();
+                    }
+                }
             }
 
             // Hover bg — fills the clock-zone exactly so there's no visible
@@ -175,7 +184,13 @@ export component Panel {
             cc-touch := TouchArea {
                 width: parent.width;
                 height: parent.height;
-                clicked => { root.toggle-control-centre(); }
+                // Mouse-DOWN — see clock-touch for rationale.
+                pointer-event(e) => {
+                    if (e.button == PointerEventButton.left
+                        && e.kind == PointerEventKind.down) {
+                        root.toggle-control-centre();
+                    }
+                }
             }
 
             Rectangle {

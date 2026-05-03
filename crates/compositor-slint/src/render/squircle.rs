@@ -18,9 +18,13 @@ pub struct SquircleClipPass {
 impl SquircleClipPass {
     pub fn new(shared: &Shared) -> Self {
         let pipeline = make_pipeline(
-            &shared.device, &shared.bgl,
-            "squircle-clip", SHADER_SRC, "fs_main",
-            shared.format, Some(blend_src_over_premul()),
+            &shared.device,
+            &shared.bgl,
+            "squircle-clip",
+            SHADER_SRC,
+            "fs_main",
+            shared.format,
+            Some(blend_src_over_premul()),
         );
         Self { pipeline }
     }
@@ -28,11 +32,11 @@ impl SquircleClipPass {
     /// Run the clip pass — blends the squircle-masked scene into the target.
     pub fn render(
         &self,
-        shared:          &Shared,
-        encoder:         &mut wgpu::CommandEncoder,
-        scene_view:      &wgpu::TextureView,
-        target_view:     &wgpu::TextureView,
-        dynamic_offset:  u32,
+        shared: &Shared,
+        encoder: &mut wgpu::CommandEncoder,
+        scene_view: &wgpu::TextureView,
+        target_view: &wgpu::TextureView,
+        dynamic_offset: u32,
     ) {
         let bg = shared.make_bind_group("squircle-clip-bg", scene_view);
         let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -42,7 +46,7 @@ impl SquircleClipPass {
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load:  wgpu::LoadOp::Load,
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],

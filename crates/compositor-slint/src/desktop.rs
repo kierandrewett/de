@@ -45,7 +45,9 @@ struct SvgCache {
 
 impl SvgCache {
     fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 }
 
@@ -127,16 +129,36 @@ impl Default for DockConfig {
         // for visual testing of the dock with a richer line-up.
         Self {
             pinned: vec![
-                PinnedApp { app_id: "org.gnome.Nautilus".into() },
-                PinnedApp { app_id: "org.mozilla.firefox".into() },
-                PinnedApp { app_id: "org.gnome.Geary".into() },
-                PinnedApp { app_id: "org.gnome.Calendar".into() },
-                PinnedApp { app_id: "kitty".into() },
-                PinnedApp { app_id: "code".into() },
-                PinnedApp { app_id: "org.gnome.Music".into() },
-                PinnedApp { app_id: "org.gnome.Settings".into() },
-                PinnedApp { app_id: "org.gnome.Calculator".into() },
-                PinnedApp { app_id: "org.gnome.TextEditor".into() },
+                PinnedApp {
+                    app_id: "org.gnome.Nautilus".into(),
+                },
+                PinnedApp {
+                    app_id: "org.mozilla.firefox".into(),
+                },
+                PinnedApp {
+                    app_id: "org.gnome.Geary".into(),
+                },
+                PinnedApp {
+                    app_id: "org.gnome.Calendar".into(),
+                },
+                PinnedApp {
+                    app_id: "kitty".into(),
+                },
+                PinnedApp {
+                    app_id: "code".into(),
+                },
+                PinnedApp {
+                    app_id: "org.gnome.Music".into(),
+                },
+                PinnedApp {
+                    app_id: "org.gnome.Settings".into(),
+                },
+                PinnedApp {
+                    app_id: "org.gnome.Calculator".into(),
+                },
+                PinnedApp {
+                    app_id: "org.gnome.TextEditor".into(),
+                },
             ],
         }
     }
@@ -342,8 +364,7 @@ pub fn resolve_icon(icon_name: &str) -> Option<PathBuf> {
 
 /// Generic icon to use when no app-specific icon resolved.
 pub fn generic_app_icon() -> Option<PathBuf> {
-    resolve_icon("application-x-executable")
-        .or_else(|| resolve_icon("application-x-generic"))
+    resolve_icon("application-x-executable").or_else(|| resolve_icon("application-x-generic"))
 }
 
 /// Resolve a freedesktop icon name (e.g. "telegram", "discord",
@@ -371,9 +392,8 @@ pub fn load_icon(icon_path: &Path) -> slint::Image {
         // Rasterise via resvg at the dock icon size.
         match rasterise_svg(icon_path, DOCK_ICON_SIZE) {
             Some((bytes, w, h)) => {
-                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                    &bytes, w, h,
-                );
+                let buf =
+                    slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&bytes, w, h);
                 debug!("SVG icon {:?} rasterised at {}×{}", icon_path, w, h);
                 return slint::Image::from_rgba8_premultiplied(buf);
             }
@@ -383,8 +403,14 @@ pub fn load_icon(icon_path: &Path) -> slint::Image {
                     // Prefer larger sizes first — Slint downscales smoothly
                     // but upscaling a 32×32 PNG to fill a 60 px slot looks
                     // pixelated. 256 → 128 → 64 → 48 → 32 fallback chain.
-                    for size in &["256x256/apps", "128x128/apps", "96x96/apps",
-                                  "64x64/apps", "48x48/apps", "32x32/apps"] {
+                    for size in &[
+                        "256x256/apps",
+                        "128x128/apps",
+                        "96x96/apps",
+                        "64x64/apps",
+                        "48x48/apps",
+                        "32x32/apps",
+                    ] {
                         for root in &[
                             PathBuf::from("/usr/share/icons/hicolor"),
                             PathBuf::from("/usr/share/icons/Adwaita"),
@@ -398,7 +424,10 @@ pub fn load_icon(icon_path: &Path) -> slint::Image {
                         }
                     }
                 }
-                debug!("SVG icon {:?} could not be rasterised and no PNG fallback found", icon_path);
+                debug!(
+                    "SVG icon {:?} could not be rasterised and no PNG fallback found",
+                    icon_path
+                );
             }
         }
     } else if let Some(img) = load_raster(icon_path) {

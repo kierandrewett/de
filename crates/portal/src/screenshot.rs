@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use zbus::interface;
-use zvariant::{OwnedValue, Str, Value};
+use zvariant::{ObjectPath, OwnedValue, Str, Value};
 
 use ipc::ScreenRegion;
 
@@ -57,7 +57,7 @@ impl ScreenshotPortal {
     /// Take a screenshot of the full desktop (or a region if `interactive`).
     async fn screenshot(
         &self,
-        _handle: &str,
+        _handle: ObjectPath<'_>,
         _app_id: &str,
         _parent_window: &str,
         options: HashMap<String, OwnedValue>,
@@ -86,7 +86,7 @@ impl ScreenshotPortal {
     /// Pick a color from the screen.
     async fn pick_color(
         &self,
-        _handle: &str,
+        _handle: ObjectPath<'_>,
         _app_id: &str,
         _parent_window: &str,
         _options: HashMap<String, OwnedValue>,

@@ -14,6 +14,7 @@ use smithay::{
     },
     utils::Point,
     wayland::{
+        pointer_warp::PointerWarpHandler,
         security_context::{
             SecurityContext, SecurityContextHandler, SecurityContextListenerSource,
         },
@@ -22,14 +23,12 @@ use smithay::{
             ToplevelSurface,
         },
         xdg_activation::{
-            XdgActivationHandler, XdgActivationState, XdgActivationToken,
-            XdgActivationTokenData,
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
         xdg_foreign::{XdgForeignHandler, XdgForeignState},
         xdg_system_bell::XdgSystemBellHandler,
         xdg_toplevel_icon::XdgToplevelIconHandler,
         xdg_toplevel_tag::XdgToplevelTagHandler,
-        pointer_warp::PointerWarpHandler,
     },
 };
 use tracing::debug;
@@ -67,7 +66,8 @@ impl XdgActivationHandler for SpikeState {
         if token_data.serial.is_none() {
             tracing::debug!(
                 "xdg-activation: dropping blind token (no input serial) for app_id={:?} token={:?}",
-                token_data.app_id, token,
+                token_data.app_id,
+                token,
             );
             return;
         }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use zbus::interface;
-use zvariant::{OwnedValue, Str, Value};
+use zvariant::{ObjectPath, OwnedValue, Str, Value};
 
 /// Active ScreenCast session state.
 #[derive(Debug, Default)]
@@ -51,6 +51,8 @@ impl ScreenCastPortal {
     /// Create a new ScreenCast session.
     async fn create_session(
         &self,
+        _handle: ObjectPath<'_>,
+        _app_id: &str,
         options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
         let token = options
@@ -68,17 +70,16 @@ impl ScreenCastPortal {
         tracing::info!(%handle, "ScreenCast session created");
 
         let mut results: HashMap<String, OwnedValue> = HashMap::new();
-        results.insert(
-            "session_handle".into(),
-            OwnedValue::from(Str::from(handle)),
-        );
+        results.insert("session_handle".into(), OwnedValue::from(Str::from(handle)));
         Ok((0, results))
     }
 
     /// Select which sources (monitors / windows) the client can capture.
     async fn select_sources(
         &self,
+        _handle: ObjectPath<'_>,
         session_handle: zvariant::ObjectPath<'_>,
+        _app_id: &str,
         options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
         let handle = session_handle.as_str().to_owned();
@@ -116,7 +117,9 @@ impl ScreenCastPortal {
     /// Returns `(1, {})` until PipeWire integration is implemented.
     async fn start(
         &self,
+        _handle: ObjectPath<'_>,
         session_handle: zvariant::ObjectPath<'_>,
+        _app_id: &str,
         _parent_window: &str,
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {

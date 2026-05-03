@@ -29,10 +29,10 @@
 //!   * DBusMenu fetch + popup rendering not yet wired (clients open
 //!     their own popup in response to ContextMenu for now).
 
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use zbus::{interface, fdo, Connection, names::BusName, zvariant::OwnedObjectPath};
+use zbus::{fdo, interface, names::BusName, zvariant::OwnedObjectPath, Connection};
 
 /// One tracked StatusNotifierItem.
 #[derive(Debug, Clone)]
@@ -88,9 +88,7 @@ impl WatcherIface {
         // (starts with `/`) the actual bus name comes from the message
         // sender — that's the canonical "registering by path" case.
         let (bus_name, object_path) = if service.starts_with('/') {
-            let sender = hdr.sender()
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
             (sender, service.to_string())
         } else {
             (service.to_string(), "/StatusNotifierItem".to_string())
@@ -114,9 +112,11 @@ impl WatcherIface {
         // Fetch the item's properties (best-effort; defaults if anything
         // fails so we still show *something* in the tray).
         let title = read_str_property(&bus_name, &object_path, "Title")
-            .await.unwrap_or_default();
+            .await
+            .unwrap_or_default();
         let icon_name = read_str_property(&bus_name, &object_path, "IconName")
-            .await.unwrap_or_default();
+            .await
+            .unwrap_or_default();
 
         let item = TrayItem {
             id,
@@ -125,8 +125,13 @@ impl WatcherIface {
             title,
             icon_name,
         };
-        tracing::info!("tray: registered {} (id={}) title={:?} icon={:?}",
-            item.service, item.id, item.title, item.icon_name);
+        tracing::info!(
+            "tray: registered {} (id={}) title={:?} icon={:?}",
+            item.service,
+            item.id,
+            item.title,
+            item.icon_name
+        );
         let _ = self.events_tx.send(TrayEvent::Added(item));
         Ok(())
     }
@@ -153,7 +158,9 @@ impl WatcherIface {
     }
 
     #[zbus(property)]
-    fn protocol_version(&self) -> i32 { 0 }
+    fn protocol_version(&self) -> i32 {
+        0
+    }
 
     #[zbus(signal)]
     async fn status_notifier_item_registered(
@@ -178,7 +185,8 @@ impl WatcherIface {
 pub fn activate(bus: String, path: String, x: i32, y: i32) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all().build()
+            .enable_all()
+            .build()
         {
             Ok(r) => r,
             Err(_) => return,
@@ -188,12 +196,16 @@ pub fn activate(bus: String, path: String, x: i32, y: i32) {
                 if let Ok(bus_name) = BusName::try_from(bus) {
                     if let Ok(obj_path) = OwnedObjectPath::try_from(path.as_str()) {
                         if let Ok(proxy) = zbus::Proxy::new(
-                            &conn, bus_name, obj_path,
+                            &conn,
+                            bus_name,
+                            obj_path,
                             "org.kde.StatusNotifierItem",
-                        ).await {
-                            let _ = proxy.call::<&str, (i32, i32), ()>(
-                                "Activate", &(x, y),
-                            ).await;
+                        )
+                        .await
+                        {
+                            let _ = proxy
+                                .call::<&str, (i32, i32), ()>("Activate", &(x, y))
+                                .await;
                         }
                     }
                 }
@@ -203,17 +215,13 @@ pub fn activate(bus: String, path: String, x: i32, y: i32) {
 }
 
 /// Read a single string property off a StatusNotifierItem at `(bus, path)`.
-async fn read_str_property(bus: &str, path: &str, prop: &str)
-    -> zbus::Result<String>
-{
+async fn read_str_property(bus: &str, path: &str, prop: &str) -> zbus::Result<String> {
     let conn = Connection::session().await?;
     let bus_name = BusName::try_from(bus.to_string())
         .map_err(|e| zbus::Error::Address(format!("bad bus name: {e}")))?;
     let obj_path = OwnedObjectPath::try_from(path)
         .map_err(|e| zbus::Error::Address(format!("bad path: {e}")))?;
-    let proxy = zbus::Proxy::new(
-        &conn, bus_name, obj_path, "org.kde.StatusNotifierItem",
-    ).await?;
+    let proxy = zbus::Proxy::new(&conn, bus_name, obj_path, "org.kde.StatusNotifierItem").await?;
     proxy.get_property::<String>(prop).await
 }
 
@@ -224,7 +232,8 @@ pub fn spawn_tray_host() -> mpsc::UnboundedReceiver<TrayEvent> {
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all().build()
+            .enable_all()
+            .build()
         {
             Ok(r) => r,
             Err(e) => {
@@ -242,9 +251,7 @@ pub fn spawn_tray_host() -> mpsc::UnboundedReceiver<TrayEvent> {
     events_rx
 }
 
-async fn run_watcher(events_tx: mpsc::UnboundedSender<TrayEvent>)
-    -> zbus::Result<()>
-{
+async fn run_watcher(events_tx: mpsc::UnboundedSender<TrayEvent>) -> zbus::Result<()> {
     let conn = Connection::session().await?;
     let inner = Arc::new(Mutex::new(WatcherState::default()));
     let iface = WatcherIface {

@@ -47,14 +47,14 @@ impl ResizeEdge {
     /// Map a `HitZone` to the `ResizeEdge` (if applicable).
     pub fn from_zone(zone: HitZone) -> Option<Self> {
         match zone {
-            HitZone::EdgeNorth             => Some(ResizeEdge::North),
-            HitZone::EdgeSouth             => Some(ResizeEdge::South),
-            HitZone::EdgeEast              => Some(ResizeEdge::East),
-            HitZone::EdgeWest              => Some(ResizeEdge::West),
-            HitZone::CornerNW { .. }       => Some(ResizeEdge::NorthWest),
-            HitZone::CornerNE { .. }       => Some(ResizeEdge::NorthEast),
-            HitZone::CornerSW { .. }       => Some(ResizeEdge::SouthWest),
-            HitZone::CornerSE { .. }       => Some(ResizeEdge::SouthEast),
+            HitZone::EdgeNorth => Some(ResizeEdge::North),
+            HitZone::EdgeSouth => Some(ResizeEdge::South),
+            HitZone::EdgeEast => Some(ResizeEdge::East),
+            HitZone::EdgeWest => Some(ResizeEdge::West),
+            HitZone::CornerNW { .. } => Some(ResizeEdge::NorthWest),
+            HitZone::CornerNE { .. } => Some(ResizeEdge::NorthEast),
+            HitZone::CornerSW { .. } => Some(ResizeEdge::SouthWest),
+            HitZone::CornerSE { .. } => Some(ResizeEdge::SouthEast),
             _ => None,
         }
     }
@@ -119,12 +119,15 @@ pub const DOCK_SNAP_BREAK_THRESHOLD: f64 = 32.0;
 /// Compute the new window geometry after a resize drag.
 ///
 /// Returns `(new_x, new_y, new_content_w, new_content_h)`.
-pub fn compute_resize(
-    drag: &ActiveDrag,
-    ptr_x: f64,
-    ptr_y: f64,
-) -> Option<(i32, i32, i32, i32)> {
-    if let ActiveDrag::Resize { edge, start_ptr_x, start_ptr_y, start_geom, .. } = drag {
+pub fn compute_resize(drag: &ActiveDrag, ptr_x: f64, ptr_y: f64) -> Option<(i32, i32, i32, i32)> {
+    if let ActiveDrag::Resize {
+        edge,
+        start_ptr_x,
+        start_ptr_y,
+        start_geom,
+        ..
+    } = drag
+    {
         let dx = (ptr_x - start_ptr_x) as i32;
         let dy = (ptr_y - start_ptr_y) as i32;
 
@@ -133,33 +136,58 @@ pub fn compute_resize(
         let mut new_h = start_geom.h;
 
         match edge {
-            ResizeEdge::East  => { new_w = start_geom.w + dx; }
-            ResizeEdge::West  => { new_x = start_geom.x + dx; new_w = start_geom.w - dx; }
-            ResizeEdge::South => { new_h = start_geom.h + dy; }
-            ResizeEdge::North => { new_y = start_geom.y + dy; new_h = start_geom.h - dy; }
-            ResizeEdge::SouthEast => { new_w = start_geom.w + dx; new_h = start_geom.h + dy; }
+            ResizeEdge::East => {
+                new_w = start_geom.w + dx;
+            }
+            ResizeEdge::West => {
+                new_x = start_geom.x + dx;
+                new_w = start_geom.w - dx;
+            }
+            ResizeEdge::South => {
+                new_h = start_geom.h + dy;
+            }
+            ResizeEdge::North => {
+                new_y = start_geom.y + dy;
+                new_h = start_geom.h - dy;
+            }
+            ResizeEdge::SouthEast => {
+                new_w = start_geom.w + dx;
+                new_h = start_geom.h + dy;
+            }
             ResizeEdge::SouthWest => {
-                new_x = start_geom.x + dx; new_w = start_geom.w - dx; new_h = start_geom.h + dy;
+                new_x = start_geom.x + dx;
+                new_w = start_geom.w - dx;
+                new_h = start_geom.h + dy;
             }
             ResizeEdge::NorthEast => {
-                new_y = start_geom.y + dy; new_w = start_geom.w + dx; new_h = start_geom.h - dy;
+                new_y = start_geom.y + dy;
+                new_w = start_geom.w + dx;
+                new_h = start_geom.h - dy;
             }
             ResizeEdge::NorthWest => {
-                new_x = start_geom.x + dx; new_y = start_geom.y + dy;
-                new_w = start_geom.w - dx; new_h = start_geom.h - dy;
+                new_x = start_geom.x + dx;
+                new_y = start_geom.y + dy;
+                new_w = start_geom.w - dx;
+                new_h = start_geom.h - dy;
             }
         }
 
         // Clamp dimensions.
         if new_w < MIN_WINDOW_SIZE {
             // Prevent x from flying off on west-side resize.
-            if matches!(edge, ResizeEdge::West | ResizeEdge::NorthWest | ResizeEdge::SouthWest) {
+            if matches!(
+                edge,
+                ResizeEdge::West | ResizeEdge::NorthWest | ResizeEdge::SouthWest
+            ) {
                 new_x = start_geom.x + start_geom.w - MIN_WINDOW_SIZE;
             }
             new_w = MIN_WINDOW_SIZE;
         }
         if new_h < MIN_WINDOW_SIZE {
-            if matches!(edge, ResizeEdge::North | ResizeEdge::NorthWest | ResizeEdge::NorthEast) {
+            if matches!(
+                edge,
+                ResizeEdge::North | ResizeEdge::NorthWest | ResizeEdge::NorthEast
+            ) {
                 new_y = start_geom.y + start_geom.h - MIN_WINDOW_SIZE;
             }
             new_h = MIN_WINDOW_SIZE;
@@ -177,7 +205,10 @@ pub fn compute_resize(
 ///
 /// Returns `(new_x, new_y)`.
 pub fn compute_move(drag: &ActiveDrag, ptr_x: f64, ptr_y: f64) -> Option<(i32, i32)> {
-    if let ActiveDrag::Move { offset_x, offset_y, .. } = drag {
+    if let ActiveDrag::Move {
+        offset_x, offset_y, ..
+    } = drag
+    {
         Some(((ptr_x - offset_x) as i32, (ptr_y - offset_y) as i32))
     } else {
         None
@@ -194,7 +225,12 @@ mod tests {
             edge,
             start_ptr_x: 100.0,
             start_ptr_y: 100.0,
-            start_geom: WindowGeomSnapshot { x: 50, y: 50, w: 400, h: 300 },
+            start_geom: WindowGeomSnapshot {
+                x: 50,
+                y: 50,
+                w: 400,
+                h: 300,
+            },
             last_configure_at: None,
             dock_snap_engaged_at: None,
         }
@@ -204,8 +240,10 @@ mod tests {
     fn test_resize_east() {
         let drag = make_resize_drag(ResizeEdge::East);
         let (nx, ny, nw, nh) = compute_resize(&drag, 150.0, 100.0).unwrap();
-        assert_eq!(nx, 50); assert_eq!(ny, 50);
-        assert_eq!(nw, 450); assert_eq!(nh, 300);
+        assert_eq!(nx, 50);
+        assert_eq!(ny, 50);
+        assert_eq!(nw, 450);
+        assert_eq!(nh, 300);
     }
 
     #[test]
@@ -221,16 +259,22 @@ mod tests {
     fn test_resize_se_corner() {
         let drag = make_resize_drag(ResizeEdge::SouthEast);
         let (nx, ny, nw, nh) = compute_resize(&drag, 120.0, 130.0).unwrap();
-        assert_eq!(nx, 50); assert_eq!(ny, 50);
-        assert_eq!(nw, 420); assert_eq!(nh, 330);
+        assert_eq!(nx, 50);
+        assert_eq!(ny, 50);
+        assert_eq!(nw, 420);
+        assert_eq!(nh, 330);
     }
 
     #[test]
     fn test_move() {
         let drag = ActiveDrag::Move {
-            toplevel_idx: 0, offset_x: 10.0, offset_y: 15.0, pending_unmaximize: None,
+            toplevel_idx: 0,
+            offset_x: 10.0,
+            offset_y: 15.0,
+            pending_unmaximize: None,
         };
         let (nx, ny) = compute_move(&drag, 210.0, 215.0).unwrap();
-        assert_eq!(nx, 200); assert_eq!(ny, 200);
+        assert_eq!(nx, 200);
+        assert_eq!(ny, 200);
     }
 }

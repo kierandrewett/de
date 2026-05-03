@@ -87,6 +87,30 @@ export global Theme {
         : rgba(0, 0, 0, 0.35);
 }
 
+// ── Control-centre palette ───────────────────────────────────────────────────
+// Theme-resolved colours used by every tile/button/slider in the control
+// centre. Centralised here so theme transitions are a single token flip
+// and the helper components in Popouts.slint don't each redeclare them.
+export global CcPalette {
+    out property <color> tile-bg: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.08)
+        : rgba(0, 0, 0, 0.05);
+    out property <color> tile-bg-hover: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.14)
+        : rgba(0, 0, 0, 0.09);
+    out property <color> fg: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.90)
+        : rgba(0, 0, 0, 0.85);
+    out property <color> fg-secondary: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.55)
+        : rgba(0, 0, 0, 0.55);
+    out property <color> accent:           rgba(53, 132, 228, 1.0);
+    out property <color> icon-on-active:   rgba(255, 255, 255, 0.95);
+    out property <color> icon-bg-inactive: Theme.mode == TokenMode.Dark
+        ? rgba(255, 255, 255, 0.08)
+        : rgba(0, 0, 0, 0.06);
+}
+
 export global Tokens {
     // ── Corner radii ──────────────────────────────────────────────────────────
     out property <length> window-corner-radius-outer: 14px;
@@ -102,14 +126,25 @@ export global Tokens {
     out property <length>  panel-font-size: 13px;
 
     // ── Dock ─────────────────────────────────────────────────────────────────
-    // Match `wm::DOCK_HEIGHT` in Rust (96 px). Used by the windows-clip
-    // wrapper in Compositor.slint to keep windows above the dock band.
-    out property <length>  dock-height: 96px;
+    // Two source values, everything else derived. Keep the dock band
+    // height in sync with `wm::DOCK_HEIGHT` in Rust (used by the WM
+    // for window-position constraints) — bump there too if you tweak
+    // these.
+    //
+    //   dock-icon-size  — the rendered icon glyph (48 px)
+    //   dock-padding    — the ONE spacing value used everywhere:
+    //                     icon→slot, slot→pill, pill→dock-band edge
+    //
+    //   slot = icon + 2·padding         (e.g. 48 + 16 = 64 px)
+    //   pill = slot + 2·padding         (e.g. 64 + 16 = 80 px)
+    //   band = pill + 2·padding         (e.g. 80 + 16 = 96 px)  ← dock-height
+    out property <length>  dock-icon-size:   48px;
+    out property <length>  dock-padding:      8px;
+    out property <length>  dock-slot-size:   dock-icon-size + dock-padding * 2;
+    out property <length>  dock-pill-height: dock-slot-size + dock-padding * 2;
+    out property <length>  dock-height:      dock-pill-height + dock-padding * 2;
     out property <color>   dock-bg: Theme.dock-bg;
     out property <color>   dock-border: Theme.dock-border;
-    out property <length>  dock-padding: 8px;
-    out property <length>  dock-outer-gap: 8px;
-    out property <length>  dock-icon-size: 48px;
 
     // ── Window chrome — title bar ─────────────────────────────────────────────
     out property <length>  titlebar-height: 33px;
@@ -142,6 +177,43 @@ export global Tokens {
     // ── Typography ────────────────────────────────────────────────────────────
     out property <string>  font-family: "Inter Variable";
     out property <string>  font-family-fallback: "Inter";
+
+    // ── Motion ────────────────────────────────────────────────────────────────
+    // ONE source of truth for open/close transitions. Every animated
+    // overlay (context menus, popouts, window chrome lifecycle) reads
+    // these so the whole shell feels coherent.
+    //
+    // Open and close use DIFFERENT curves on purpose. The close uses
+    // GNOME-libadwaita's "spring" — very fast acceleration up front
+    // with a soft tail. Mapped onto a 1 → 0 fade this reads as a
+    // visible long decay (drops to ~30 % almost instantly, then
+    // slow tail), which feels like a snappy dismissal.
+    //
+    // The SAME curve mapped onto a 0 → 1 fade is invisible: ~70 % of
+    // the rise lands in the first 30 ms, so the menu effectively pops
+    // to full size with no perceivable ramp. Open therefore uses an
+    // ease-in-out curve (slow start, smooth ramp through the middle,
+    // gentle settle) — the entire 220 ms window is visible.
+    //
+    // Curve choice: `cubic-bezier(0.4, 0, 0.2, 1)` is Material
+    // Design's "standard" easing — well-known to read as smooth in
+    // both directions, balanced acceleration. Verified arithmetically:
+    // y is 3 % at 23 ms, 50 % at 77 ms, 97 % at 174 ms.
+    out property <duration>  motion-overlay-duration: 160ms;
+    out property <easing>    motion-overlay-curve-in:  cubic-bezier(0.4, 0.0, 0.2, 1.0);
+    out property <easing>    motion-overlay-curve-out: cubic-bezier(0.32, 0.72, 0.0, 1.0);
+    // Back-compat alias for callers that haven't been migrated yet.
+    out property <easing>    motion-overlay-curve:     cubic-bezier(0.32, 0.72, 0.0, 1.0);
+
+    // Slide distance and scale endpoints for overlays. Centralised so a
+    // tweak here propagates to every menu and popout consistently.
+    out property <length>    motion-overlay-slide: 8px;
+    out property <float>     motion-overlay-scale-from: 0.95;
+
+    // Smooth ease-in-out for theme / focus / colour-only crossfades —
+    // no scale or slide, just a soft colour blend.
+    out property <duration>  motion-fade-duration: 200ms;
+    out property <easing>    motion-fade-curve: ease-in-out;
 
     // ── Z-order layers ────────────────────────────────────────────────────────
     //   wallpaper:  0

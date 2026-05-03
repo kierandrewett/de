@@ -13,20 +13,24 @@ pub struct HighlightPass {
 impl HighlightPass {
     pub fn new(shared: &Shared) -> Self {
         let pipeline = make_pipeline(
-            &shared.device, &shared.bgl,
-            "highlight", SHADER_SRC, "fs_main",
-            shared.format, Some(blend_src_over_premul()),
+            &shared.device,
+            &shared.bgl,
+            "highlight",
+            SHADER_SRC,
+            "fs_main",
+            shared.format,
+            Some(blend_src_over_premul()),
         );
         Self { pipeline }
     }
 
     pub fn render(
         &self,
-        shared:          &Shared,
-        encoder:         &mut wgpu::CommandEncoder,
-        dummy_view:      &wgpu::TextureView,
-        target_view:     &wgpu::TextureView,
-        dynamic_offset:  u32,
+        shared: &Shared,
+        encoder: &mut wgpu::CommandEncoder,
+        dummy_view: &wgpu::TextureView,
+        target_view: &wgpu::TextureView,
+        dynamic_offset: u32,
     ) {
         let bg = shared.make_bind_group("highlight-bg", dummy_view);
         let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -36,7 +40,7 @@ impl HighlightPass {
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load:  wgpu::LoadOp::Load,
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],

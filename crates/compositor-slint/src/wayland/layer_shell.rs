@@ -26,7 +26,7 @@ use smithay::{
 };
 use tracing::{info, trace};
 
-use crate::wayland_state::{import_shm_buffer, ClientSurfaceData, SpikeState};
+use crate::wayland_state::{ClientSurfaceData, SpikeState};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public data exposed to the render side
@@ -67,9 +67,10 @@ pub struct LayerInfo {
     pub w: i32,
     pub h: i32,
 
-    /// Composited pixel buffer for the layer surface tree. Refreshed each
-    /// frame from `refresh_layer_layout` via `import_shm_buffer`. The
-    /// renderer reads it to populate the Slint `layers` model.
+    /// Composited pixel buffer for the layer surface tree. Refreshed by
+    /// the wl_surface commit handler (SHM + DMA-BUF), not on a per-frame
+    /// schedule — `pixels.dirty` then drives whether the renderer needs
+    /// to rebuild the Slint `layers` model.
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
 }
 
@@ -87,8 +88,10 @@ impl LayerInfo {
     /// True when this layer surface is on Top/Overlay and asked for exclusive
     /// keyboard focus (lock screens, password prompts, app launchers).
     pub fn wants_exclusive_keyboard(&self) -> bool {
-        matches!(self.keyboard_interactivity, KeyboardInteractivity::Exclusive)
-            && matches!(self.layer, Layer::Top | Layer::Overlay)
+        matches!(
+            self.keyboard_interactivity,
+            KeyboardInteractivity::Exclusive
+        ) && matches!(self.layer, Layer::Top | Layer::Overlay)
     }
 }
 
@@ -159,13 +162,17 @@ fn effective_exclusive_edge(anchor: Anchor, explicit: Option<Anchor>) -> Option<
     }
     match anchor.bits().count_ones() {
         1 => Some(anchor),
-        3 => Some(match anchor.complement() & (Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT) {
-            Anchor::TOP => Anchor::BOTTOM,
-            Anchor::BOTTOM => Anchor::TOP,
-            Anchor::LEFT => Anchor::RIGHT,
-            Anchor::RIGHT => Anchor::LEFT,
-            _ => return None,
-        }),
+        3 => Some(
+            match anchor.complement()
+                & (Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT)
+            {
+                Anchor::TOP => Anchor::BOTTOM,
+                Anchor::BOTTOM => Anchor::TOP,
+                Anchor::LEFT => Anchor::RIGHT,
+                Anchor::RIGHT => Anchor::LEFT,
+                _ => return None,
+            },
+        ),
         _ => None,
     }
 }
@@ -241,8 +248,7 @@ impl SpikeState {
         // walks the same vec twice (exclusive then non-exclusive) so we
         // collect indices into a working list to avoid double-borrows.
         for li in self.layer_surfaces.iter_mut() {
-            let cached: LayerSurfaceCachedState =
-                li.surface.with_cached_state(|s| *s);
+            let cached: LayerSurfaceCachedState = li.surface.with_cached_state(|s| *s);
             li.anchor = cached.anchor;
             li.exclusive_zone = cached.exclusive_zone;
             li.exclusive_edge = cached.exclusive_edge;
@@ -252,13 +258,6 @@ impl SpikeState {
             // Cached `layer` may have been updated by a v2 set_layer request;
             // mirror that so we route z-order and reserved-zone math correctly.
             li.layer = cached.layer;
-
-            // Re-composite the surface tree (root + subsurfaces) into the
-            // per-layer pixel buffer so the renderer can upload it as a
-            // texture this frame. The commit handler now also routes
-            // DMA-BUF layer-shell clients into this same pixel buffer
-            // (keyed by surface id in `dmabuf_pending`).
-            let _ = import_shm_buffer(li.surface.wl_surface(), &li.pixels);
         }
 
         // Two-pass arrange.
@@ -268,11 +267,9 @@ impl SpikeState {
         // Order: all exclusive-zone surfaces first, then the rest. Indexing
         // by usize so the second pass can re-borrow `&mut self.layer_surfaces`.
         let mut order: Vec<usize> = (0..self.layer_surfaces.len()).collect();
-        order.sort_by_key(|&i| {
-            match self.layer_surfaces[i].exclusive_zone {
-                ExclusiveZone::Exclusive(_) => 0,
-                _ => 1,
-            }
+        order.sort_by_key(|&i| match self.layer_surfaces[i].exclusive_zone {
+            ExclusiveZone::Exclusive(_) => 0,
+            _ => 1,
         });
 
         for i in order {

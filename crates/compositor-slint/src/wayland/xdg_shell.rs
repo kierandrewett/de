@@ -18,8 +18,7 @@ use smithay::{
     },
     utils::{Serial, SERIAL_COUNTER},
     wayland::shell::xdg::{
-        Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler,
-        XdgShellState,
+        Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     },
 };
 use tracing::info;
@@ -61,6 +60,7 @@ impl XdgShellHandler for SpikeState {
             x,
             y,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             csd: false,
         });
 
@@ -104,6 +104,9 @@ impl XdgShellHandler for SpikeState {
             pixels: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::wayland_state::ClientSurfaceData::default(),
             )),
+            surface_pixels: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         });
     }
 
@@ -120,9 +123,7 @@ impl XdgShellHandler for SpikeState {
 
         // Update active_surface to the most recent remaining toplevel (if any).
         // The WM will refine this when it processes the close.
-        let still_mapped: Vec<_> = self.toplevels.iter()
-            .filter(|t| &t.surface != wl)
-            .collect();
+        let still_mapped: Vec<_> = self.toplevels.iter().filter(|t| &t.surface != wl).collect();
         self.active_surface = still_mapped.last().map(|t| t.surface.clone());
 
         // Legacy single-surface pixel buffer: clear if it was the active one.
@@ -185,14 +186,16 @@ impl XdgShellHandler for SpikeState {
             // `None` (no edge) — protocol-spec: treat as a no-op.
             _ => return,
         };
-        self.pending_xdg_resize.push((surface.wl_surface().clone(), edge));
+        self.pending_xdg_resize
+            .push((surface.wl_surface().clone(), edge));
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         surface.with_pending_state(|s| {
             s.states.set(xdg_toplevel::State::Maximized);
         });
-        self.pending_xdg_maximize.push((surface.wl_surface().clone(), true));
+        self.pending_xdg_maximize
+            .push((surface.wl_surface().clone(), true));
         // Protocol requires us to always reply with a configure. If the
         // initial configure has not been sent yet the deferred path will
         // include the Maximized state we just set above.
@@ -206,7 +209,8 @@ impl XdgShellHandler for SpikeState {
             s.states.unset(xdg_toplevel::State::Maximized);
             s.size = None;
         });
-        self.pending_xdg_maximize.push((surface.wl_surface().clone(), false));
+        self.pending_xdg_maximize
+            .push((surface.wl_surface().clone(), false));
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }
@@ -217,7 +221,8 @@ impl XdgShellHandler for SpikeState {
             s.states.set(xdg_toplevel::State::Fullscreen);
             s.fullscreen_output = output;
         });
-        self.pending_xdg_fullscreen.push((surface.wl_surface().clone(), true));
+        self.pending_xdg_fullscreen
+            .push((surface.wl_surface().clone(), true));
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }
@@ -229,7 +234,8 @@ impl XdgShellHandler for SpikeState {
             s.size = None;
             s.fullscreen_output = None;
         });
-        self.pending_xdg_fullscreen.push((surface.wl_surface().clone(), false));
+        self.pending_xdg_fullscreen
+            .push((surface.wl_surface().clone(), false));
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }

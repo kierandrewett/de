@@ -77,11 +77,16 @@ const CURSOR_SIZE: u32 = 24;
 
 /// Rasterise an SVG string (no rotation) to premultiplied RGBA bytes.
 fn rasterise_svg(svg_data: &str, size: u32) -> Option<Vec<u8>> {
-    if size == 0 { return None; }
+    if size == 0 {
+        return None;
+    }
     let opt = usvg::Options::default();
     let tree = match usvg::Tree::from_str(svg_data, &opt) {
         Ok(t) => t,
-        Err(e) => { warn!("SVG parse error: {}", e); return None; }
+        Err(e) => {
+            warn!("SVG parse error: {}", e);
+            return None;
+        }
     };
     let svg_size = tree.size();
     let sx = size as f32 / svg_size.width();
@@ -98,11 +103,16 @@ fn rasterise_svg(svg_data: &str, size: u32) -> Option<Vec<u8>> {
 /// may clip at the edges — that is intentional; the cursor icon is small
 /// (32 px) so ≤45° rotation stays within bounds.
 fn rasterise_svg_rotated(svg_data: &str, size: u32, angle_rad: f64) -> Option<Vec<u8>> {
-    if size == 0 { return None; }
+    if size == 0 {
+        return None;
+    }
     let opt = usvg::Options::default();
     let tree = match usvg::Tree::from_str(svg_data, &opt) {
         Ok(t) => t,
-        Err(e) => { warn!("SVG parse error: {}", e); return None; }
+        Err(e) => {
+            warn!("SVG parse error: {}", e);
+            return None;
+        }
     };
     let svg_size = tree.size();
     let sx = size as f32 / svg_size.width();
@@ -113,7 +123,9 @@ fn rasterise_svg_rotated(svg_data: &str, size: u32, angle_rad: f64) -> Option<Ve
 
     // Build: translate to centre → rotate → translate back → scale.
     let transform = tiny_skia::Transform::from_translate(cx, cy)
-        .post_concat(tiny_skia::Transform::from_rotate(angle_rad.to_degrees() as f32))
+        .post_concat(tiny_skia::Transform::from_rotate(
+            angle_rad.to_degrees() as f32
+        ))
         .post_concat(tiny_skia::Transform::from_translate(-cx, -cy))
         .post_concat(tiny_skia::Transform::from_scale(sx, sy));
 
@@ -124,9 +136,7 @@ fn rasterise_svg_rotated(svg_data: &str, size: u32, angle_rad: f64) -> Option<Ve
 
 /// Convert premultiplied RGBA bytes to a `slint::Image`.
 fn pixels_to_slint(pixels: Vec<u8>, size: u32) -> slint::Image {
-    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-        &pixels, size, size,
-    );
+    let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&pixels, size, size);
     slint::Image::from_rgba8_premultiplied(buf)
 }
 
@@ -143,32 +153,50 @@ const FALLBACK_DIRS: &[&str] = &[
     "/usr/share/icons/DMZ-White/cursors",
 ];
 
-fn load_xcursor(name: &str, target_size: u32)
-    -> Option<(Vec<u8>, u32, u32, u32, u32)>
-{
+fn load_xcursor(name: &str, target_size: u32) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
     for dir in std::iter::once(ADWAITA_DIR).chain(FALLBACK_DIRS.iter().copied()) {
         let path = std::path::Path::new(dir).join(name);
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Some(images) = xcursor::parser::parse_xcursor(&bytes) else { continue };
-        if images.is_empty() { continue }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(images) = xcursor::parser::parse_xcursor(&bytes) else {
+            continue;
+        };
+        if images.is_empty() {
+            continue;
+        }
 
-        let img = images.iter()
+        let img = images
+            .iter()
             .min_by_key(|i| (i.size as i64 - target_size as i64).abs())
             .unwrap();
 
-        debug!("xcursor: {} from {:?} ({}×{}, hot={},{})",
-            name, dir, img.width, img.height, img.xhot, img.yhot);
-        return Some((img.pixels_rgba.clone(), img.width, img.height, img.xhot, img.yhot));
+        debug!(
+            "xcursor: {} from {:?} ({}×{}, hot={},{})",
+            name, dir, img.width, img.height, img.xhot, img.yhot
+        );
+        return Some((
+            img.pixels_rgba.clone(),
+            img.width,
+            img.height,
+            img.xhot,
+            img.yhot,
+        ));
     }
     None
 }
 
 fn scale_pixels_to(
-    pixels: &[u8], src_w: u32, src_h: u32,
-    src_hot_x: u32, src_hot_y: u32,
+    pixels: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_hot_x: u32,
+    src_hot_y: u32,
     target: u32,
 ) -> Option<(Vec<u8>, f32, f32)> {
-    if src_w == 0 || src_h == 0 || target == 0 { return None }
+    if src_w == 0 || src_h == 0 || target == 0 {
+        return None;
+    }
     let mut src = tiny_skia::Pixmap::new(src_w, src_h)?;
     src.data_mut().copy_from_slice(pixels);
 
@@ -180,8 +208,14 @@ fn scale_pixels_to(
     let transform = tiny_skia::Transform::from_translate(off_x, off_y)
         .post_concat(tiny_skia::Transform::from_scale(scale, scale));
 
-    dst.draw_pixmap(0, 0, src.as_ref(), &tiny_skia::PixmapPaint::default(),
-                    transform, None);
+    dst.draw_pixmap(
+        0,
+        0,
+        src.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        transform,
+        None,
+    );
 
     let hot_x = off_x + src_hot_x as f32 * scale;
     let hot_y = off_y + src_hot_y as f32 * scale;
@@ -204,15 +238,15 @@ fn try_load_adwaita(name: &str, target: u32) -> Option<AdwaitaImage> {
 
 fn adwaita_name(kind: CursorKind) -> &'static str {
     match kind {
-        CursorKind::Arrow              => "default",
-        CursorKind::Move               => "move",
-        CursorKind::Hand               => "pointer",
-        CursorKind::ResizeN            => "n-resize",
-        CursorKind::ResizeS            => "s-resize",
-        CursorKind::ResizeE            => "e-resize",
-        CursorKind::ResizeW            => "w-resize",
-        CursorKind::ResizeNWSE { .. }  => "nw-resize",
-        CursorKind::ResizeNESW { .. }  => "ne-resize",
+        CursorKind::Arrow => "default",
+        CursorKind::Move => "move",
+        CursorKind::Hand => "pointer",
+        CursorKind::ResizeN => "n-resize",
+        CursorKind::ResizeS => "s-resize",
+        CursorKind::ResizeE => "e-resize",
+        CursorKind::ResizeW => "w-resize",
+        CursorKind::ResizeNWSE { .. } => "nw-resize",
+        CursorKind::ResizeNESW { .. } => "ne-resize",
     }
 }
 
@@ -259,7 +293,8 @@ impl CursorRenderer {
             let loaded = try_load_adwaita(name, CURSOR_SIZE);
             self.dynamic_cache.insert(name.to_string(), loaded);
         }
-        self.dynamic_cache.get(name)
+        self.dynamic_cache
+            .get(name)
             .and_then(|o| o.as_ref())
             .map(|a| (a.image.clone(), a.hotspot))
     }
@@ -303,14 +338,14 @@ impl CursorRenderer {
             return a.image.clone();
         }
         match kind {
-            CursorKind::Arrow  => self.get_static("arrow",   ARROW_SVG),
-            CursorKind::Move   => self.get_static("move",    MOVE_SVG),
-            CursorKind::Hand   => self.get_static("hand",    HAND_SVG),
+            CursorKind::Arrow => self.get_static("arrow", ARROW_SVG),
+            CursorKind::Move => self.get_static("move", MOVE_SVG),
+            CursorKind::Hand => self.get_static("hand", HAND_SVG),
             CursorKind::ResizeN => self.get_static("resize_n", RESIZE_NS_SVG),
             CursorKind::ResizeS => self.get_static("resize_s", RESIZE_NS_SVG),
             CursorKind::ResizeE => self.get_static("resize_e", RESIZE_EW_SVG),
             CursorKind::ResizeW => self.get_static("resize_w", RESIZE_EW_SVG),
-            _                   => slint::Image::default(),
+            _ => slint::Image::default(),
         }
     }
 
@@ -324,8 +359,8 @@ impl CursorRenderer {
         let s = CURSOR_SIZE as f32;
         match kind {
             CursorKind::Arrow => (4.0, 2.0),
-            CursorKind::Hand  => (9.0, 1.0),
-            _                 => (s / 2.0, s / 2.0),
+            CursorKind::Hand => (9.0, 1.0),
+            _ => (s / 2.0, s / 2.0),
         }
     }
 

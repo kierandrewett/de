@@ -775,6 +775,7 @@ dependencies = [
  "chrono",
  "image",
  "ipc",
+ "libc",
  "pollster",
  "raw-window-handle",
  "resvg 0.44.0",

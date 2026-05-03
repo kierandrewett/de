@@ -12,8 +12,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ipc::{deserialize_request, ShellRequest};
 use tracing::{info, warn};
@@ -32,7 +33,10 @@ pub enum IpcCommand {
     /// Type each character in the string as a press+release pair.
     TypeText { text: String },
     /// Capture a screenshot to the given absolute path (PNG).
-    Screenshot { save_path: String },
+    Screenshot {
+        save_path: String,
+        response: Option<mpsc::Sender<Result<String, String>>>,
+    },
     /// Activate a WM window by id.
     ActivateWindow { wm_id: i32 },
     /// Close a WM window.
@@ -97,7 +101,10 @@ fn accept_loop(listener: UnixListener, queue: PendingIpc) {
 fn handle_conn(stream: UnixStream, queue: PendingIpc) {
     let peer_stream = match stream.try_clone() {
         Ok(s) => s,
-        Err(e) => { warn!("ipc: clone failed: {}", e); return }
+        Err(e) => {
+            warn!("ipc: clone failed: {}", e);
+            return;
+        }
     };
     let reader = BufReader::new(stream);
     let mut writer = peer_stream;
@@ -105,17 +112,45 @@ fn handle_conn(stream: UnixStream, queue: PendingIpc) {
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(e) => { warn!("ipc: read err: {}", e); break }
+            Err(e) => {
+                warn!("ipc: read err: {}", e);
+                break;
+            }
         };
         let req = match deserialize_request(&line) {
             Ok(r) => r,
             Err(e) => {
-                let _ = writer.write_all(
-                    format!("{{\"error\":\"{}\"}}\n", e).as_bytes(),
-                );
+                let _ = writer.write_all(format!("{{\"error\":\"{}\"}}\n", e).as_bytes());
                 continue;
             }
         };
+
+        if let ShellRequest::TakeScreenshot { region: _ } = req {
+            let save_path = screenshot_path();
+            let (tx, rx) = mpsc::channel();
+            queue.lock().unwrap().push(IpcCommand::Screenshot {
+                save_path: save_path.clone(),
+                response: Some(tx),
+            });
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(path)) => {
+                    let _ = writer.write_all(
+                        format!("{{\"path\":{}}}\n", serde_json::to_string(&path).unwrap())
+                            .as_bytes(),
+                    );
+                }
+                Ok(Err(error)) => {
+                    let _ = writer.write_all(
+                        format!("{{\"error\":{}}}\n", serde_json::to_string(&error).unwrap())
+                            .as_bytes(),
+                    );
+                }
+                Err(_) => {
+                    let _ = writer.write_all(b"{\"error\":\"screenshot timed out\"}\n");
+                }
+            }
+            continue;
+        }
 
         let cmd = translate(req);
         if let Some(cmd) = cmd {
@@ -132,22 +167,44 @@ fn translate(req: ShellRequest) -> Option<IpcCommand> {
         ShellRequest::MovePointer { x, y } => IpcCommand::PointerMove { x, y },
         ShellRequest::ClickPointer { button, pressed } => {
             let b = match button.to_ascii_lowercase().as_str() {
-                "left"   => 0x110, // BTN_LEFT
-                "right"  => 0x111, // BTN_RIGHT
+                "left" => 0x110,   // BTN_LEFT
+                "right" => 0x111,  // BTN_RIGHT
                 "middle" => 0x112, // BTN_MIDDLE
                 _ => 0x110,
             };
-            IpcCommand::PointerButton { button_evdev: b, pressed }
+            IpcCommand::PointerButton {
+                button_evdev: b,
+                pressed,
+            }
         }
         ShellRequest::KeyPress { scancode, pressed } => IpcCommand::KeyEvent { scancode, pressed },
         ShellRequest::TypeText { text } => IpcCommand::TypeText { text },
-        ShellRequest::Screenshot { save_path } => IpcCommand::Screenshot { save_path },
-        ShellRequest::ActivateWindow { window_id } => IpcCommand::ActivateWindow { wm_id: window_id as i32 },
-        ShellRequest::CloseWindow { window_id }   => IpcCommand::CloseWindow   { wm_id: window_id as i32 },
-        ShellRequest::MinimizeWindow { window_id } => IpcCommand::MinimizeWindow { wm_id: window_id as i32 },
-        ShellRequest::MoveWindow { window_id, x, y } => IpcCommand::MoveWindow { wm_id: window_id as i32, x, y },
-        ShellRequest::ResizeWindow { window_id, width, height } => IpcCommand::ResizeWindow {
-            wm_id: window_id as i32, w: width, h: height,
+        ShellRequest::Screenshot { save_path } => IpcCommand::Screenshot {
+            save_path,
+            response: None,
+        },
+        ShellRequest::ActivateWindow { window_id } => IpcCommand::ActivateWindow {
+            wm_id: window_id as i32,
+        },
+        ShellRequest::CloseWindow { window_id } => IpcCommand::CloseWindow {
+            wm_id: window_id as i32,
+        },
+        ShellRequest::MinimizeWindow { window_id } => IpcCommand::MinimizeWindow {
+            wm_id: window_id as i32,
+        },
+        ShellRequest::MoveWindow { window_id, x, y } => IpcCommand::MoveWindow {
+            wm_id: window_id as i32,
+            x,
+            y,
+        },
+        ShellRequest::ResizeWindow {
+            window_id,
+            width,
+            height,
+        } => IpcCommand::ResizeWindow {
+            wm_id: window_id as i32,
+            w: width,
+            h: height,
         },
         ShellRequest::SetTheme { mode } => IpcCommand::SetTheme { mode },
         ShellRequest::GetAllWindows => IpcCommand::DumpWindows {
@@ -157,4 +214,15 @@ fn translate(req: ShellRequest) -> Option<IpcCommand> {
         // Variants we don't act on yet.
         _ => return None,
     })
+}
+
+fn screenshot_path() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir()
+        .join(format!("myDE-screenshot-{nanos}.png"))
+        .to_string_lossy()
+        .into_owned()
 }

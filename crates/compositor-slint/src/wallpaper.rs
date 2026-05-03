@@ -19,10 +19,10 @@ pub fn find_wallpaper_path() -> Option<PathBuf> {
 
     let candidates: &[(&str, &[&str])] = &[
         ("Documents/wallpaper_light", &["jpg", "jpeg", "png"]),
-        ("Documents/wallpaper_dark",  &["jpg", "jpeg", "png"]),
-        ("Documents/wallpaper",       &["jpg", "jpeg", "png"]),
-        ("Pictures/wallpaper",        &["jpg", "jpeg", "png"]),
-        (".config/myDE/wallpaper",    &["jpg", "jpeg", "png"]),
+        ("Documents/wallpaper_dark", &["jpg", "jpeg", "png"]),
+        ("Documents/wallpaper", &["jpg", "jpeg", "png"]),
+        ("Pictures/wallpaper", &["jpg", "jpeg", "png"]),
+        (".config/myDE/wallpaper", &["jpg", "jpeg", "png"]),
     ];
 
     for (stem, exts) in candidates {
@@ -38,7 +38,10 @@ pub fn find_wallpaper_path() -> Option<PathBuf> {
     let absolute: &[(&str, &[&str])] = &[
         ("/usr/share/backgrounds/default", &["jpg", "png"]),
         ("/usr/share/backgrounds/gnome/symbolic-d", &["png"]),
-        ("/usr/share/backgrounds/cosmic/A_stormy_stellar_nursery_esa_379309", &["jpg"]),
+        (
+            "/usr/share/backgrounds/cosmic/A_stormy_stellar_nursery_esa_379309",
+            &["jpg"],
+        ),
     ];
     for (stem, exts) in absolute {
         for ext in *exts {
@@ -92,7 +95,9 @@ pub fn load_from_path(path: &Path) -> Option<slint::Image> {
     let (width, height) = rgba.dimensions();
 
     let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-        rgba.as_raw(), width, height,
+        rgba.as_raw(),
+        width,
+        height,
     );
 
     let slint_image = slint::Image::from_rgba8(pixel_buf);
@@ -113,11 +118,13 @@ pub fn load_blurred_from_path(path: &Path, sigma: f32) -> Option<slint::Image> {
     let blurred = image::imageops::blur(&small.to_rgba8(), sigma);
 
     let (w, h) = blurred.dimensions();
-    let pixel_buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-        blurred.as_raw(), w, h,
-    );
+    let pixel_buf =
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(blurred.as_raw(), w, h);
     let slint_image = slint::Image::from_rgba8(pixel_buf);
-    info!("wallpaper blurred backdrop ready: {}x{} (sigma={})", w, h, sigma);
+    info!(
+        "wallpaper blurred backdrop ready: {}x{} (sigma={})",
+        w, h, sigma
+    );
     Some(slint_image)
 }
 

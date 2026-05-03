@@ -25,35 +25,46 @@ pub fn compose_wgsl(frag_src: &str) -> String {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ChromeUniforms {
-    pub win_x:      f32,
-    pub win_y:      f32,
-    pub win_w:      f32,
-    pub win_h:      f32,    // 16
+    pub win_x: f32,
+    pub win_y: f32,
+    pub win_w: f32,
+    pub win_h: f32, // 16
 
-    pub surface_w:  f32,
-    pub surface_h:  f32,
-    pub radius_px:  f32,
-    pub smoothing:  f32,    // 32
+    pub surface_w: f32,
+    pub surface_h: f32,
+    pub radius_px: f32,
+    pub smoothing: f32, // 32
 
-    pub mode_t:     f32,
-    pub focus_t:    f32,
-    pub shadow_a:   f32,
-    pub shadow_oy:  f32,    // 48
+    pub mode_t: f32,
+    pub focus_t: f32,
+    pub shadow_a: f32,
+    pub shadow_oy: f32, // 48
 
-    pub shadow_ox:  f32,
+    pub shadow_ox: f32,
     pub blur_sigma: f32,
-    pub _pad0:      f32,
-    pub _pad1:      f32,    // 64
+    pub _pad0: f32,
+    pub _pad1: f32, // 64
 }
 
 impl Default for ChromeUniforms {
     fn default() -> Self {
         Self {
-            win_x: 0.0, win_y: 0.0, win_w: 0.0, win_h: 0.0,
-            surface_w: 0.0, surface_h: 0.0, radius_px: 14.0, smoothing: 0.6,
-            mode_t: 0.0, focus_t: 1.0,
-            shadow_a: 0.0, shadow_oy: 0.0, shadow_ox: 0.0, blur_sigma: 0.0,
-            _pad0: 0.0, _pad1: 0.0,
+            win_x: 0.0,
+            win_y: 0.0,
+            win_w: 0.0,
+            win_h: 0.0,
+            surface_w: 0.0,
+            surface_h: 0.0,
+            radius_px: 14.0,
+            smoothing: 0.6,
+            mode_t: 0.0,
+            focus_t: 1.0,
+            shadow_a: 0.0,
+            shadow_oy: 0.0,
+            shadow_ox: 0.0,
+            blur_sigma: 0.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
         }
     }
 }
@@ -170,21 +181,21 @@ pub fn make_pipeline(
 /// a linear sampler, the bind-group layout. Instances are owned by
 /// `ChromeRenderer` and lent out via `Arc` so each pass can build bind groups.
 pub struct Shared {
-    pub device:               Arc<wgpu::Device>,
-    pub format:               wgpu::TextureFormat,
-    pub bgl:                  wgpu::BindGroupLayout,
-    pub sampler:              wgpu::Sampler,
-    pub dynamic_uniform_buf:  wgpu::Buffer,
+    pub device: Arc<wgpu::Device>,
+    pub format: wgpu::TextureFormat,
+    pub bgl: wgpu::BindGroupLayout,
+    pub sampler: wgpu::Sampler,
+    pub dynamic_uniform_buf: wgpu::Buffer,
     /// 1×1 dummy texture for passes that don't actually sample t_src. The
     /// bind-group layout still requires a texture binding, and binding the
     /// scene texture here would conflict with using it as a colour target
     /// in the same encoder scope (wgpu validation error).
-    pub dummy_view:           wgpu::TextureView,
+    pub dummy_view: wgpu::TextureView,
 }
 
 impl Shared {
     pub fn new(device: Arc<wgpu::Device>, format: wgpu::TextureFormat) -> Self {
-        let bgl     = make_bind_group_layout(&device);
+        let bgl = make_bind_group_layout(&device);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("chrome-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -195,22 +206,33 @@ impl Shared {
         });
         let dynamic_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chrome-dynamic-uniforms"),
-            size:  DYNAMIC_UNIFORM_BUF_SIZE,
+            size: DYNAMIC_UNIFORM_BUF_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("chrome-dummy-1x1"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
-            sample_count:    1,
-            dimension:       wgpu::TextureDimension::D2,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { device, format, bgl, sampler, dynamic_uniform_buf, dummy_view }
+        Self {
+            device,
+            format,
+            bgl,
+            sampler,
+            dynamic_uniform_buf,
+            dummy_view,
+        }
     }
 
     /// Build a bind group bound to (dynamic-uniform-buffer, the given view, sampler).

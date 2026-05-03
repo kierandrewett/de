@@ -12,17 +12,13 @@
 //! We use the buffer type from `with_renderer_surface_state` to decide.
 
 use smithay::{
-    delegate_compositor,
     backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
-    reexports::{
-        calloop::Interest,
-        wayland_server::{protocol::wl_surface::WlSurface, Client, Resource},
-    },
+    delegate_compositor,
+    reexports::wayland_server::{protocol::wl_surface::WlSurface, Client, Resource},
     wayland::{
         compositor::{
-            add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
-            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes,
+            get_parent, is_sync_subsurface, with_states, CompositorClientState, CompositorHandler,
+            CompositorState, SurfaceAttributes,
         },
         dmabuf::get_dmabuf,
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
@@ -31,8 +27,8 @@ use smithay::{
 };
 use tracing::debug;
 
+use crate::wayland_state::{import_shm_buffer, import_shm_per_surface};
 use crate::wayland_state::{ClientState, ClientSurfaceData, SpikeState};
-use crate::wayland_state::import_shm_buffer;
 
 impl CompositorHandler for SpikeState {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -56,41 +52,84 @@ impl CompositorHandler for SpikeState {
         FALLBACK.get_or_init(CompositorClientState::default)
     }
 
-    fn new_surface(&mut self, surface: &WlSurface) {
-        // Mesa 24+ Vulkan WSI / explicit-sync clients may commit a DMA-BUF
-        // before the producer GPU has finished writing to it. Importing on
-        // commit without waiting samples garbage. We mirror anvil's approach:
-        // block the commit on the dmabuf's implicit acquire-fence becoming
-        // readable, then let smithay re-drive the commit via blocker_cleared.
-        add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
-            let maybe_dmabuf = with_states(surface, |surface_data| {
-                surface_data
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .pending()
-                    .buffer
-                    .as_ref()
-                    .and_then(|assignment| match assignment {
-                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
-                        _ => None,
-                    })
-            });
-            let Some(dmabuf) = maybe_dmabuf else { return };
-            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else { return };
-            let Some(client) = surface.client() else { return };
-            let res = state.loop_handle.insert_source(source, move |_, _, data| {
-                let dh = data.display_handle.clone();
-                data.client_compositor_state(&client).blocker_cleared(data, &dh);
-                Ok(())
-            });
-            if res.is_ok() {
-                add_blocker(surface, blocker);
-            }
-        });
+    fn new_surface(&mut self, _surface: &WlSurface) {
+        // DMA-BUF acquire-fence blocker REMOVED.
+        //
+        // The textbook anvil pattern is to add a pre-commit blocker that
+        // waits on `dmabuf.generate_blocker(Interest::READ)` so we don't
+        // sample garbage from a buffer the GPU hasn't finished writing.
+        // In practice, on radv (mesa Vulkan WSI for AMD) the implicit
+        // acquire fence frequently never becomes readable, so wp_fifo
+        // clients (eframe/wgpu, mpv, etc.) deadlock after a handful of
+        // commits — the commit transaction stays in smithay's blocker
+        // queue forever, our `CompositorHandler::commit` never fires for
+        // it, and the wp_fifo barrier on that commit is never signalled,
+        // wedging the client's render loop.
+        //
+        // Skipping the blocker means we may read a buffer mid-write on
+        // the very first frame after a buffer is allocated. In practice
+        // the import path (`import_dmabuf_for_surface` → GLES readback)
+        // re-syncs via its own EGL fence, and clients double-buffer, so
+        // the worst case is a one-frame artifact — far cheaper than the
+        // permanent freeze.
     }
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        // wp_fifo_v1 barrier: signal the just-committed barrier IMMEDIATELY,
+        // before any subsequent commit can overwrite `current.barrier`.
+        //
+        // The naive approach (signal all barriers from a per-frame helper)
+        // deadlocks when the client back-to-back-commits without giving us
+        // a main-loop tick between them: commit N+1's `set_barrier` lands
+        // a fresh Arc in `current.barrier`, dropping the reference we held
+        // to commit N's barrier. The pending blocker on commit N+1's
+        // `wait_barrier` then references the orphaned barrier N Arc and
+        // never resolves. Signalling here, in the commit handler, ties
+        // the signal to the exact commit that produced the barrier and
+        // sidesteps the race entirely. The semantic cost is that we
+        // signal "presented" before actually presenting the buffer, but
+        // that just removes throttling — we already render at vsync
+        // through winit's own swap, so the client still gets paced.
+        //
+        // After signalling, drive the client's blocker_cleared so smithay
+        // re-checks any commit transactions that were waiting on this
+        // barrier (anvil does the same: signal + insert client → call
+        // blocker_cleared on each).
+        let mut signaled_barrier = false;
+        {
+            use smithay::wayland::compositor::with_states;
+            use smithay::wayland::fifo::FifoBarrierCachedState;
+            with_states(surface, |states| {
+                let mut guard = states.cached_state.get::<FifoBarrierCachedState>();
+                if let Some(b) = guard.current().barrier.take() {
+                    b.signal();
+                    signaled_barrier = true;
+                }
+                if let Some(b) = guard.pending().barrier.take() {
+                    b.signal();
+                    signaled_barrier = true;
+                }
+            });
+        }
+        if signaled_barrier {
+            use smithay::reexports::wayland_server::Resource;
+            tracing::debug!(
+                "fifo: per-commit signal on surface_id={}",
+                surface.id().protocol_id(),
+            );
+            if let Some(client) = surface.client() {
+                let dh = self.display_handle.clone();
+                let ccs_ptr: *const smithay::wayland::compositor::CompositorClientState =
+                    self.client_compositor_state(&client) as *const _;
+                // SAFETY: the CompositorClientState is owned by the
+                // ClientState user-data on this client, pinned for the
+                // life of the connection.
+                let ccs = unsafe { &*ccs_ptr };
+                ccs.blocker_cleared(self, &dh);
+            }
+        }
 
         // Sync subsurfaces stage their state into the parent's pending tree
         // and become visible only when the parent commits — running the
@@ -106,7 +145,8 @@ impl CompositorHandler for SpikeState {
         // signalled). Result lands in `dmabuf_pending` keyed by surface id.
         let dmabuf = with_renderer_surface_state(surface, |s| {
             s.buffer().and_then(|b| get_dmabuf(b).cloned().ok())
-        }).flatten();
+        })
+        .flatten();
         if let Some(dmabuf) = dmabuf {
             self.import_dmabuf_for_surface(surface, &dmabuf);
         }
@@ -225,7 +265,9 @@ impl CompositorHandler for SpikeState {
         // flip the protocol to "locked". The renderer's gate consumes
         // `session_locked` next frame and stops rendering everything
         // else.
-        let lock_idx = self.lock_surfaces.iter()
+        let lock_idx = self
+            .lock_surfaces
+            .iter()
             .position(|li| li.surface.wl_surface() == &root);
         if let Some(lidx) = lock_idx {
             let pixels_arc = self.lock_surfaces[lidx].pixels.clone();
@@ -248,36 +290,48 @@ impl CompositorHandler for SpikeState {
         // If `root` is a popup surface (or `surface` itself is a popup that
         // has no wl_subsurface parent), import for the popup's pixel buffer
         // and bail before falling through to toplevel handling.
-        let popup_idx = self.popups.iter()
+        let popup_idx = self
+            .popups
+            .iter()
             .position(|p| p.surface == root || p.surface == *surface);
         if let Some(pidx) = popup_idx {
             let popup_surf = self.popups[pidx].surface.clone();
             let pixels_arc = self.popups[pidx].pixels.clone();
+            let surface_pixels_arc = self.popups[pidx].surface_pixels.clone();
             let _ = import_shm_buffer(&popup_surf, &pixels_arc);
+            let _ = import_shm_per_surface(&popup_surf, &surface_pixels_arc);
             return;
         }
 
-        // Layer-shell surface: import its DMA-BUF (if any) into the
-        // LayerInfo pixel buffer. SHM import for layer surfaces happens
-        // each frame in `refresh_layer_layout`; DMA-BUF needs to land
-        // here because the surface-keyed `dmabuf_pending` map is
-        // populated by `import_dmabuf_for_surface` above and consumed
-        // wherever the surface lives. Without this, DMA-BUF layer-shell
-        // clients (anything wgpu/Vulkan-backed) get blank panels.
-        let layer_idx = self.layer_surfaces.iter()
+        // Layer-shell surface: import the buffer (SHM or DMA-BUF) into the
+        // LayerInfo pixel buffer right here on commit. Doing the SHM import
+        // per-commit (rather than every iteration of `refresh_layer_layout`)
+        // means `pixels.dirty` only flips when the client actually paints,
+        // which the renderer uses to skip rebuilding the Slint layers model
+        // on idle frames.
+        let layer_idx = self
+            .layer_surfaces
+            .iter()
             .position(|li| li.surface.wl_surface() == &root);
         if let Some(idx) = layer_idx {
             let pixels_arc = self.layer_surfaces[idx].pixels.clone();
+            let _ = import_shm_buffer(&root, &pixels_arc);
             if let Some(data) = self.dmabuf_pending.remove(&root.id()) {
-                debug!("DMA-BUF: consuming pending {}x{} pixels for layer surface", data.width, data.height);
+                debug!(
+                    "DMA-BUF: consuming pending {}x{} pixels for layer surface",
+                    data.width, data.height
+                );
                 *pixels_arc.lock().unwrap() = data;
             }
             return;
         }
 
         let toplevel_idx = self.toplevels.iter().position(|t| t.surface == root);
-        debug!("commit: surface_is_toplevel={} root_in_toplevels={}",
-            surface == &root, toplevel_idx.is_some());
+        debug!(
+            "commit: surface_is_toplevel={} root_in_toplevels={}",
+            surface == &root,
+            toplevel_idx.is_some()
+        );
         let surface = &root;
         if let Some(idx) = toplevel_idx {
             let pixels_arc = self.toplevels[idx].pixels.clone();
@@ -297,29 +351,71 @@ impl CompositorHandler for SpikeState {
                 self.toplevels[idx].csd = true;
             }
 
+            // Per-surface render-element model (runs alongside the legacy
+            // composite during the staged rewrite). Imports each surface
+            // in the tree separately so the renderer can position and
+            // source-clip them independently — the prerequisite for
+            // damage tracking, animated subsurfaces, and per-surface
+            // buffer_transform.
+            let surface_pixels_arc = self.toplevels[idx].surface_pixels.clone();
+            let _ = import_shm_per_surface(surface, &surface_pixels_arc);
+
             // If SHM import produced nothing (width == 0), pull the
             // surface-keyed DMA-BUF pixels populated earlier in this commit.
             // Keying by surface id (rather than "WxH") prevents two surfaces
             // at the same resolution from swapping each other's frames.
             if pixels_arc.lock().unwrap().width == 0 {
                 if let Some(data) = self.dmabuf_pending.remove(&surface.id()) {
-                    debug!("DMA-BUF: consuming pending {}x{} pixels for toplevel", data.width, data.height);
+                    debug!(
+                        "DMA-BUF: consuming pending {}x{} pixels for toplevel",
+                        data.width, data.height
+                    );
+                    // Mirror into the per-surface map; legacy pixels_arc
+                    // gets the owned buffer. Cloning is unavoidable while
+                    // both code paths coexist (~25 readers depend on
+                    // pixels_arc.pixels). Future Phase 5 work will
+                    // eliminate one of them.
+                    use smithay::reexports::wayland_server::Resource;
+                    let key = surface.id().protocol_id();
+                    {
+                        let mut sp = surface_pixels_arc.lock().unwrap();
+                        let prev_version = sp.get(&key).map(|d| d.version).unwrap_or(0);
+                        sp.insert(
+                            key,
+                            crate::wayland_state::ClientSurfaceData {
+                                pixels: data.pixels.clone(),
+                                width: data.width,
+                                height: data.height,
+                                dirty: true,
+                                version: prev_version.wrapping_add(1),
+                                last_commit: None,
+                            },
+                        );
+                    }
                     *pixels_arc.lock().unwrap() = data;
                 }
             }
 
             // Also update legacy single-surface buffer if this is the active surface.
-            let is_active = self.active_surface.as_ref().map(|s| s == surface).unwrap_or(false);
+            let is_active = self
+                .active_surface
+                .as_ref()
+                .map(|s| s == surface)
+                .unwrap_or(false);
             if is_active {
                 let _ = import_shm_buffer(surface, &self.client_pixels.clone());
                 // Sync DMA-BUF data to legacy buffer too.
                 let current = pixels_arc.lock().unwrap().clone();
                 if current.width > 0 {
-                    *self.client_pixels.lock().unwrap() = ClientSurfaceData {
+                    let mut legacy = self.client_pixels.lock().unwrap();
+                    let next_version = legacy.version.wrapping_add(1);
+                    *legacy = ClientSurfaceData {
                         pixels: current.pixels,
                         width: current.width,
                         height: current.height,
                         dirty: true,
+                        version: next_version,
+                        last_commit: None,
                     };
                 }
             }

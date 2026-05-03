@@ -19,8 +19,7 @@ use crate::wayland_state::SpikeState;
 impl FractionalScaleHandler for SpikeState {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
         let scale = self
-            .output
-            .as_ref()
+            .primary_output()
             .map(|o| o.current_scale().fractional_scale())
             .unwrap_or(1.0);
         smithay::wayland::compositor::with_states(&surface, |states| {

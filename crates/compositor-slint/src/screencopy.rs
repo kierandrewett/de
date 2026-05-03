@@ -39,11 +39,7 @@ pub struct CaptureContext<'a> {
 /// client's wl_buffer, and drive the frame to success/fail. Consumes
 /// `frame` so dropping it (failure path included) auto-fails the client
 /// per smithay's contract.
-pub fn process_frame(
-    ctx: &CaptureContext<'_>,
-    frame: Frame,
-    presented: std::time::Duration,
-) {
+pub fn process_frame(ctx: &CaptureContext<'_>, frame: Frame, presented: std::time::Duration) {
     let buffer = frame.buffer();
 
     // Pull the wl_shm parameters we need to size the staging copy. We don't
@@ -104,9 +100,11 @@ pub fn process_frame(
         mapped_at_creation: false,
     });
 
-    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("screencopy-readback"),
-    });
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("screencopy-readback"),
+        });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: ctx.final_tex,
@@ -135,13 +133,12 @@ pub fn process_frame(
     let slot: Arc<std::sync::Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let slot_cb = slot.clone();
-    staging.slice(..).map_async(wgpu::MapMode::Read, move |res| {
-        *slot_cb.lock().unwrap() = Some(res);
-    });
-    if let Err(e) = ctx
-        .device
-        .poll(wgpu::PollType::wait_indefinitely())
-    {
+    staging
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |res| {
+            *slot_cb.lock().unwrap() = Some(res);
+        });
+    if let Err(e) = ctx.device.poll(wgpu::PollType::wait_indefinitely()) {
         warn!("screencopy: device.poll failed: {:?}", e);
         frame.fail(CaptureFailureReason::Unknown);
         return;

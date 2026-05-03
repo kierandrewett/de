@@ -26,11 +26,18 @@ use tracing::debug;
 /// for the cascaded box-blur). 320 px gives noticeably sharper backdrops
 /// than 200 while staying well under 1 ms per refresh.
 const BACKDROP_WIDTH: u32 = 320;
-/// Refresh cadence. 16 ms = effectively per-frame at 60 Hz so window
-/// movement reflects in the dock/panel backdrop with no visible lag.
-/// Cost stays low because the compositing + cascaded box-blur runs at
-/// 320 × ~180 px, not output resolution.
-const REFRESH_MS: u64 = 16;
+/// Refresh cadence. The backdrop is a heavily-blurred wallpaper sample;
+/// even at low resolution the cascaded box-blur + per-window resize is
+/// the hottest piece of CPU work in the per-frame path. Each refresh
+/// snapshot-clones every visible window's pixel buffer (~2 MiB at 800×600
+/// per window) and runs a full Gaussian — measured ~50 ms wall on a
+/// modern desktop. At 100 ms cadence that consumed half the render
+/// thread and produced a periodic 50 ms stall every 100 ms, which the
+/// user perceives as ~20 fps despite the GPU rendering 60+ fps in
+/// between. 500 ms is invisible under σ=14 (the eye can't tell static
+/// from 2 Hz under that much blur) and leaves 90% of the render thread
+/// available for actual frame work.
+const REFRESH_MS: u64 = 500;
 /// Gaussian σ applied after compositing windows onto the wallpaper. Higher
 /// hides the low backdrop resolution and reads as a softer macOS glass.
 const BLUR_SIGMA: f32 = 14.0;
@@ -97,22 +104,37 @@ impl BackdropSynth {
             return;
         };
         let small = img.resize_exact(
-            self.backdrop_w, self.backdrop_h,
+            self.backdrop_w,
+            self.backdrop_h,
             imageops::FilterType::Triangle,
         );
         self.wallpaper_small = Some(small.to_rgba8());
         self.last_at = None;
-        debug!("backdrop: wallpaper resampled to {}×{}", self.backdrop_w, self.backdrop_h);
+        debug!(
+            "backdrop: wallpaper resampled to {}×{}",
+            self.backdrop_w, self.backdrop_h
+        );
+    }
+
+    /// True when a fresh synth is due (throttle window has elapsed) AND the
+    /// wallpaper has been loaded. Callers gate snapshot work on this so we
+    /// don't clone megabytes of window pixels just to throw them away.
+    pub fn should_refresh(&self) -> bool {
+        if self.wallpaper_small.is_none() {
+            return false;
+        }
+        match self.last_at {
+            Some(t) => t.elapsed().as_millis() >= REFRESH_MS as u128,
+            None => true,
+        }
     }
 
     /// Composite the wallpaper + window snapshots and blur. Returns None if
     /// throttled (called within REFRESH_MS of the last successful synth) or
     /// if the wallpaper hasn't been loaded.
     pub fn try_synth(&mut self, windows: &[WindowSnapshot<'_>]) -> Option<slint::Image> {
-        if let Some(t) = self.last_at {
-            if t.elapsed().as_millis() < REFRESH_MS as u128 {
-                return None;
-            }
+        if !self.should_refresh() {
+            return None;
         }
         let base = self.wallpaper_small.as_ref()?.clone();
         let mut canvas = base;
@@ -129,7 +151,9 @@ impl BackdropSynth {
 
             // Build an RgbaImage from the window pixels (zero-copy borrow
             // would be ideal, but image's API requires owned bytes).
-            let Some(buf) = RgbaImage::from_raw(w.buf_w, w.buf_h, w.pixels.to_vec()) else { continue };
+            let Some(buf) = RgbaImage::from_raw(w.buf_w, w.buf_h, w.pixels.to_vec()) else {
+                continue;
+            };
             let scaled = imageops::resize(&buf, target_w, target_h, imageops::FilterType::Triangle);
 
             // Blend into canvas via overlay (the SHM clients' alpha is 255 so
@@ -143,7 +167,9 @@ impl BackdropSynth {
 
         let (bw, bh) = blurred.dimensions();
         let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-            blurred.as_raw(), bw, bh,
+            blurred.as_raw(),
+            bw,
+            bh,
         );
         let img = slint::Image::from_rgba8(buf);
 

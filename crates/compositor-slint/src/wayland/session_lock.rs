@@ -62,7 +62,7 @@ impl SessionLockHandler for SpikeState {
     fn new_surface(&mut self, surface: LockSurface, output: wl_output::WlOutput) {
         // Configure the lock surface to fill the output. The client renders
         // at this size; we composite at the same rect.
-        let (w, h) = output_size(&self.output, &output);
+        let (w, h) = output_size(self.primary_output(), &output);
         surface.with_pending_state(|state| {
             state.size = Some(Size::from((w as u32, h as u32)));
         });
@@ -80,11 +80,9 @@ impl SessionLockHandler for SpikeState {
 /// Look up the size of `wl_output` from our compositor's known `Output` (the
 /// single virtual output for now) and fall back to a sensible default if the
 /// caller hands us a wl_output we don't recognise.
-fn output_size(known: &Option<Output>, _wl: &wl_output::WlOutput) -> (i32, i32) {
-    if let Some(output) = known {
-        if let Some(mode) = output.current_mode() {
-            return (mode.size.w.max(1), mode.size.h.max(1));
-        }
+fn output_size(known: Option<&Output>, _wl: &wl_output::WlOutput) -> (i32, i32) {
+    if let Some(mode) = known.and_then(Output::current_mode) {
+        return (mode.size.w.max(1), mode.size.h.max(1));
     }
     (1280, 960)
 }
