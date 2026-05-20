@@ -696,23 +696,25 @@ impl WindowManager {
         }
     }
 
-    /// Sweep windows whose close animation has settled; returns their surfaces
-    /// for `xdg_toplevel.close` dispatch.
-    pub fn sweep_closed(&mut self) -> Vec<WlSurface> {
+    /// Sweep windows whose close animation has settled; returns their
+    /// `(surface, stable_id)` pairs so the renderer can dispatch the
+    /// `xdg_toplevel.close` AND remove per-window tween state from the
+    /// theme tracker.
+    pub fn sweep_closed(&mut self) -> Vec<(WlSurface, i32)> {
         let mut done_keys: Vec<usize> = Vec::new();
         for (&key, win) in &self.windows {
             if win.close_done() {
                 done_keys.push(key);
             }
         }
-        let mut surfaces = Vec::new();
+        let mut out = Vec::new();
         for key in done_keys {
             if let Some(win) = self.windows.remove(&key) {
-                surfaces.push(win.surface);
+                out.push((win.surface, win.id));
             }
             self.focus_stack.retain(|&k| k != key);
         }
-        surfaces
+        out
     }
 
     /// Focus a window by surface, raise it to the top of z-order.
@@ -835,11 +837,10 @@ impl WindowManager {
             // shadow padding) + our titlebar for SSD.
             let total_w = win.geom_w.max(1) as f64;
             let total_h = win.geom_h.max(1) as f64 + if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
-            if x >= wx && x < wx + total_w && y >= wy && y < wy + total_h {
-                if best.map_or(true, |(_, z)| win.z_order > z) {
+            if x >= wx && x < wx + total_w && y >= wy && y < wy + total_h
+                && best.is_none_or(|(_, z)| win.z_order > z) {
                     best = Some((key, win.z_order));
                 }
-            }
         }
         if let Some((key, _)) = best {
             let new_z = self.next_z;
@@ -1039,11 +1040,10 @@ impl WindowManager {
             let ww = win.geom_w.max(1) as f64;
             let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
             let wh = win.geom_h.max(1) as f64 + titlebar;
-            if x >= wx && x < wx + ww && y >= wy && y < wy + wh {
-                if best.map_or(true, |(_, z)| win.z_order > z) {
+            if x >= wx && x < wx + ww && y >= wy && y < wy + wh
+                && best.is_none_or(|(_, z)| win.z_order > z) {
                     best = Some((key, win.z_order));
                 }
-            }
         }
         let (key, _) = best?;
         let win = self.windows.get(&key)?;
@@ -1084,7 +1084,7 @@ impl WindowManager {
         //                                      the real I-beam.
         // `WindowSurfaceType::ALL` includes both toplevel and subsurfaces.
         let toplevel_origin = Point::<i32, smithay::utils::Logical>::from((
-            (win.anim.current_x() - win.geom_x) as i32,
+            win.anim.current_x() - win.geom_x,
             (win.anim.current_y() as f64 + titlebar - win.geom_y as f64) as i32,
         ));
         let hit = under_from_surface_tree(
@@ -1134,7 +1134,7 @@ impl WindowManager {
             .filter(|&&k| {
                 self.windows
                     .get(&k)
-                    .map_or(false, |w| !w.minimized && !w.closing)
+                    .is_some_and(|w| !w.minimized && !w.closing)
             })
             .count();
         if visible_count < 2 {

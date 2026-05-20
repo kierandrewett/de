@@ -52,6 +52,16 @@ impl XdgShellHandler for SpikeState {
 
         let wl_surface = surface.wl_surface().clone();
 
+        // Register with ext-foreign-toplevel-list-v1 so docks / taskbars /
+        // alt-tab clients see the window appear. Title and app_id are sent
+        // empty here — the client hasn't set them yet at new_toplevel time;
+        // the per-frame sync in renderer.rs::update_windows pushes them as
+        // soon as the client populates `XdgToplevelSurfaceData`.
+        let foreign_handle = Some(
+            self.foreign_toplevel_list_state
+                .new_toplevel::<Self>("", ""),
+        );
+
         // Add to toplevels list.
         self.toplevels.push(ToplevelInfo {
             surface: wl_surface.clone(),
@@ -62,6 +72,13 @@ impl XdgShellHandler for SpikeState {
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             csd: false,
+            foreign_handle,
+            last_advertised_title: String::new(),
+            last_advertised_app_id: String::new(),
+            is_dialog: false,
+            icon_name: None,
+            tag: None,
+            description: None,
         });
 
         // Focus the new toplevel (most recently mapped = focused).
@@ -81,6 +98,9 @@ impl XdgShellHandler for SpikeState {
             s.geometry = geom;
             s.positioner = positioner;
         });
+        // Re-run the constraint solver against the output so the popup never
+        // renders off-screen — anvil/shell/xdg.rs:63.
+        self.unconstrain_popup(&surface);
         let parent = match surface.get_parent_surface() {
             Some(p) => p,
             None => {
@@ -114,6 +134,16 @@ impl XdgShellHandler for SpikeState {
         let wl = surface.wl_surface();
         info!("toplevel destroyed");
 
+        // Send `closed` on the foreign-toplevel handle so taskbars/docks drop
+        // the entry right away (before our close animation finishes). The
+        // entry stays in `self.toplevels` until the WM sweep so the animation
+        // can play.
+        if let Some(t) = self.toplevels.iter().find(|t| &t.surface == wl) {
+            if let Some(h) = &t.foreign_handle {
+                self.foreign_toplevel_list_state.remove_toplevel(h);
+            }
+        }
+
         // Push to destroyed_surfaces so the WM can start a close animation.
         self.destroyed_surfaces.push(wl.clone());
 
@@ -135,9 +165,61 @@ impl XdgShellHandler for SpikeState {
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         let wl = surface.wl_surface().clone();
         self.popups.retain(|p| p.surface != wl);
+        // PopupManager has its own destroy hook so we don't need to remove
+        // explicitly, but the auto-cleanup helper releases the slot now.
+        self.popup_manager.cleanup();
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        // Real popup grab via smithay's PopupManager. Anvil shell/xdg.rs:380.
+        // Without this, GTK/Qt context menus, comboboxes, and submenus don't
+        // get a keyboard grab — keystrokes leak to the parent window — and
+        // dismissal on click-outside the popup hierarchy is best-effort.
+        use smithay::desktop::{
+            find_popup_root_surface, PopupKeyboardGrab, PopupKind, PopupPointerGrab,
+            PopupUngrabStrategy,
+        };
+        use smithay::input::{pointer::Focus, Seat};
+        let seat: Seat<SpikeState> = match Seat::from_resource(&seat) {
+            Some(s) => s,
+            None => return,
+        };
+        let kind = PopupKind::Xdg(surface.clone());
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let ret = self.popup_manager.grab_popup(root, kind, &seat, serial);
+        let mut grab = match ret {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("popup grab failed: {e:?}");
+                return;
+            }
+        };
+        if let Some(keyboard) = seat.get_keyboard() {
+            // Spec: if another grab is in progress with a different serial,
+            // ungrab and bail (anvil pattern).
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+    }
 
     fn reposition_request(
         &mut self,
@@ -147,7 +229,12 @@ impl XdgShellHandler for SpikeState {
     ) {
         surface.with_pending_state(|s| {
             s.geometry = positioner.get_geometry();
+            s.positioner = positioner;
         });
+        // Unconstrain against the output so the popup doesn't render off-screen
+        // when the positioner asks for an anchor close to the edge. Mirrors
+        // anvil/shell/xdg.rs:70-77.
+        self.unconstrain_popup(&surface);
         surface.send_repositioned(token);
     }
 
@@ -160,7 +247,15 @@ impl XdgShellHandler for SpikeState {
         // protocol just needs the trait method to be reachable.
     }
 
-    fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, _serial: Serial) {
+    fn move_request(&mut self, surface: ToplevelSurface, seat: WlSeat, serial: Serial) {
+        // Serial / focus validation, mirrors anvil/shell/xdg.rs:80-97.
+        // Without this, any client could request a move grab at any time —
+        // including when it doesn't have focus or wasn't the recipient of
+        // the most recent pointer/touch button event. Reject the request if
+        // the serial doesn't match a real grab on this surface.
+        if !self.validate_grab_serial(&seat, surface.wl_surface(), serial) {
+            return;
+        }
         // Defer: the renderer has the pointer position + ActiveDrag
         // machinery. It will translate this into an `ActiveDrag::Move`
         // grab on its next iteration.
@@ -170,10 +265,13 @@ impl XdgShellHandler for SpikeState {
     fn resize_request(
         &mut self,
         surface: ToplevelSurface,
-        _seat: WlSeat,
-        _serial: Serial,
+        seat: WlSeat,
+        serial: Serial,
         edges: XdgResizeEdge,
     ) {
+        if !self.validate_grab_serial(&seat, surface.wl_surface(), serial) {
+            return;
+        }
         let edge = match edges {
             XdgResizeEdge::Top => ResizeEdge::North,
             XdgResizeEdge::Bottom => ResizeEdge::South,

@@ -233,6 +233,19 @@ impl XWaylandShellHandler for SpikeState {
                 .user_data()
                 .insert_if_missing(|| X11OverrideRedirect);
         }
+        // Register with ext-foreign-toplevel-list-v1 — but only for managed
+        // windows; X11 override-redirect surfaces are tooltips/menus, not
+        // toplevels (cosmic skips them too).
+        let title = x11_surface.title();
+        let app_id = x11_surface.class();
+        let foreign_handle = if is_or {
+            None
+        } else {
+            Some(
+                self.foreign_toplevel_list_state
+                    .new_toplevel::<Self>(&title, &app_id),
+            )
+        };
         self.toplevels.push(ToplevelInfo {
             surface: wl_surface.clone(),
             toplevel: None,
@@ -242,6 +255,13 @@ impl XWaylandShellHandler for SpikeState {
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             csd: !x11_surface.is_decorated(),
+            foreign_handle,
+            last_advertised_title: title.clone(),
+            last_advertised_app_id: app_id.clone(),
+            is_dialog: false,
+            icon_name: None,
+            tag: None,
+            description: None,
         });
         // OR windows aren't focusable / managed — they piggyback on the
         // parent's keyboard focus (xterm popup menu, GTK dropdown).
@@ -333,6 +353,12 @@ impl XwmHandler for SpikeState {
                 let cascade = self.toplevels.len() as i32;
                 let x = 100 + cascade * 40;
                 let y = 100 + cascade * 40;
+                let title = window.title();
+                let app_id = window.class();
+                let foreign_handle = Some(
+                    self.foreign_toplevel_list_state
+                        .new_toplevel::<Self>(&title, &app_id),
+                );
                 self.toplevels.push(ToplevelInfo {
                     surface: wl_surface.clone(),
                     toplevel: None,
@@ -342,6 +368,13 @@ impl XwmHandler for SpikeState {
                     pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
                     surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     csd: !window.is_decorated(),
+                    foreign_handle,
+                    last_advertised_title: title.clone(),
+                    last_advertised_app_id: app_id.clone(),
+                    is_dialog: false,
+                    icon_name: None,
+                    tag: None,
+                    description: None,
                 });
                 self.active_surface = Some(wl_surface.clone());
                 if let Some(kb) = self.seat.get_keyboard() {
@@ -399,6 +432,16 @@ impl XwmHandler for SpikeState {
                     // OR windows always paint everything they need themselves
                     // — never add SSD chrome.
                     csd: true,
+                    // Override-redirect = X11 tooltip/menu, not a toplevel
+                    // from the user's perspective. Skip foreign-toplevel-list
+                    // (matches cosmic-comp behaviour).
+                    foreign_handle: None,
+                    last_advertised_title: String::new(),
+                    last_advertised_app_id: String::new(),
+                    is_dialog: false,
+                    icon_name: None,
+                    tag: None,
+                    description: None,
                 });
             }
         } else {
@@ -413,6 +456,14 @@ impl XwmHandler for SpikeState {
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
         debug!("X11: unmapped id={:?}", window.window_id());
         if let Some(wl_surface) = window.wl_surface() {
+            // Drop the foreign-toplevel-list entry before retain() removes
+            // the ToplevelInfo. Taskbars/docks see the window disappear
+            // immediately.
+            if let Some(t) = self.toplevels.iter().find(|t| t.surface == wl_surface) {
+                if let Some(h) = &t.foreign_handle {
+                    self.foreign_toplevel_list_state.remove_toplevel(h);
+                }
+            }
             self.destroyed_surfaces.push(wl_surface.clone());
             self.toplevels.retain(|t| t.surface != wl_surface);
             if self.active_surface.as_ref() == Some(&wl_surface) {
@@ -427,10 +478,25 @@ impl XwmHandler for SpikeState {
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
         debug!("X11: destroyed id={:?}", window.window_id());
         if let Some(wl_surface) = window.wl_surface() {
-            self.destroyed_surfaces.push(wl_surface.clone());
-            self.toplevels.retain(|t| t.surface != wl_surface);
-            if self.active_surface.as_ref() == Some(&wl_surface) {
-                self.active_surface = self.toplevels.last().map(|t| t.surface.clone());
+            // `unmapped_window` typically fires first and already removed the
+            // foreign-toplevel entry + ToplevelInfo; the guards below are
+            // idempotent so the same code is safe on both paths.
+            if let Some(t) = self.toplevels.iter().find(|t| t.surface == wl_surface) {
+                if let Some(h) = &t.foreign_handle {
+                    self.foreign_toplevel_list_state.remove_toplevel(h);
+                }
+            }
+            // Bug fix: previously this also pushed to destroyed_surfaces
+            // unconditionally, which fired the close animation a second time
+            // when `unmapped_window` had already pushed it. Only push if the
+            // surface is still in our toplevels list (i.e. unmapped never ran).
+            let already_swept = !self.toplevels.iter().any(|t| t.surface == wl_surface);
+            if !already_swept {
+                self.destroyed_surfaces.push(wl_surface.clone());
+                self.toplevels.retain(|t| t.surface != wl_surface);
+                if self.active_surface.as_ref() == Some(&wl_surface) {
+                    self.active_surface = self.toplevels.last().map(|t| t.surface.clone());
+                }
             }
         }
     }
@@ -454,7 +520,46 @@ impl XwmHandler for SpikeState {
         if let Some(h) = h {
             geo.size.h = h as i32;
         }
+        // Clamp to the client's own WM_NORMAL_HINTS min/max so we don't shrink
+        // an X11 app below its declared minimum (the spec says compositors MUST
+        // honour these; older audit flagged this as silently dropped).
+        if let Some(min) = window.min_size() {
+            if min.w > 0 {
+                geo.size.w = geo.size.w.max(min.w);
+            }
+            if min.h > 0 {
+                geo.size.h = geo.size.h.max(min.h);
+            }
+        }
+        if let Some(max) = window.max_size() {
+            if max.w > 0 {
+                geo.size.w = geo.size.w.min(max.w);
+            }
+            if max.h > 0 {
+                geo.size.h = geo.size.h.min(max.h);
+            }
+        }
         let _ = window.configure(geo);
+    }
+
+    fn active_window_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _timestamp: u32,
+        _currently_active_window: Option<X11Surface>,
+    ) {
+        // X11 client requested focus (e.g. via _NET_ACTIVE_WINDOW from another
+        // X11 app, or its own urgency handling). Honour it by raising the
+        // associated wl_surface and setting it as the keyboard focus.
+        let Some(wl_surface) = window.wl_surface() else {
+            return;
+        };
+        self.active_surface = Some(wl_surface.clone());
+        if let Some(kb) = self.seat.get_keyboard() {
+            kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+        }
+        let _ = window.set_activated(true);
     }
 
     fn configure_notify(
@@ -469,6 +574,21 @@ impl XwmHandler for SpikeState {
             window.window_id(),
             geometry
         );
+        // For override-redirect windows the X11 client places itself
+        // unilaterally — the compositor must follow. Update the tracked
+        // position so the renderer composites the OR surface at the new
+        // location (otherwise tooltips/menus stay glued to their map-time
+        // position when X11 apps move them).
+        if !window.is_override_redirect() {
+            return;
+        }
+        let Some(wl_surface) = window.wl_surface() else {
+            return;
+        };
+        if let Some(tl) = self.toplevels.iter_mut().find(|t| t.surface == wl_surface) {
+            tl.x = geometry.loc.x;
+            tl.y = geometry.loc.y;
+        }
     }
 
     fn resize_request(
@@ -546,7 +666,13 @@ impl XwmHandler for SpikeState {
     }
 
     fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        // Symmetric with `minimize_request` — bridge into the WM via the
+        // pending queue so the renderer's tick drives the restore
+        // animation. Audit flagged this as asymmetric (was a bare set_hidden).
         let _ = window.set_hidden(false);
+        if let Some(wl_surface) = window.wl_surface() {
+            self.pending_xdg_restore.push(wl_surface);
+        }
     }
 
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
@@ -557,6 +683,22 @@ impl XwmHandler for SpikeState {
                     window.title(),
                     window.window_id()
                 );
+                // Push the title change through the foreign-toplevel handle
+                // immediately. The per-frame sync_foreign_toplevels catches
+                // it within a frame anyway, but this gives taskbars an
+                // event the same tick the X11 client changed _NET_WM_NAME.
+                if let Some(wl_surface) = window.wl_surface() {
+                    if let Some(tl) = self.toplevels.iter_mut().find(|t| t.surface == wl_surface) {
+                        if let Some(handle) = &tl.foreign_handle {
+                            let new_title = window.title();
+                            if new_title != tl.last_advertised_title {
+                                handle.send_title(&new_title);
+                                handle.send_done();
+                                tl.last_advertised_title = new_title;
+                            }
+                        }
+                    }
+                }
             }
             WmWindowProperty::Class => {
                 debug!(
@@ -564,11 +706,36 @@ impl XwmHandler for SpikeState {
                     window.class(),
                     window.window_id()
                 );
+                if let Some(wl_surface) = window.wl_surface() {
+                    if let Some(tl) = self.toplevels.iter_mut().find(|t| t.surface == wl_surface) {
+                        if let Some(handle) = &tl.foreign_handle {
+                            let new_app_id = window.class();
+                            if new_app_id != tl.last_advertised_app_id {
+                                handle.send_app_id(&new_app_id);
+                                handle.send_done();
+                                tl.last_advertised_app_id = new_app_id;
+                            }
+                        }
+                    }
+                }
             }
             WmWindowProperty::TransientFor => {
                 // Re-resolve: the parent may have only just been mapped, or
                 // the client may have re-targeted (rare but legal).
                 refresh_transient_for(self, &window);
+            }
+            WmWindowProperty::Hints => {
+                // WM_HINTS.urgency tracks "demands attention". Future:
+                // surface this on ToplevelInfo and let the taskbar flash;
+                // for now log so we can confirm the wiring's reaching us.
+                if let Some(hints) = window.hints() {
+                    debug!(
+                        "X11: WM_HINTS urgent={:?} input={:?} (id={:?})",
+                        hints.urgent,
+                        hints.input,
+                        window.window_id()
+                    );
+                }
             }
             _ => {}
         }
@@ -577,11 +744,26 @@ impl XwmHandler for SpikeState {
     // ── Selection bridge (X11 <-> wayland clipboard / primary). Mirrors
     //    anvil one-for-one — smithay handles most of the plumbing once these
     //    are wired up.
-    fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
-        // We don't track the focused-surface→xwm mapping yet, so allow the
-        // bridge unconditionally. TODO: gate on whether the focused surface
-        // belongs to this xwm.
-        true
+    fn allow_selection_access(&mut self, xwm: XwmId, _selection: SelectionTarget) -> bool {
+        // Security gate, mirrors anvil/shell/x11.rs:259-271 and
+        // cosmic/xwayland.rs:1233. Only allow this xwm to read the wayland
+        // clipboard when the currently-focused window is in fact an X11
+        // window owned by this xwm — i.e. the user is interacting with an
+        // Xwayland app. Otherwise any X11 client could spy on whatever the
+        // user just copied in a Wayland app.
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return false;
+        };
+        let Some(focus) = keyboard.current_focus() else {
+            return false;
+        };
+        self.toplevels.iter().any(|t| {
+            t.surface == focus
+                && t.x11_surface
+                    .as_ref()
+                    .and_then(|x| x.xwm_id())
+                    .is_some_and(|id| id == xwm)
+        })
     }
 
     fn send_selection(

@@ -60,9 +60,11 @@ impl SessionLockHandler for SpikeState {
     }
 
     fn new_surface(&mut self, surface: LockSurface, output: wl_output::WlOutput) {
-        // Configure the lock surface to fill the output. The client renders
-        // at this size; we composite at the same rect.
-        let (w, h) = output_size(self.primary_output(), &output);
+        // Match the wl_output resource to one of our smithay Outputs and
+        // use THAT output's mode — not primary's. Fixes the multi-output
+        // session-lock bug from the audit where every output's lock
+        // surface was configured at the primary's resolution.
+        let (w, h) = output_size(&self.outputs, &output);
         surface.with_pending_state(|state| {
             state.size = Some(Size::from((w as u32, h as u32)));
         });
@@ -77,11 +79,22 @@ impl SessionLockHandler for SpikeState {
     }
 }
 
-/// Look up the size of `wl_output` from our compositor's known `Output` (the
-/// single virtual output for now) and fall back to a sensible default if the
-/// caller hands us a wl_output we don't recognise.
-fn output_size(known: Option<&Output>, _wl: &wl_output::WlOutput) -> (i32, i32) {
-    if let Some(mode) = known.and_then(Output::current_mode) {
+/// Resolve a `wl_output` resource to an actual logical-pixel size by walking
+/// our `Output` list and matching client_outputs. Falls back to primary, then
+/// to a sensible default if we have no outputs at all.
+fn output_size(outputs: &[Output], wl: &wl_output::WlOutput) -> (i32, i32) {
+    use smithay::reexports::wayland_server::Resource;
+    let client = wl.client();
+    if let Some(client) = client {
+        for out in outputs {
+            if out.client_outputs(&client).into_iter().any(|c| &c == wl) {
+                if let Some(mode) = out.current_mode() {
+                    return (mode.size.w.max(1), mode.size.h.max(1));
+                }
+            }
+        }
+    }
+    if let Some(mode) = outputs.first().and_then(Output::current_mode) {
         return (mode.size.w.max(1), mode.size.h.max(1));
     }
     (1280, 960)

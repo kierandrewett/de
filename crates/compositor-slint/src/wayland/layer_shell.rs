@@ -75,16 +75,6 @@ pub struct LayerInfo {
 }
 
 impl LayerInfo {
-    /// Whether this layer surface participates in keyboard focus routing
-    /// (None = never; OnDemand = via normal click-to-focus; Exclusive = takes
-    /// focus from toplevels while mapped).
-    pub fn can_receive_keyboard_focus(&self) -> bool {
-        matches!(
-            self.keyboard_interactivity,
-            KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand
-        )
-    }
-
     /// True when this layer surface is on Top/Overlay and asked for exclusive
     /// keyboard focus (lock screens, password prompts, app launchers).
     pub fn wants_exclusive_keyboard(&self) -> bool {
@@ -178,12 +168,6 @@ fn effective_exclusive_edge(anchor: Anchor, explicit: Option<Anchor>) -> Option<
 }
 
 impl SpikeState {
-    /// Return all currently-mapped layer surfaces, ordered as received.
-    /// Render code should iterate and z-sort by `LayerInfo::layer`.
-    pub fn layer_surfaces(&self) -> &[LayerInfo] {
-        &self.layer_surfaces
-    }
-
     /// Per-edge sum of exclusive zones across all currently mapped Top +
     /// Bottom layer surfaces. Background / Overlay layers are not subtracted
     /// from the toplevel work area (Background sits beneath windows, and
@@ -215,17 +199,13 @@ impl SpikeState {
         // Overlay outranks Top.
         let overlay = self
             .layer_surfaces
-            .iter()
-            .filter(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Overlay))
-            .next_back();
+            .iter().rfind(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Overlay));
         if let Some(l) = overlay {
             return Some(l.surface.wl_surface());
         }
         let top = self
             .layer_surfaces
-            .iter()
-            .filter(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Top))
-            .next_back();
+            .iter().rfind(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Top));
         top.map(|l| l.surface.wl_surface())
     }
 

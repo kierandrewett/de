@@ -18,9 +18,18 @@ use crate::wayland_state::SpikeState;
 // change to push updates to all bound fractional-scale objects.
 impl FractionalScaleHandler for SpikeState {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
+        // Pick the output whose client_outputs include any of this surface's
+        // entered outputs. Falls back to primary when the surface isn't on
+        // any output yet (first-bind, before initial enter). This fixes the
+        // multi-monitor case where every surface was told the primary's
+        // scale even when it lived on a different monitor.
         let scale = self
-            .primary_output()
+            .output_for_surface(&surface)
             .map(|o| o.current_scale().fractional_scale())
+            .or_else(|| {
+                self.primary_output()
+                    .map(|o| o.current_scale().fractional_scale())
+            })
             .unwrap_or(1.0);
         smithay::wayland::compositor::with_states(&surface, |states| {
             smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {

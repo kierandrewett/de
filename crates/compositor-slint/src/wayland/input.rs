@@ -36,20 +36,48 @@ impl PointerConstraintsHandler for SpikeState {
         surface: &WlSurface,
         pointer: &smithay::input::pointer::PointerHandle<Self>,
     ) {
-        // Auto-activate any constraint when created.
-        with_pointer_constraint(surface, pointer, |c| {
-            if let Some(c) = c {
-                c.activate();
-            }
-        });
+        // Anvil/state.rs:367 pattern: only auto-activate when the constraint
+        // surface is currently the pointer focus. Otherwise a client could
+        // request a lock on a surface that isn't even under the pointer and
+        // hijack input the next time the cursor wanders over it.
+        let Some(current_focus) = pointer.current_focus() else {
+            return;
+        };
+        if &current_focus == surface {
+            with_pointer_constraint(surface, pointer, |c| {
+                if let Some(c) = c {
+                    c.activate();
+                }
+            });
+        }
     }
 
     fn cursor_position_hint(
         &mut self,
-        _surface: &WlSurface,
-        _pointer: &smithay::input::pointer::PointerHandle<Self>,
-        _location: smithay::utils::Point<f64, Logical>,
+        surface: &WlSurface,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        location: smithay::utils::Point<f64, Logical>,
     ) {
+        // Honoured only when the constraint is active — games (CS2, Counter-
+        // Strike, etc.) use this to recentre the cursor inside the locked
+        // surface so their HUD crosshair matches the OS pointer position.
+        let active =
+            with_pointer_constraint(surface, pointer, |c| c.is_some_and(|c| c.is_active()));
+        if !active {
+            return;
+        }
+        // Translate the surface-local hint to compositor coordinates by
+        // looking up the toplevel that owns this surface. For X11 OR or
+        // popups (rare for constraints) we fall back to the current pointer
+        // location.
+        let origin = self
+            .toplevels
+            .iter()
+            .find(|t| t.surface == *surface)
+            .map(|t| smithay::utils::Point::from((t.x as f64, t.y as f64)))
+            .unwrap_or_else(|| pointer.current_location());
+        pointer.set_location(origin + location);
+        self.pointer_pos = ((origin + location).x, (origin + location).y);
     }
 }
 
@@ -99,7 +127,20 @@ impl InputMethodHandler for SpikeState {
     fn new_popup(&mut self, _surface: PopupSurface) {}
     fn dismiss_popup(&mut self, _surface: PopupSurface) {}
     fn popup_repositioned(&mut self, _surface: PopupSurface) {}
-    fn parent_geometry(&self, _parent: &WlSurface) -> Rectangle<i32, Logical> {
+    fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, Logical> {
+        // Locate the parent in our toplevels list so the IME popup
+        // (candidate window / emoji picker) anchors against the actual
+        // window position. Was returning Rectangle::default() (0,0,0,0)
+        // → fcitx5 / ibus drew their candidate window in the top-left
+        // corner regardless of where the text field actually was.
+        if let Some(tl) = self.toplevels.iter().find(|t| &t.surface == parent) {
+            // Use the buffer-detected geometry if available, fall back to
+            // a 1×1 anchor rect at the toplevel origin.
+            return Rectangle::new(
+                smithay::utils::Point::from((tl.x, tl.y)),
+                smithay::utils::Size::from((1, 1)),
+            );
+        }
         Rectangle::default()
     }
 }

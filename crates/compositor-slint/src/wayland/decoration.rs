@@ -81,6 +81,48 @@ impl KdeDecorationHandler for SpikeState {
     fn kde_decoration_state(&self) -> &KdeDecorationState {
         &self.kde_decoration_state
     }
+
+    fn new_decoration(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        decoration: &wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration,
+    ) {
+        // Tell the Qt/KWin-style client up-front that we draw decorations
+        // server-side (default mode). Without this, Qt 5/6 apps that opt
+        // into kde-server-decoration but not xdg-decoration end up either
+        // double-decorated or fully undecorated depending on the Qt
+        // version. Pattern matches the protocol's `default_mode` semantics.
+        use wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
+        decoration.mode(Mode::Server);
+        let _ = surface;
+    }
+
+    fn request_mode(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        decoration: &wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration,
+        mode: smithay::reexports::wayland_server::WEnum<
+            wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode,
+        >,
+    ) {
+        // Mirror what we do for xdg-decoration: clients may request CSD via
+        // Client mode; anything else gets ServerSide. Apps that don't
+        // honour our reply (Qt5 on some versions) will end up double-
+        // decorated, which is preferable to undecorated.
+        use smithay::reexports::wayland_server::WEnum;
+        use wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
+        let resolved = match mode {
+            WEnum::Value(Mode::Client) => Mode::Client,
+            _ => Mode::Server,
+        };
+        decoration.mode(resolved);
+        // Mirror into our ToplevelInfo so the chrome renderer knows whether
+        // to draw an SSD titlebar over this surface.
+        let csd = matches!(resolved, Mode::Client);
+        if let Some(tl) = self.toplevels.iter_mut().find(|t| &t.surface == surface) {
+            tl.csd = csd;
+        }
+    }
 }
 
 delegate_kde_decoration!(SpikeState);

@@ -26,8 +26,10 @@ use smithay::backend::{
     },
     egl::{context::ContextPriority, EGLContext, EGLDisplay},
     input::{
-        Axis, Device as InputDevice, DeviceCapability, Event as InputBackendEvent, InputEvent,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        AbsolutePositionEvent, Axis, Device as InputDevice, DeviceCapability,
+        Event as InputBackendEvent, GestureBeginEvent, GestureEndEvent,
+        GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _, InputEvent, KeyboardKeyEvent,
+        PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent as _,
     },
     libinput::{LibinputInputBackend, LibinputSessionInterface},
     renderer::{element::solid::SolidColorRenderElement, gles::GlesRenderer},
@@ -409,7 +411,7 @@ impl UdevRuntime {
         Ok((drm, render))
     }
 
-    fn create_render_probe(fd: DrmDeviceFd, path: &PathBuf) -> Result<RenderProbe> {
+    fn create_render_probe(fd: DrmDeviceFd, path: &std::path::Path) -> Result<RenderProbe> {
         let gbm = GbmDevice::new(fd).map_err(|err| {
             anyhow::anyhow!(
                 "failed to create GBM device for {}: {err:?}",
@@ -688,6 +690,11 @@ impl UdevRuntime {
 }
 
 fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &mut SpikeState) {
+    // Reset the ext-idle-notify-v1 timers on any user input — without this
+    // the screen-locker fires while the user is actively typing/clicking
+    // (cosmic-comp/src/input/mod.rs:212 mirrors this pattern). Cheap: a
+    // `Vec<IdleNotification>` walk per event.
+    state.idle_notifier_state.notify_activity(&state.seat);
     match event {
         InputEvent::Keyboard { event } => {
             let surface = if state.session_locked {
@@ -706,7 +713,13 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
                 return;
             };
 
-            keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+            // Only re-issue set_focus when the target actually changed.
+            // Per-keystroke set_focus calls re-send wl_keyboard.enter/leave
+            // and bump modifier serials (input audit P0.7) — clients see a
+            // serial storm that interacts badly with grabs.
+            if keyboard.current_focus().as_ref() != Some(&surface) {
+                keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+            }
             keyboard.input_forward(
                 state,
                 event.key_code(),
@@ -756,10 +769,18 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
                 return;
             };
             let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
+            // Finger-source events deliver a zero-delta "stop" frame when the
+            // finger lifts off the touchpad. Without emitting `axis_stop` to
+            // clients, kinetic scrolling never settles — every smooth-scroll
+            // surface in GTK/Qt keeps the bottom-out indicator drawn.
+            let is_finger = event.source() == smithay::backend::input::AxisSource::Finger;
             for axis in [Axis::Horizontal, Axis::Vertical] {
                 if let Some(value) = event.amount(axis) {
                     if value != 0.0 {
                         frame = frame.value(axis, value);
+                    } else if is_finger {
+                        // Zero amount on a finger event = lift-off on this axis.
+                        frame = frame.stop(axis);
                     }
                 }
                 if let Some(v120) = event.amount_v120(axis) {
@@ -771,6 +792,183 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
             }
             pointer.axis(state, frame);
             pointer.frame(state);
+        }
+        // ─── Touchpad gestures (pointer-gestures-unstable-v1) ────────────
+        // Three- and four-finger swipes, pinches, holds. Browsers, Wayfire
+        // panels, KDE's overview gesture, GNOME's "swipe up to overview" all
+        // consume these. Anvil/input_handler.rs:1054-1154 is the reference.
+        InputEvent::GestureSwipeBegin { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_swipe_begin(
+                state,
+                &smithay::input::pointer::GestureSwipeBeginEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    fingers: event.fingers(),
+                },
+            );
+        }
+        InputEvent::GestureSwipeUpdate { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_swipe_update(
+                state,
+                &smithay::input::pointer::GestureSwipeUpdateEvent {
+                    time: event.time_msec(),
+                    delta: event.delta(),
+                },
+            );
+        }
+        InputEvent::GestureSwipeEnd { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_swipe_end(
+                state,
+                &smithay::input::pointer::GestureSwipeEndEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                },
+            );
+        }
+        InputEvent::GesturePinchBegin { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_pinch_begin(
+                state,
+                &smithay::input::pointer::GesturePinchBeginEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    fingers: event.fingers(),
+                },
+            );
+        }
+        InputEvent::GesturePinchUpdate { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_pinch_update(
+                state,
+                &smithay::input::pointer::GesturePinchUpdateEvent {
+                    time: event.time_msec(),
+                    delta: event.delta(),
+                    scale: event.scale(),
+                    rotation: event.rotation(),
+                },
+            );
+        }
+        InputEvent::GesturePinchEnd { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_pinch_end(
+                state,
+                &smithay::input::pointer::GesturePinchEndEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                },
+            );
+        }
+        InputEvent::GestureHoldBegin { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_hold_begin(
+                state,
+                &smithay::input::pointer::GestureHoldBeginEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    fingers: event.fingers(),
+                },
+            );
+        }
+        InputEvent::GestureHoldEnd { event } => {
+            let Some(pointer) = state.seat.get_pointer() else {
+                return;
+            };
+            pointer.gesture_hold_end(
+                state,
+                &smithay::input::pointer::GestureHoldEndEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                    cancelled: event.cancelled(),
+                },
+            );
+        }
+        InputEvent::TouchDown { event } => {
+            let Some(touch) = state.seat.get_touch() else {
+                return;
+            };
+            let Some(loc) = libinput_touch_location(state, &event) else {
+                return;
+            };
+            // Touch acts like a click for keyboard focus: bring the surface
+            // under the contact point to the top.
+            let surface_at = surface_under_for_touch(state, loc.x, loc.y);
+            if let Some((surface, _, _)) = surface_at.as_ref() {
+                if let Some(kb) = state.seat.get_keyboard() {
+                    kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+                }
+            }
+            let under = surface_at.map(|(s, ox, oy)| (s, Point::from((ox, oy))));
+            touch.down(
+                state,
+                under,
+                &smithay::input::touch::DownEvent {
+                    slot: event.slot(),
+                    location: loc,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                },
+            );
+        }
+        InputEvent::TouchMotion { event } => {
+            let Some(touch) = state.seat.get_touch() else {
+                return;
+            };
+            let Some(loc) = libinput_touch_location(state, &event) else {
+                return;
+            };
+            let under = surface_under_for_touch(state, loc.x, loc.y)
+                .map(|(s, ox, oy)| (s, Point::from((ox, oy))));
+            touch.motion(
+                state,
+                under,
+                &smithay::input::touch::MotionEvent {
+                    slot: event.slot(),
+                    location: loc,
+                    time: event.time_msec(),
+                },
+            );
+        }
+        InputEvent::TouchUp { event } => {
+            let Some(touch) = state.seat.get_touch() else {
+                return;
+            };
+            touch.up(
+                state,
+                &smithay::input::touch::UpEvent {
+                    slot: event.slot(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: event.time_msec(),
+                },
+            );
+        }
+        InputEvent::TouchFrame { .. } => {
+            if let Some(touch) = state.seat.get_touch() {
+                touch.frame(state);
+            }
+        }
+        InputEvent::TouchCancel { .. } => {
+            if let Some(touch) = state.seat.get_touch() {
+                touch.cancel(state);
+            }
         }
         InputEvent::DeviceAdded { device } => {
             if InputDevice::has_capability(&device, DeviceCapability::Touch)
@@ -785,4 +983,56 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
         }
         other => info!(?other, "udev backend: input event observed"),
     }
+}
+
+/// Map a libinput absolute-position event (normalised 0..1) into the
+/// compositor's logical-pixel coordinate space using the primary output's
+/// current mode + scale. Returns None until we have a registered output.
+fn libinput_touch_location<E>(
+    state: &SpikeState,
+    event: &E,
+) -> Option<Point<f64, smithay::utils::Logical>>
+where
+    E: AbsolutePositionEvent<LibinputInputBackend>,
+{
+    let output = state.primary_output()?;
+    let mode = output.current_mode()?;
+    let scale = output.current_scale().fractional_scale();
+    let logical_w = mode.size.w as f64 / scale;
+    let logical_h = mode.size.h as f64 / scale;
+    Some(Point::from((
+        event.x_transformed(logical_w as i32),
+        event.y_transformed(logical_h as i32),
+    )))
+}
+
+/// Surface lookup for touch events. Honours the session lock the same way the
+/// renderer's `forward_pointer_motion` does — touches go ONLY to the lock
+/// surface while locked.
+fn surface_under_for_touch(
+    state: &SpikeState,
+    x: f64,
+    y: f64,
+) -> Option<(
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    f64,
+    f64,
+)> {
+    if state.session_locked {
+        return state
+            .lock_surfaces
+            .first()
+            .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0));
+    }
+    // Best-effort: the udev backend currently has no access to the WM's
+    // surface_under since the renderer owns the WindowManager. Fall back to
+    // "topmost toplevel" — good enough for touch-to-focus on a foreground
+    // window. The full surface tree walk lives in WindowManager::surface_under,
+    // which the production touch path will need once the udev backend
+    // actually drives a frame loop.
+    let _ = (x, y);
+    state
+        .toplevels
+        .last()
+        .map(|tl| (tl.surface.clone(), 0.0, 0.0))
 }

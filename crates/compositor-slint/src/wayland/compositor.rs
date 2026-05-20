@@ -77,6 +77,12 @@ impl CompositorHandler for SpikeState {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
+        // Drive smithay's PopupManager through this commit. It walks the
+        // popup tree rooted at `surface` and sends `xdg_popup.configure`
+        // events when geometry changed (required by xdg-shell spec).
+        // Idempotent when surface isn't a popup or no popup is mid-config.
+        self.popup_manager.commit(surface);
+
         // wp_fifo_v1 barrier: signal the just-committed barrier IMMEDIATELY,
         // before any subsequent commit can overwrite `current.barrier`.
         //

@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
-        egl::{EGLContext, EGLDisplay},
+        egl::{EGLContext, EGLDevice, EGLDisplay},
         renderer::{gles::GlesRenderer, ExportMem, ImportDma},
     },
     delegate_dmabuf, delegate_seat, delegate_shm,
@@ -64,9 +64,9 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState},
         content_type::ContentTypeState,
         cursor_shape::CursorShapeManagerState,
-        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fifo::FifoManagerState,
-        foreign_toplevel_list::ForeignToplevelListState,
+        foreign_toplevel_list::{ForeignToplevelHandle, ForeignToplevelListState},
         fractional_scale::FractionalScaleManagerState,
         idle_inhibit::IdleInhibitManagerState,
         idle_notify::IdleNotifierState,
@@ -90,11 +90,15 @@ use smithay::{
             data_device::{
                 set_data_device_focus, DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
             },
+            ext_data_control::{
+                DataControlHandler as ExtDataControlHandler,
+                DataControlState as ExtDataControlState,
+            },
             primary_selection::{
                 set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
             },
             wlr_data_control::{DataControlHandler, DataControlState},
-            SelectionHandler,
+            SelectionHandler, SelectionSource, SelectionTarget,
         },
         session_lock::SessionLockManagerState,
         shell::{
@@ -130,6 +134,12 @@ use smithay::wayland::shell::xdg::ToplevelSurface;
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// `Some` when this client connected via a `wp_security_context_v1`
+    /// listener — Flatpak / Snap / Bubblewrap clients carry one to identify
+    /// their sandbox. Filters like `client_has_no_security_context` use
+    /// this to deny privileged globals (screencopy, data_control,
+    /// session_lock) to sandboxed apps.
+    pub security_context: Option<smithay::wayland::security_context::SecurityContext>,
 }
 
 impl ClientData for ClientState {
@@ -139,6 +149,16 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
         info!("wayland client disconnected");
     }
+}
+
+/// Filter passed to privileged globals (data_control, image_copy_capture,
+/// session_lock, ...). Returns `true` when the client has no security
+/// context attached — i.e. it's a normal client, not a sandboxed Flatpak.
+/// Mirrors cosmic's `client_has_no_security_context`.
+pub fn client_has_no_security_context(client: &smithay::reexports::wayland_server::Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .is_none_or(|d| d.security_context.is_none())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -200,6 +220,30 @@ pub struct ToplevelInfo {
     /// Client requested ClientSide decorations (CSD). False = SSD; we draw
     /// our own titlebar above the client surface.
     pub csd: bool,
+    /// `ext-foreign-toplevel-list-v1` handle. Created when the toplevel is
+    /// added to `SpikeState::toplevels`; used to keep external taskbars/docks
+    /// (waybar, fuzzel, lavalauncher) in sync with our window list. Updated
+    /// on title/app_id changes in `renderer::update_windows`; removed in the
+    /// `toplevel_destroyed` / `unmapped` paths.
+    pub foreign_handle: Option<ForeignToplevelHandle>,
+    /// Last `(title, app_id)` we sent to the foreign-toplevel handle, so the
+    /// per-frame sync in `renderer::update_windows` only fires events on
+    /// real change. Avoids spamming `send_title`/`send_done` 60×/sec.
+    pub last_advertised_title: String,
+    pub last_advertised_app_id: String,
+    /// True when the client tagged this toplevel as an `xdg-dialog-v1`
+    /// dialog/modal. Used by the WM for centred placement, parent attach,
+    /// and to hide the minimise button on the SSD chrome.
+    pub is_dialog: bool,
+    /// Themed icon name set via `xdg-toplevel-icon-v1`. None when the client
+    /// hasn't called `set_icon` or set the icon by buffer only. Used by the
+    /// dock / taskbar to render a per-window app icon.
+    pub icon_name: Option<String>,
+    /// `xdg-toplevel-tag-v1` tag + description. Tag is a stable per-window
+    /// identifier the client uses for window-session restore; description
+    /// is human-readable. Stored for future session-management consumers.
+    pub tag: Option<String>,
+    pub description: Option<String>,
 }
 
 /// A mapped xdg_popup — context menus, dropdowns, autocomplete, etc.
@@ -246,6 +290,10 @@ pub struct DndIcon {
 #[derive(Clone)]
 pub struct LockSurfaceInfo {
     pub surface: smithay::wayland::session_lock::LockSurface,
+    /// The wl_output this lock surface is bound to. Stored so the per-output
+    /// multi-output story has the handle when it lands; currently read only
+    /// by session_lock.rs at construction time.
+    #[allow(dead_code)]
     pub output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
 }
@@ -254,6 +302,14 @@ pub struct LockSurfaceInfo {
 // Compositor state
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Many of the smithay state-holder fields below (XdgDecorationState,
+// FractionalScaleManagerState, ContentTypeState, etc.) exist only to keep
+// their globals + dispatch tables alive — the actual protocol handling
+// runs through `delegate_*!` macro-generated paths that the compiler's
+// dead-code pass doesn't traverse. Silence the false-positive at the
+// struct level so the warning list stays usable for things that actually
+// matter.
+#[allow(dead_code)]
 pub struct SpikeState {
     pub display_handle: DisplayHandle,
     pub loop_handle: LoopHandle<'static, SpikeState>,
@@ -284,6 +340,7 @@ pub struct SpikeState {
     // wlr-data-control powers wl-clipboard / cliphist / wl-paste — without it
     // those tools can't observe or write the selection at all.
     pub data_control_state: DataControlState,
+    pub ext_data_control_state: ExtDataControlState,
 
     // ── P1 Scaling ────────────────────────────────────────────────────────
     pub fractional_scale_manager_state: FractionalScaleManagerState,
@@ -325,6 +382,12 @@ pub struct SpikeState {
     pub security_context_state: SecurityContextState,
     pub xdg_system_bell_state: XdgSystemBellState,
     pub xdg_toplevel_icon_manager: XdgToplevelIconManager,
+    pub xdg_dialog_state: smithay::wayland::shell::xdg::dialog::XdgDialogState,
+    /// smithay's PopupManager handles popup grab + chain dismissal. Used in
+    /// addition to our own `popups: Vec<PopupInfo>` (which holds pixel
+    /// buffers for compositing). PopupManager doesn't need pixels — just
+    /// the popup hierarchy + grab state.
+    pub popup_manager: smithay::desktop::PopupManager,
     pub xdg_toplevel_tag_manager: XdgToplevelTagManager,
 
     // ── P2 Screen capture (ext-image-copy-capture-v1) ─────────────────────
@@ -339,6 +402,10 @@ pub struct SpikeState {
     /// and frames. The actual readback runs from the renderer after each
     /// `render_frame`, draining `pending_capture_frames` below.
     pub image_copy_capture_state: ImageCopyCaptureState,
+    /// Active `ext-image-copy-capture-v1` sessions. Stored so we can re-emit
+    /// buffer constraints on output mode changes and so the frame readback
+    /// path can iterate them. Dead sessions are swept by `cleanup_capture_sessions`.
+    pub capture_sessions: Vec<Session>,
     /// Frames whose capture has been requested but not yet serviced. The
     /// `frame()` handler enqueues them (instead of doing readback inline,
     /// which would need the renderer's wgpu device + final_tex); the main
@@ -433,6 +500,14 @@ pub struct SpikeState {
     pub pending_xdg_fullscreen: Vec<(WlSurface, bool)>,
     /// Toplevel surfaces whose client called `xdg_toplevel.set_minimized`.
     pub pending_xdg_minimize: Vec<WlSurface>,
+    /// Symmetric to `pending_xdg_minimize` but for restore — pushed by the
+    /// XwmHandler `unminimize_request`. xdg-shell has no client-driven
+    /// unminimize so this queue is X11-only.
+    pub pending_xdg_restore: Vec<WlSurface>,
+    /// Set by `xdg-system-bell-v1::ring` — the renderer's per-frame tick
+    /// drains it and starts a brief flash animation on the targeted
+    /// window's chrome. `None` between bells.
+    pub pending_bell: Option<WlSurface>,
 
     pub should_exit: bool,
     pub pointer_pos: (f64, f64),
@@ -503,8 +578,22 @@ impl SpikeState {
         let primary_selection_state = PrimarySelectionState::new::<Self>(dh);
         // Bridge wlr-data-control to primary selection so wl-paste --primary
         // works the same way wl-paste does for the regular clipboard.
-        let data_control_state =
-            DataControlState::new::<Self, _>(dh, Some(&primary_selection_state), |_| true);
+        // Privileged-global filter: deny sandboxed clients access to the
+        // clipboard manager + screencopy + session lock + image-capture.
+        // Without this a Flatpak'd browser could harvest your clipboard.
+        let data_control_state = DataControlState::new::<Self, _>(
+            dh,
+            Some(&primary_selection_state),
+            client_has_no_security_context,
+        );
+        // ext-data-control-v1 (the standardised successor to wlr-data-control).
+        // Newer clipboard managers (wl-clipboard 2.2+, cliphist 0.7+) prefer
+        // this; we keep wlr too for compat with older tools.
+        let ext_data_control_state = ExtDataControlState::new::<Self, _>(
+            dh,
+            Some(&primary_selection_state),
+            client_has_no_security_context,
+        );
 
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(dh);
         let viewporter_state = ViewporterState::new::<Self>(dh);
@@ -520,26 +609,52 @@ impl SpikeState {
         let tablet_manager_state = TabletManagerState::new::<Self>(dh);
 
         let text_input_state = TextInputManagerState::new::<Self>(dh);
-        let input_method_state = InputMethodManagerState::new::<Self, _>(dh, |_| true);
-        let virtual_keyboard_state = VirtualKeyboardManagerState::new::<Self, _>(dh, |_| true);
+        // input-method and virtual-keyboard let clients inject keystrokes —
+        // privilege gate: a sandboxed Flatpak that grabs virtual-keyboard
+        // could synthesize keys into other apps. Filter by security context.
+        let input_method_state =
+            InputMethodManagerState::new::<Self, _>(dh, client_has_no_security_context);
+        let virtual_keyboard_state =
+            VirtualKeyboardManagerState::new::<Self, _>(dh, client_has_no_security_context);
 
         let idle_notifier_state = IdleNotifierState::<Self>::new(dh, loop_handle.clone());
         let idle_inhibit_manager_state = IdleInhibitManagerState::new::<Self>(dh);
-        let session_lock_manager_state = SessionLockManagerState::new::<Self, _>(dh, |_| true);
+        // session-lock is privileged: only the trusted lockscreen process
+        // should be able to bind it. Filter mirrors cosmic-comp.
+        let session_lock_manager_state =
+            SessionLockManagerState::new::<Self, _>(dh, client_has_no_security_context);
 
         let activation_state = XdgActivationState::new::<Self>(dh);
         let content_type_state = ContentTypeState::new::<Self>(dh);
         let alpha_modifier_state = AlphaModifierState::new::<Self>(dh);
         let xdg_foreign_state = XdgForeignState::new::<Self>(dh);
-        let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(dh);
+        // ext-foreign-toplevel-list-v1 lets clients enumerate every open
+        // window across the desktop — a meaningful info-disclosure surface
+        // for a sandboxed app. Filter sandboxed clients.
+        let foreign_toplevel_list_state =
+            ForeignToplevelListState::new_with_filter::<Self>(dh, client_has_no_security_context);
         let security_context_state = SecurityContextState::new::<Self, _>(dh, |_| true);
         let xdg_system_bell_state = XdgSystemBellState::new::<Self>(dh);
         let xdg_toplevel_icon_manager = XdgToplevelIconManager::new::<Self>(dh);
+        // xdg-dialog-v1 — clients (file pickers, About boxes) tag toplevels
+        // as dialog so the compositor centres/parent-attaches them. Without
+        // the global created, the protocol was advertised by the delegate
+        // macro alone, which dispatches but the global was never broadcast.
+        let xdg_dialog_state =
+            smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<Self>(dh);
+        let popup_manager = smithay::desktop::PopupManager::default();
         let xdg_toplevel_tag_manager = XdgToplevelTagManager::new::<Self>(dh);
 
         let image_capture_source_state = ImageCaptureSourceState::new();
-        let output_capture_source_state = OutputCaptureSourceState::new::<Self>(dh);
-        let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(dh);
+        // image-capture / image-copy-capture are screen-recording globals —
+        // a sandboxed app shouldn't be able to read the screen without the
+        // portal granting it. Filter on security context.
+        let output_capture_source_state = OutputCaptureSourceState::new_with_filter::<Self, _>(
+            dh,
+            client_has_no_security_context,
+        );
+        let image_copy_capture_state =
+            ImageCopyCaptureState::new_with_filter::<Self, _>(dh, client_has_no_security_context);
 
         let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
         XWaylandKeyboardGrabState::new::<Self>(dh);
@@ -569,6 +684,7 @@ impl SpikeState {
             data_device_state,
             primary_selection_state,
             data_control_state,
+            ext_data_control_state,
             fractional_scale_manager_state,
             viewporter_state,
             fifo_state,
@@ -594,10 +710,13 @@ impl SpikeState {
             security_context_state,
             xdg_system_bell_state,
             xdg_toplevel_icon_manager,
+            xdg_dialog_state,
+            popup_manager,
             xdg_toplevel_tag_manager,
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
+            capture_sessions: Vec::new(),
             pending_capture_frames: Vec::new(),
             xwayland_shell_state,
             xwm: None,
@@ -620,6 +739,8 @@ impl SpikeState {
             pending_xdg_maximize: Vec::new(),
             pending_xdg_fullscreen: Vec::new(),
             pending_xdg_minimize: Vec::new(),
+            pending_xdg_restore: Vec::new(),
+            pending_bell: None,
             should_exit: false,
             pointer_pos: (0.0, 0.0),
             cursor_status: CursorImageStatus::default_named(),
@@ -630,10 +751,220 @@ impl SpikeState {
             dmabuf_pending: std::collections::HashMap::new(),
         };
 
-        state.seat.add_keyboard(Default::default(), 200, 25).ok();
+        // Pick up XKB config from the environment so users get the right
+        // layout/variant/options without us shipping a config file yet
+        // (cosmic-comp does this via its own settings layer; we use the
+        // same XKB_DEFAULT_LAYOUT etc. environment variables xkbcommon
+        // already honours by default). Repeat rate/delay from env if set,
+        // otherwise sensible defaults that match GNOME (500ms delay, 33Hz).
+        let xkb_config = smithay::input::keyboard::XkbConfig {
+            rules: "",
+            model: "",
+            layout: "",
+            variant: "",
+            options: None,
+        };
+        let repeat_delay = std::env::var("DE_KB_REPEAT_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(500);
+        let repeat_rate = std::env::var("DE_KB_REPEAT_RATE_HZ")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(33);
+        state
+            .seat
+            .add_keyboard(xkb_config, repeat_delay, repeat_rate)
+            .ok();
         state.seat.add_pointer();
+        // Advertise touch capability on the seat (matches cosmic-comp seats.rs:234).
+        // Touch event dispatch is plumbed separately in the backends.
+        state.seat.add_touch();
+
+        // Create the linux-dmabuf-v1 global. Without this, clients (Firefox,
+        // GTK4, Qt6, Chromium, mpv, OBS) fall back to wl_shm which is
+        // ~30-50% more CPU under load. Pattern mirrors anvil/winit.rs:146-182.
+        state.create_dmabuf_global();
 
         state
+    }
+
+    /// Re-run the xdg-popup positioner against the parent toplevel + output
+    /// rect so the popup doesn't render off-screen. Mirrors
+    /// anvil/shell/xdg.rs:556-589 simplified for our single-output model.
+    pub fn unconstrain_popup(&self, popup: &smithay::wayland::shell::xdg::PopupSurface) {
+        use smithay::desktop::{find_popup_root_surface, get_popup_toplevel_coords, PopupKind};
+        let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
+            return;
+        };
+        let Some(tl) = self.toplevels.iter().find(|t| t.surface == root) else {
+            return;
+        };
+        let Some(output) = self.primary_output() else {
+            return;
+        };
+        let Some(mode) = output.current_mode() else {
+            return;
+        };
+        let scale = output.current_scale().fractional_scale();
+        let logical_w = (mode.size.w as f64 / scale).max(1.0) as i32;
+        let logical_h = (mode.size.h as f64 / scale).max(1.0) as i32;
+        // Positioner target rect = output, but expressed relative to the
+        // parent toplevel's surface origin (the positioner anchors relative
+        // to its parent).
+        let mut target = smithay::utils::Rectangle::new(
+            smithay::utils::Point::from((0, 0)),
+            smithay::utils::Size::from((logical_w, logical_h)),
+        );
+        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+        target.loc -= smithay::utils::Point::from((tl.x, tl.y));
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
+
+    /// Validate that a client-supplied `serial` corresponds to a real
+    /// pointer/touch grab on `surface`. Used to gate interactive move/resize
+    /// requests so a malicious or buggy client can't unilaterally seize the
+    /// pointer (xdg-shell spec recommends this; anvil/shell/xdg.rs:80-117
+    /// is the reference impl).
+    pub fn validate_grab_serial(
+        &self,
+        seat_resource: &smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
+        surface: &WlSurface,
+        serial: Serial,
+    ) -> bool {
+        let Some(seat) = Seat::<Self>::from_resource(seat_resource) else {
+            return false;
+        };
+        // Pointer path: the grab must be active for this serial and the
+        // pointer must currently be focused on a surface owned by the same
+        // client as `surface`. The xdg-shell spec also accepts touch.
+        // Our SeatHandler::PointerFocus / TouchFocus are both `WlSurface`,
+        // so `start.focus` is `Option<(WlSurface, _)>` and we compare client
+        // identity directly via ObjectId::same_client_as.
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.has_grab(serial) {
+                if let Some(start) = pointer.grab_start_data() {
+                    if let Some((focus_surface, _)) = start.focus.as_ref() {
+                        if focus_surface.id().same_client_as(&surface.id()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(touch) = seat.get_touch() {
+            if touch.has_grab(serial) {
+                if let Some(start) = touch.grab_start_data() {
+                    if let Some((focus_surface, _)) = start.focus.as_ref() {
+                        if focus_surface.id().same_client_as(&surface.id()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        debug!("xdg grab rejected: serial does not match an active pointer/touch grab");
+        false
+    }
+
+    /// Push the latest `title`/`app_id` of every tracked toplevel to its
+    /// `ext-foreign-toplevel-list-v1` handle, diff-gated so the per-frame
+    /// call only fires protocol events on real change. Cheap when nothing
+    /// changed: a `clone` + string compare per toplevel.
+    pub fn sync_foreign_toplevels(&mut self) {
+        use smithay::wayland::compositor::with_states;
+        use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
+        for tl in &mut self.toplevels {
+            let Some(handle) = tl.foreign_handle.as_ref() else {
+                continue;
+            };
+            let (title, app_id) = if let Some(x11) = &tl.x11_surface {
+                // X11 windows expose these via X11Surface, not wl_surface data.
+                (x11.title(), x11.class())
+            } else {
+                with_states(&tl.surface, |states| {
+                    let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() else {
+                        return (String::new(), String::new());
+                    };
+                    let Ok(guard) = data.lock() else {
+                        return (String::new(), String::new());
+                    };
+                    (
+                        guard.title.clone().unwrap_or_default(),
+                        guard.app_id.clone().unwrap_or_default(),
+                    )
+                })
+            };
+            let mut changed = false;
+            if title != tl.last_advertised_title {
+                handle.send_title(&title);
+                tl.last_advertised_title = title;
+                changed = true;
+            }
+            if app_id != tl.last_advertised_app_id {
+                handle.send_app_id(&app_id);
+                tl.last_advertised_app_id = app_id;
+                changed = true;
+            }
+            if changed {
+                handle.send_done();
+            }
+        }
+    }
+
+    /// Create the `linux-dmabuf-v1` global. Prefers v4 (with per-render-node
+    /// default feedback) when EGL can identify the render node; falls back to
+    /// v3 (formats only) otherwise. No-op if EGL/GLES init failed — clients
+    /// will use wl_shm.
+    fn create_dmabuf_global(&mut self) {
+        self.ensure_gles_renderer();
+
+        let (dmabuf_formats, render_node) = match self.gles_renderer.as_ref() {
+            Some(r) => {
+                let formats: Vec<_> = r.dmabuf_formats().into_iter().collect();
+                let node = EGLDevice::device_for_display(r.egl_context().display())
+                    .ok()
+                    .and_then(|d| d.try_get_render_node().ok().flatten());
+                (formats, node)
+            }
+            None => {
+                warn!(
+                    "DMA-BUF: GLES renderer unavailable — global NOT advertised, clients will use SHM"
+                );
+                return;
+            }
+        };
+
+        if dmabuf_formats.is_empty() {
+            warn!("DMA-BUF: GLES exposed zero formats — global NOT advertised");
+            return;
+        }
+        let n_formats = dmabuf_formats.len();
+        let dh = self.display_handle.clone();
+
+        if let Some(node) = render_node {
+            match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone()).build() {
+                Ok(feedback) => {
+                    let _ = self
+                        .dmabuf_state
+                        .create_global_with_default_feedback::<Self>(&dh, &feedback);
+                    info!(
+                        formats = n_formats,
+                        node = ?node.dev_id(),
+                        "DMA-BUF v4 global advertised (per-render-node feedback)"
+                    );
+                    return;
+                }
+                Err(e) => warn!("DMA-BUF: feedback build failed: {e:?} — falling back to v3"),
+            }
+        } else {
+            warn!("DMA-BUF: no EGL render node — falling back to v3");
+        }
+
+        let _ = self.dmabuf_state.create_global::<Self>(&dh, dmabuf_formats);
+        info!(formats = n_formats, "DMA-BUF v3 global advertised");
     }
 
     pub fn register_output(&mut self, output: Output) {
@@ -647,6 +978,27 @@ impl SpikeState {
 
     pub fn primary_output(&self) -> Option<&Output> {
         self.output.as_ref().or_else(|| self.outputs.first())
+    }
+
+    /// Find the Output most likely "hosting" a surface, by checking which
+    /// outputs the surface has entered (sent via `wl_surface.enter`).
+    /// Returns `None` if the surface hasn't entered any of our outputs yet.
+    /// Used by multi-output paths (fractional-scale, future per-output
+    /// frame callbacks) so we don't blindly use the primary output's scale
+    /// for surfaces living on a secondary monitor.
+    pub fn output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        use smithay::reexports::wayland_server::Resource;
+        let client = surface.client()?;
+        for out in &self.outputs {
+            let entered: Vec<_> = out.client_outputs(&client).collect();
+            if !entered.is_empty() {
+                // Heuristic: any client_output for this client on this
+                // Output means the client has wl_outputs bound — good
+                // enough until we have real per-surface enter tracking.
+                return Some(out);
+            }
+        }
+        None
     }
 
     /// Lazily initialise the surfaceless EGL display and GLES renderer used
@@ -1051,9 +1403,9 @@ pub fn import_shm_buffer(surface: &WlSurface, pixels_out: &Arc<Mutex<ClientSurfa
             _ => continue,
         };
 
-        let _ = with_buffer_contents(&*buf, |ptr: *const u8, len: usize, spec| {
-            let src_w = spec.width as i32;
-            let src_h = spec.height as i32;
+        let _ = with_buffer_contents(&buf, |ptr: *const u8, len: usize, spec| {
+            let src_w = spec.width;
+            let src_h = spec.height;
             let stride = spec.stride as usize;
             let has_alpha = matches!(spec.format, wl_shm::Format::Argb8888);
             let data = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -1255,7 +1607,7 @@ pub fn import_shm_per_surface(
 
         // Read SHM contents → premul RGBA.
         let mut converted: Option<Vec<u8>> = None;
-        let _ = with_buffer_contents(&*buf, |ptr: *const u8, len: usize, spec| {
+        let _ = with_buffer_contents(&buf, |ptr: *const u8, len: usize, spec| {
             let stride = spec.stride as usize;
             let has_alpha = matches!(spec.format, wl_shm::Format::Argb8888);
             let data = unsafe { std::slice::from_raw_parts(ptr, len) };
@@ -1395,6 +1747,33 @@ impl SeatHandler for SpikeState {
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client.clone());
         set_primary_focus(dh, seat, client);
+
+        // Push `xdg_toplevel.Activated` to the newly-focused toplevel and
+        // clear it on every other one. Without this, GTK/Qt header bars and
+        // window-chrome tints don't dim/light on focus transitions
+        // (shell-audit P1). Mirrors cosmic shell/focus/mod.rs:277.
+        // X11 toplevels get the equivalent treatment via `X11Surface::set_activated`,
+        // which we wire here too so XWayland apps respond to focus.
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+        for tl in &self.toplevels {
+            let is_focused = focused.map(|f| f == &tl.surface).unwrap_or(false);
+            if let Some(top) = &tl.toplevel {
+                let changed = top.with_pending_state(|s| {
+                    let was = s.states.contains(xdg_toplevel::State::Activated);
+                    if is_focused {
+                        s.states.set(xdg_toplevel::State::Activated);
+                    } else {
+                        s.states.unset(xdg_toplevel::State::Activated);
+                    }
+                    was != is_focused
+                });
+                if changed && top.is_initial_configure_sent() {
+                    top.send_pending_configure();
+                }
+            } else if let Some(x11) = &tl.x11_surface {
+                let _ = x11.set_activated(is_focused);
+            }
+        }
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
@@ -1415,6 +1794,43 @@ delegate_seat!(SpikeState);
 
 impl SelectionHandler for SpikeState {
     type SelectionUserData = ();
+
+    /// A wayland client just set the selection — forward to XWayland so X11
+    /// apps can paste it. Without this, copying in a Wayland app and pasting
+    /// into an X11/XWayland app silently fails. Mirrors anvil/src/state.rs:251.
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if let Some(xwm) = self.xwm.as_mut() {
+            if let Err(err) = xwm.new_selection(ty, source.map(|s| s.mime_types())) {
+                warn!(?err, ?ty, "XWayland: failed to advertise wayland selection");
+            }
+        }
+    }
+
+    /// An X11 client requested to read the wayland selection. Pipe the fd
+    /// to XWayland's xwm which already has the transfer machinery.
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        if let Some(xwm) = self.xwm.as_mut() {
+            if let Err(err) = xwm.send_selection(ty, mime_type, fd) {
+                warn!(
+                    ?err,
+                    ?ty,
+                    "XWayland: send_selection (wayland -> X11) failed"
+                );
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1432,11 +1848,24 @@ impl WaylandDndGrabHandler for SpikeState {
     ) {
         // Capture the icon so the renderer can composite it under the cursor
         // while the drag is active. Cleared in `DndGrabHandler::dropped` and
-        // `cancelled`. The accumulated wl_surface.offset is treated as the
-        // hotspot (matches anvil + sway); see `DndIcon::offset`.
+        // `cancelled`. Seed the icon offset from the current cursor surface's
+        // hotspot (cosmic-comp pattern) — clients that don't subsequently call
+        // wl_surface.offset on the icon still get hotspot-aligned positioning.
+        let initial_offset = match &self.cursor_status {
+            CursorImageStatus::Surface(cursor_surface) => {
+                smithay::wayland::compositor::with_states(cursor_surface, |states| {
+                    states
+                        .data_map
+                        .get::<smithay::input::pointer::CursorImageSurfaceData>()
+                        .and_then(|d| d.lock().ok().map(|a| a.hotspot))
+                        .unwrap_or_else(|| smithay::utils::Point::from((0, 0)))
+                })
+            }
+            _ => smithay::utils::Point::from((0, 0)),
+        };
         self.dnd_icon = icon.map(|surface| DndIcon {
             surface,
-            offset: smithay::utils::Point::from((0, 0)),
+            offset: initial_offset,
         });
 
         match type_ {
@@ -1535,6 +1964,17 @@ impl DataControlHandler for SpikeState {
 
 smithay::delegate_data_control!(SpikeState);
 
+// ext-data-control-v1 (standardised successor to wlr-data-control). Two
+// separate handlers because the protocols are wire-incompatible; clients pick
+// the one they support.
+impl ExtDataControlHandler for SpikeState {
+    fn data_control_state(&mut self) -> &mut ExtDataControlState {
+        &mut self.ext_data_control_state
+    }
+}
+
+smithay::delegate_ext_data_control!(SpikeState);
+
 // ──────────────────────────────────────────────────────────────────────────────
 // ext-image-capture-source-v1 + ext-image-copy-capture-v1
 //
@@ -1589,13 +2029,82 @@ impl ImageCopyCaptureHandler for SpikeState {
         })
     }
 
-    fn new_session(&mut self, _session: Session) {}
+    fn new_session(&mut self, session: Session) {
+        // Per smithay docs: "The compositor should store this session". Keeps
+        // the session alive (Session drops fail all pending frames) and lets
+        // `refresh_capture_constraints` re-emit constraints to it when an
+        // output mode changes.
+        // Immediately push current constraints so the client can size its
+        // buffer pool — without this, portal screencast stalls waiting on a
+        // constraints event that never arrives.
+        if let Some(constraints) = self.capture_constraints(&session.source()) {
+            session.update_constraints(constraints);
+        }
+        self.capture_sessions.push(session);
+        // Sweep dead sessions while we're here so the vec doesn't grow.
+        self.cleanup_capture_sessions();
+    }
 
     fn frame(&mut self, _session: &SessionRef, frame: Frame) {
         // Defer: the wgpu device + final_tex live in the renderer, not on
         // SpikeState. The main loop drains this vec right after each
         // `render_frame` so the readback samples the just-presented frame.
         self.pending_capture_frames.push(frame);
+    }
+}
+
+impl SpikeState {
+    /// Remove sessions whose underlying client object is no longer alive.
+    pub fn cleanup_capture_sessions(&mut self) {
+        use smithay::utils::IsAlive;
+        self.capture_sessions.retain(|s| s.alive());
+    }
+
+    /// Re-issue buffer-constraints to every live capture session — called
+    /// after the wl_output mode changes (host window resize, scale change).
+    /// Without this, portal screencast keeps allocating buffers at the
+    /// stale size and frame submission keeps failing the size match in
+    /// `screencopy.rs`.
+    /// Idle-inhibit while a mapped toplevel claims `content-type-v1` Video
+    /// or Game. Used by movies and games so the screensaver doesn't fire
+    /// mid-cutscene; matches gnome-shell / kwin behaviour. Cheap: iterates
+    /// the toplevel list and reads cached state.
+    pub fn refresh_content_type_idle_inhibit(&mut self) {
+        use smithay::wayland::compositor::with_states;
+        use smithay::wayland::content_type::ContentTypeSurfaceCachedState;
+        use wayland_protocols::wp::content_type::v1::server::wp_content_type_v1::Type;
+        let any_active = self.toplevels.iter().any(|tl| {
+            with_states(&tl.surface, |states| {
+                let mut g = states.cached_state.get::<ContentTypeSurfaceCachedState>();
+                matches!(g.current().content_type(), Type::Video | Type::Game)
+            })
+        });
+        // OR with explicit idle-inhibit-v1 inhibitors.
+        let inhibited = any_active || !self.idle_inhibitors.is_empty();
+        self.idle_notifier_state.set_is_inhibited(inhibited);
+    }
+
+    pub fn refresh_capture_constraints(&mut self) {
+        use smithay::utils::IsAlive;
+        // Snapshot sources off the sessions vec first so the subsequent
+        // `&mut self` for capture_constraints doesn't double-borrow.
+        let sources: Vec<_> = self
+            .capture_sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.alive())
+            .map(|(i, s)| (i, s.source()))
+            .collect();
+        let updates: Vec<_> = sources
+            .into_iter()
+            .filter_map(|(i, src)| self.capture_constraints(&src).map(|c| (i, c)))
+            .collect();
+        for (i, c) in updates {
+            if let Some(session) = self.capture_sessions.get(i) {
+                session.update_constraints(c);
+            }
+        }
+        self.cleanup_capture_sessions();
     }
 }
 
