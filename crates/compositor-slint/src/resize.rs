@@ -203,7 +203,12 @@ pub fn compute_resize(drag: &ActiveDrag, ptr_x: f64, ptr_y: f64) -> Option<(i32,
 
 /// Compute the new window position after a move drag.
 ///
-/// Returns `(new_x, new_y)`.
+/// Returns `(new_x, new_y)`. Currently only exercised by the unit test —
+/// the renderer inlines its own move-math against `self.pointer_pos` plus
+/// `offset_x/offset_y` rather than calling this. Kept because the logic
+/// is non-trivial enough that the test value of having it codified
+/// outweighs the few lines of dead code.
+#[allow(dead_code)]
 pub fn compute_move(drag: &ActiveDrag, ptr_x: f64, ptr_y: f64) -> Option<(i32, i32)> {
     if let ActiveDrag::Move {
         offset_x, offset_y, ..

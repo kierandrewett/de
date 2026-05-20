@@ -30,7 +30,6 @@ pub mod squircle;
 
 use std::sync::Arc;
 
-use wgpu;
 
 use common::{ChromeUniforms, Shared, MAX_DRAWS, UNIFORM_STRIDE, UNIFORM_STRUCT_SIZE};
 use shadow::{active_layers, inactive_layers, uniforms_for_layer};
@@ -42,6 +41,10 @@ pub struct WindowChromeParams {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    /// Discrete active-vs-blur flag. Superseded by the smooth `focus_t`
+    /// for shading; kept here so callers that just want a bool (debug
+    /// overlays, theme tracking) don't have to threshold the float.
+    #[allow(dead_code)]
     pub active: bool,
     pub focus_t: f32,
     pub mode_t: f32,

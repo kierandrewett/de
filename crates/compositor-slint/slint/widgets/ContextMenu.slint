@@ -231,7 +231,10 @@ export component ContextMenu {
                 row-touch := TouchArea {
                     width: parent.width;
                     height: parent.height;
-                    enabled: !it.separator && it.enabled;
+                    // The menu stays `visible: true` at opacity 0 to keep
+                    // Slint's render pipeline warm between opens. Gate input
+                    // separately so invisible menus cannot be clicked.
+                    enabled: root.open && !it.separator && it.enabled;
                     // Trigger the flicker; the timer fires
                     // `item-clicked` after blink. Guard against double
                     // clicks while a flicker is already in flight.

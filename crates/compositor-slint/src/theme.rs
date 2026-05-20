@@ -122,20 +122,13 @@ impl ThemeMode {
 // ── Auto-schedule config ──────────────────────────────────────────────────────
 
 /// Parsed `theme.json` configuration.
+#[derive(Default)]
 struct AutoConfig {
     /// `None` = explicit mode, `Some(sunrise_hour, sunset_hour)` = auto.
     auto_times: Option<(u8, u8)>,
     explicit_mode: Option<ThemeMode>,
 }
 
-impl Default for AutoConfig {
-    fn default() -> Self {
-        Self {
-            auto_times: None,
-            explicit_mode: None,
-        }
-    }
-}
 
 fn load_theme_config() -> AutoConfig {
     // Look for theme.json in XDG_CONFIG_HOME/compositor-slint/ or ~/.config/compositor-slint/

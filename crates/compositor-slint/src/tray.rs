@@ -54,6 +54,12 @@ pub struct TrayItem {
 #[derive(Debug, Clone)]
 pub enum TrayEvent {
     Added(TrayItem),
+    /// Currently never emitted — the watcher's name-owner-change subscription
+    /// path isn't implemented, so dropped clients linger until the user
+    /// restarts the panel. Variant kept as the consumer side (in renderer's
+    /// main loop) already handles it; wiring the `org.freedesktop.DBus`
+    /// `NameOwnerChanged` listener is a self-contained follow-up.
+    #[allow(dead_code)]
     Removed(u32),
 }
 

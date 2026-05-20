@@ -81,6 +81,10 @@ pub enum HitZone {
 pub enum CursorKind {
     Arrow,
     Move,
+    /// Pointing hand. Currently only referenced by `cursor_render` for
+    /// rendering — the WM hit-test never picks it, but it's part of the
+    /// XCursor family so we keep it available for future link-style hover.
+    #[allow(dead_code)]
     Hand,
     ResizeN,
     ResizeS,

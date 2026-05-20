@@ -26,6 +26,11 @@ pub struct ShadowPass {
     intermediates: Option<Intermediates>,
 }
 
+// The Texture handles are held alongside their TextureViews to keep the
+// GPU allocation alive — dropping a Texture invalidates any Views derived
+// from it. The compiler doesn't see that lifetime relationship, so it
+// flags them as unread; suppress.
+#[allow(dead_code)]
 struct Intermediates {
     width: u32,
     height: u32,
@@ -102,7 +107,7 @@ impl ShadowPass {
         if self
             .intermediates
             .as_ref()
-            .map_or(true, |i| i.width != w || i.height != h)
+            .is_none_or(|i| i.width != w || i.height != h)
         {
             let mk = |label: &str| {
                 let tex = shared.device.create_texture(&wgpu::TextureDescriptor {

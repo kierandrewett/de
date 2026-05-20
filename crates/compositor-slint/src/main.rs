@@ -15,12 +15,11 @@
 //!
 //! Wave 1D additions:
 //!   - DMA-BUF Option B import (wayland_state.rs)
-//!   - True separable Gaussian shadow blur (chrome.wgsl, chrome_shader.rs)
-//!   - Border-overlaid chrome contract (chrome.wgsl)
+//!   - True separable Gaussian shadow blur (`render::shadow`)
+//!   - Border-overlaid chrome contract (`render::border`)
 //!   - SVG icon decode via resvg (desktop.rs)
 //!
-//! This is the seed of the production compositor; the iced-based
-//! `crates/compositor` is being phased out.
+//! This is the seed of the production compositor.
 
 use anyhow::Result;
 use tracing::info;
@@ -40,9 +39,9 @@ mod renderer;
 mod wayland;
 mod wayland_runtime;
 mod wayland_state;
-// chrome_shader retired in favour of `mod render` (separate single-purpose
-// passes). The old src/chrome_shader.rs + shaders/chrome.wgsl files remain on
-// disk for reference but are no longer compiled.
+
+// Chrome rendering lives in `mod render` — separate single-purpose passes
+// (shadow, border, highlight, squircle, dnd_icon) under `src/render/`.
 mod backdrop;
 mod cursor;
 mod cursor_render;

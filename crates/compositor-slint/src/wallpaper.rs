@@ -79,12 +79,6 @@ pub fn find_wallpaper_for_mode(tag: &str) -> Option<PathBuf> {
     find_wallpaper_path()
 }
 
-/// Load a wallpaper image from disk and return a Slint `Image`.
-pub fn load() -> Option<slint::Image> {
-    let path = find_wallpaper_path()?;
-    load_from_path(&path)
-}
-
 /// Load an image from an explicit path.
 pub fn load_from_path(path: &Path) -> Option<slint::Image> {
     let img = image::open(path)

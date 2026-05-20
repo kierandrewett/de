@@ -23,6 +23,11 @@ pub struct DbusMenuItem {
     pub id: i32,
     pub label: String,
     pub enabled: bool,
+    /// Visibility flag from the DBusMenu protocol. Currently read only at
+    /// parse time (we drop invisible items before exposing the model to
+    /// Slint), but the field is kept so a future "hidden items toggle" or
+    /// remote-UI consumer doesn't have to re-introduce it.
+    #[allow(dead_code)]
     pub visible: bool,
     pub separator: bool,
 }
@@ -77,7 +82,7 @@ fn flatten_node(node_value: &Value<'_>, out: &mut Vec<DbusMenuItem>) {
     if let Value::Dict(dict) = &fields[1] {
         for (k, v) in dict.iter() {
             if let Value::Str(ks) = k {
-                if let Ok(owned) = v.try_clone().and_then(|v| OwnedValue::try_from(v)) {
+                if let Ok(owned) = v.try_clone().and_then(OwnedValue::try_from) {
                     props.insert(ks.to_string(), owned);
                 }
             }
