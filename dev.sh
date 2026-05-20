@@ -32,7 +32,9 @@ for _ in $(seq 1 80); do
         tail -20 "$LOG_DIR/compositor-slint.log" >&2
         exit 1
     fi
-    if SOCK=$(grep -oE 'Wayland socket: wayland-[0-9]+' "$LOG_DIR/compositor-slint.log" 2>/dev/null | tail -1 | awk '{print $3}'); then
+    # The compositor logs via tracing's Debug formatter, so the line reads
+    # `Wayland socket: "wayland-N"` with quotes. Pull the quoted value.
+    if SOCK=$(awk -F'"' '/Wayland socket: "wayland-/ { print $2 }' "$LOG_DIR/compositor-slint.log" 2>/dev/null | tail -1); then
         if [[ -n "${SOCK:-}" ]]; then break; fi
     fi
     sleep 0.25
