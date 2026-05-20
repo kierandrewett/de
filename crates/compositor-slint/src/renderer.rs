@@ -58,6 +58,12 @@ use winit::{
     window::{Window, WindowId},
 };
 
+mod calendar;
+mod input_util;
+mod popup;
+mod wgpu_setup;
+use wgpu_setup::{configure_surface, make_render_texture};
+
 use crate::{
     backdrop::{BackdropSynth, WindowSnapshot},
     cursor::{self, CursorKind, HitZone, WindowRect, TITLEBAR_HEIGHT},
@@ -113,80 +119,13 @@ pub enum PendingPointerEvent {
     },
 }
 
-/// Map a winit `MouseButton` to a Linux evdev button code.
-fn winit_button_to_evdev(button: MouseButton) -> u32 {
-    match button {
-        MouseButton::Left => 0x110,    // BTN_LEFT
-        MouseButton::Right => 0x111,   // BTN_RIGHT
-        MouseButton::Middle => 0x112,  // BTN_MIDDLE
-        MouseButton::Back => 0x116,    // BTN_SIDE
-        MouseButton::Forward => 0x115, // BTN_EXTRA
-        _ => 0x110,
-    }
-}
+// `winit_button_to_evdev`, `forward_keyboard_event`, `ascii_to_scancode`, and
+// `compute_menu_height` moved to `renderer/input_util.rs`.
+use input_util::{
+    ascii_to_scancode, compute_menu_height, forward_keyboard_event, winit_button_to_evdev,
+};
 
-// ──────────────────────────────────────────────────────────────────────────────
-// wgpu helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Allocate an offscreen texture for Slint/FemtoVG to render into.
-fn make_render_texture(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-    format: wgpu::TextureFormat,
-) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("slint-render-target"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST       // final_tex is a copy destination
-            | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    })
-}
-
-/// Configure the wgpu swapchain surface.
-fn configure_surface(
-    surface: &wgpu::Surface<'static>,
-    adapter: &wgpu::Adapter,
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> wgpu::TextureFormat {
-    let caps = surface.get_capabilities(adapter);
-    let format = if caps.formats.contains(&wgpu::TextureFormat::Rgba8Unorm) {
-        wgpu::TextureFormat::Rgba8Unorm
-    } else if caps.formats.contains(&wgpu::TextureFormat::Bgra8Unorm) {
-        wgpu::TextureFormat::Bgra8Unorm
-    } else {
-        caps.formats[0]
-    };
-
-    surface.configure(
-        device,
-        &wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
-            format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        },
-    );
-    format
-}
+// `make_render_texture` and `configure_surface` moved to `renderer/wgpu_setup.rs`.
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Alt-tab key state
@@ -243,7 +182,6 @@ struct CompositorApp {
     theme: ThemeState,
 
     pointer_pos: (f64, f64),
-    start_time: Instant,
     last_clock_update: Instant,
     /// Months ahead (+) or behind (-) the current month for the
     /// datetime popout's calendar. Driven by the prev/next chevrons
@@ -318,7 +256,11 @@ struct CompositorApp {
 
     /// Snap candidate from the last Move-drag motion. If Some on left-up,
     /// apply_pending_snap glides the window into the snap rect.
-    pending_snap: Option<(i32 /* wm_id */, crate::snap::SnapRect)>,
+    pending_snap: Option<(
+        i32, /* wm_id */
+        crate::snap::SnapZone,
+        crate::snap::SnapRect,
+    )>,
 
     /// Queue of IPC commands posted by the unix-socket server thread. Drained
     /// in the main loop on each iteration.
@@ -345,6 +287,11 @@ struct CompositorApp {
     /// have `state`) and call `output.change_current_state(scale)` so
     /// clients see fresh `preferred_buffer_scale` events.
     pending_output_scale: Option<f64>,
+    /// Pending wl_output mode update — (logical_w, logical_h, refresh_mhz).
+    /// Drained in update_windows the same way pending_output_scale is, so
+    /// clients see fresh `wl_output.mode` events when the host window
+    /// resizes (matching what we already do for `xdg_output.logical_size`).
+    pending_output_mode: Option<(i32, i32, i32)>,
 
     /// Snapshot of the first ext-session-lock-v1 lock surface's pixels.
     /// Refreshed each `update_windows`; consumed by `render_frame` to
@@ -427,7 +374,6 @@ impl CompositorApp {
             theme: ThemeState::new(),
             super_held: false,
             pointer_pos: (0.0, 0.0),
-            start_time: Instant::now(),
             last_clock_update: Instant::now(),
             calendar_month_offset: 0,
             pending_keys,
@@ -462,6 +408,7 @@ impl CompositorApp {
             last_present_time: None,
             dnd_icon_snapshot: None,
             pending_output_scale: None,
+            pending_output_mode: None,
             lock_surface_snapshot: None,
             layer_image_cache: std::collections::HashMap::new(),
             last_layers_fingerprint: Vec::new(),
@@ -648,6 +595,18 @@ impl ApplicationHandler for CompositorApp {
                 if let Some(c) = self.chrome.as_mut() {
                     c.invalidate();
                 }
+                // Read the host's actual refresh from winit if available
+                // (Wayland host on a 165Hz monitor → we should propagate
+                // that instead of advertising 60Hz to our clients). Fall
+                // back to 60Hz if winit doesn't know.
+                let refresh_mhz = self
+                    .window
+                    .as_ref()
+                    .and_then(|w| w.current_monitor())
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map(|v| v as i32)
+                    .unwrap_or(60_000);
+                self.pending_output_mode = Some((logical_w as i32, logical_h as i32, refresh_mhz));
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -1289,7 +1248,7 @@ impl CompositorApp {
                     return;
                 }
                 self.frame_count += 1;
-                if self.frame_count % 60 == 0 {
+                if self.frame_count.is_multiple_of(60) {
                     info!("frame loop: {} frames rendered", self.frame_count);
                 }
                 debug!(
@@ -1458,8 +1417,7 @@ impl CompositorApp {
                             // z-stacked content from Slint's repeater so
                             // copying its rects restores correct z without
                             // per-window content textures.
-                            for j in (wi + 1)..win_rects.len() {
-                                let (rx, ry, rw, rh) = win_rects[j];
+                            for &(rx, ry, rw, rh) in &win_rects[wi + 1..] {
                                 if rw == 0 || rh == 0 {
                                     continue;
                                 }
@@ -1723,16 +1681,51 @@ impl CompositorApp {
             }
         }
 
+        // Propagate window size changes to the wl_output mode. Without this,
+        // clients see the original Mode { size, refresh } advertised at
+        // startup forever, so xdg-output's logical_size and `wl_output.mode`
+        // never reflect the host window's actual dimensions — apps that
+        // size themselves to the output (gamescope, mpv fullscreen) end up
+        // at the wrong size after the user resizes the host window. We
+        // also re-emit screencopy `buffer_size` to all active sessions so
+        // portal screencast stays in sync.
+        if let Some((w, h, refresh)) = self.pending_output_mode.take() {
+            if let Some(out) = state.primary_output() {
+                let new_mode = smithay::output::Mode {
+                    size: (w, h).into(),
+                    refresh,
+                };
+                out.change_current_state(Some(new_mode), None, None, None);
+                out.set_preferred(new_mode);
+            }
+            // Refresh ext-image-copy-capture constraints so the new buffer
+            // dimensions reach already-bound capture sessions before they
+            // request the next frame at the stale size.
+            state.refresh_capture_constraints();
+        }
+
         // Tick the WM animations.
         self.wm.tick_auto();
 
+        // Push title/app_id changes to ext-foreign-toplevel-list-v1 handles.
+        // Diff-gated inside the helper so this is cheap when nothing changed.
+        state.sync_foreign_toplevels();
+        // Refresh idle inhibit based on content-type-v1 hints (Video/Game
+        // surfaces auto-inhibit). Diffed inside set_is_inhibited so this is
+        // a no-op when nothing changed.
+        state.refresh_content_type_idle_inhibit();
+
         // Sweep windows whose close animation has finished.
-        let closed_surfaces = self.wm.sweep_closed();
-        for surf in &closed_surfaces {
+        let closed = self.wm.sweep_closed();
+        for (surf, wm_id) in &closed {
             // Remove from SpikeState toplevel list.
             state.toplevels.retain(|t| &t.surface != surf);
+            // Drop per-window theme tweens so the HashMaps in ThemeState don't
+            // leak entries every time a window closes.
+            self.theme.remove_window(*wm_id);
             debug!("WM: swept closed window for surface");
         }
+        let closed_surfaces: Vec<WlSurface> = closed.into_iter().map(|(s, _)| s).collect();
         // If we swept anything, the focus might need updating.
         if !closed_surfaces.is_empty() {
             state.active_surface = self.wm.focused_surface();
@@ -1755,7 +1748,7 @@ impl CompositorApp {
                     .toplevels
                     .iter()
                     .find(|t| t.surface == w.surface)
-                    .map_or(false, |tl| tl.pixels.lock().unwrap().width > 0)
+                    .is_some_and(|tl| tl.pixels.lock().unwrap().width > 0)
             })
             .map(|w| w.id)
             .collect();
@@ -2925,7 +2918,7 @@ impl CompositorApp {
         // share the maximize geometry.
         let mut max_actions: Vec<(WlSurface, bool)> =
             state.pending_xdg_maximize.drain(..).collect();
-        max_actions.extend(state.pending_xdg_fullscreen.drain(..));
+        max_actions.append(&mut state.pending_xdg_fullscreen);
         for (surface, want_max) in max_actions {
             let Some(id) = self.wm.id_for_surface(&surface) else {
                 continue;
@@ -2957,6 +2950,15 @@ impl CompositorApp {
         for surface in minimizes {
             if let Some(id) = self.wm.id_for_surface(&surface) {
                 self.wm.minimize_by_id(id);
+                self.update_focused_surface(state);
+            }
+        }
+
+        // Restore (X11 unminimize_request — wayland clients can't un-minimize themselves)
+        let restores: Vec<WlSurface> = state.pending_xdg_restore.drain(..).collect();
+        for surface in restores {
+            if let Some(id) = self.wm.id_for_surface(&surface) {
+                self.wm.restore_by_id(id);
                 self.update_focused_surface(state);
             }
         }
@@ -3053,94 +3055,34 @@ impl CompositorApp {
         }
     }
 
-    fn popup_rect(
-        &self,
-        state: &SpikeState,
-        popup: &crate::wayland_state::PopupInfo,
-    ) -> Option<(f64, f64, f64, f64)> {
-        let (bw, bh) = {
-            let p = popup.pixels.lock().unwrap();
-            (p.width as i32, p.height as i32)
-        };
-        let w = if popup.w > 0 { popup.w } else { bw };
-        let h = if popup.h > 0 { popup.h } else { bh };
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-
-        let mut abs_x = popup.rel_x;
-        let mut abs_y = popup.rel_y;
-        let mut cur_parent = popup.parent.clone();
-        let mut anchored = false;
-        for _ in 0..16 {
-            if let Some(parent_popup) = state.popups.iter().find(|p| p.surface == cur_parent) {
-                abs_x += parent_popup.rel_x;
-                abs_y += parent_popup.rel_y;
-                cur_parent = parent_popup.parent.clone();
-                continue;
-            }
-            if let Some(tl_win) = self.wm.windows.values().find(|w| w.surface == cur_parent) {
-                abs_x += tl_win.anim.current_x();
-                let titlebar = if tl_win.csd {
-                    0
-                } else {
-                    crate::wm::TITLEBAR_HEIGHT as i32
-                };
-                abs_y += tl_win.anim.current_y() + titlebar;
-                anchored = true;
-            }
-            break;
-        }
-
-        anchored.then_some((abs_x as f64, abs_y as f64, w as f64, h as f64))
-    }
-
-    fn popup_surface_under(
-        &self,
-        state: &SpikeState,
-        x: f64,
-        y: f64,
-    ) -> Option<(WlSurface, f64, f64)> {
-        use smithay::desktop::utils::under_from_surface_tree;
-        use smithay::desktop::WindowSurfaceType;
-        use smithay::utils::Point;
-
-        for popup in state.popups.iter().rev() {
-            let Some((px, py, pw, ph)) = self.popup_rect(state, popup) else {
-                continue;
-            };
-            if x < px || x >= px + pw || y < py || y >= py + ph {
-                continue;
-            }
-
-            let popup_origin = Point::<i32, smithay::utils::Logical>::from((px as i32, py as i32));
-            if let Some((surface, origin)) = under_from_surface_tree(
-                &popup.surface,
-                Point::from((x, y)),
-                popup_origin,
-                WindowSurfaceType::ALL,
-            ) {
-                return Some((surface, origin.x as f64, origin.y as f64));
-            }
-
-            return Some((popup.surface.clone(), px, py));
-        }
-
-        None
-    }
+    // `popup_rect` and `popup_surface_under` moved to `renderer/popup.rs`.
 
     /// Forward a pointer motion event to the wayland client whose surface is under the pointer.
     fn forward_pointer_motion(&self, state: &mut SpikeState, x: f64, y: f64) {
-        use smithay::input::pointer::MotionEvent;
+        use smithay::input::pointer::{MotionEvent, RelativeMotionEvent};
         use smithay::utils::Point;
+        use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 
         let pointer = match state.seat.get_pointer() {
             Some(p) => p,
             None => return,
         };
 
+        // Reset the idle timer on user input (audit: screen locks while typing).
+        // Mirrors cosmic-comp/src/input/mod.rs:212.
+        state.idle_notifier_state.notify_activity(&state.seat);
+
         let serial = SERIAL_COUNTER.next_serial();
-        let time = state.clock.now().as_millis() as u32;
+        let time = state.clock.now().as_millis();
+
+        // Delta from previous compositor-space pointer position. winit gives us
+        // absolute coords; we compute the relative for `wp_relative_pointer_v1`
+        // and pointer-constraints semantics. No `delta_unaccel` from winit, so
+        // pass the same value (clients that care about accel/unaccel separately
+        // need the libinput path under backend/udev.rs).
+        let (px, py) = state.pointer_pos;
+        let delta_x = x - px;
+        let delta_y = y - py;
 
         // Session-lock gate: while locked, the only valid pointer focus is
         // the lock surface for this output. WM surfaces are completely
@@ -3157,6 +3099,82 @@ impl CompositorApp {
                 .or_else(|| self.wm.surface_under(x, y))
         };
 
+        // Pointer-constraints check, mirroring anvil/input_handler.rs:779-882.
+        // If the focused surface has an active constraint covering the
+        // current pointer position:
+        //   Locked   → suppress absolute motion, only emit relative_motion
+        //   Confined → clamp pointer to constraint region / surface bounds
+        let mut pointer_locked = false;
+        let mut pointer_confined = false;
+        let mut confine_region: Option<smithay::wayland::compositor::RegionAttributes> = None;
+        if let Some((surface, origin_x, origin_y)) = hit.as_ref() {
+            with_pointer_constraint(surface, &pointer, |constraint| match constraint {
+                Some(c) if c.is_active() => {
+                    let local = ((px - origin_x) as i32, (py - origin_y) as i32);
+                    if !c
+                        .region()
+                        .is_none_or(|r| r.contains(smithay::utils::Point::from(local)))
+                    {
+                        return;
+                    }
+                    match &*c {
+                        PointerConstraint::Locked(_) => pointer_locked = true,
+                        PointerConstraint::Confined(cf) => {
+                            pointer_confined = true;
+                            confine_region = cf.region().cloned();
+                        }
+                    }
+                }
+                _ => {}
+            });
+        }
+
+        // Always emit relative_motion — FPS games (CS2, Aim Lab clones, etc.)
+        // gate their aim on this event regardless of whether the pointer is
+        // locked.
+        pointer.relative_motion(
+            state,
+            hit.clone().map(|(s, ox, oy)| (s, Point::from((ox, oy)))),
+            &RelativeMotionEvent {
+                delta: Point::from((delta_x, delta_y)),
+                delta_unaccel: Point::from((delta_x, delta_y)),
+                utime: (time as u64) * 1000,
+            },
+        );
+
+        if pointer_locked {
+            // Pointer position stays put — do NOT update state.pointer_pos.
+            // Do NOT call pointer.motion (the spec forbids it while locked).
+            pointer.frame(state);
+            return;
+        }
+
+        // Confine path: if moving would leave the surface or constraint region,
+        // discard the absolute delta but keep the relative event (already sent).
+        let (new_x, new_y) = (x, y);
+        if pointer_confined {
+            if let Some((focus_surface, origin_x, origin_y)) = hit.as_ref() {
+                let new_hit = self
+                    .popup_surface_under(state, new_x, new_y)
+                    .or_else(|| self.wm.surface_under(new_x, new_y));
+                let crossed_surface = new_hit
+                    .as_ref()
+                    .map(|(s, _, _)| s != focus_surface)
+                    .unwrap_or(true);
+                let out_of_region = confine_region.as_ref().is_some_and(|r| {
+                    let local = ((new_x - origin_x) as i32, (new_y - origin_y) as i32);
+                    !r.contains(smithay::utils::Point::from(local))
+                });
+                if crossed_surface || out_of_region {
+                    pointer.frame(state);
+                    return;
+                }
+            }
+        }
+
+        // Commit new compositor-space position.
+        state.pointer_pos = (new_x, new_y);
+
         // Smithay expects `focus.1` to be the SURFACE ORIGIN in compositor
         // space (NOT the surface-local position). It computes
         // surface_local = event.location - focus.1 internally and ships
@@ -3172,25 +3190,40 @@ impl CompositorApp {
                 surface.id().protocol_id(),
                 surface.client().and_then(|c| c.get_credentials(&state.display_handle).ok())
                     .map(|c| c.pid).unwrap_or(0),
-                x, y, origin_x, origin_y, x - origin_x, y - origin_y,
+                new_x, new_y, origin_x, origin_y, new_x - origin_x, new_y - origin_y,
             );
+            // If the surface under the new position has an inactive
+            // constraint whose region contains the pointer, activate it
+            // (anvil/input_handler.rs:867-881 — needed so games that
+            // request lock at pointer-enter time actually get locked).
+            with_pointer_constraint(&surface, &pointer, |constraint| match constraint {
+                Some(c) if !c.is_active() => {
+                    let local = ((new_x - origin_x) as i32, (new_y - origin_y) as i32);
+                    if c.region()
+                        .is_none_or(|r| r.contains(smithay::utils::Point::from(local)))
+                    {
+                        c.activate();
+                    }
+                }
+                _ => {}
+            });
             pointer.motion(
                 state,
                 Some((surface, Point::from((origin_x, origin_y)))),
                 &MotionEvent {
-                    location: Point::from((x, y)),
+                    location: Point::from((new_x, new_y)),
                     serial,
                     time,
                 },
             );
             pointer.frame(state);
         } else {
-            tracing::debug!("pointer.motion → no surface at ({:.1},{:.1})", x, y);
+            tracing::debug!("pointer.motion → no surface at ({:.1},{:.1})", new_x, new_y);
             pointer.motion(
                 state,
                 None,
                 &MotionEvent {
-                    location: Point::from((x, y)),
+                    location: Point::from((new_x, new_y)),
                     serial,
                     time,
                 },
@@ -3214,6 +3247,9 @@ impl CompositorApp {
         use smithay::backend::input::{Axis, AxisSource};
         use smithay::input::pointer::AxisFrame;
 
+        // Reset idle timer on scroll input.
+        state.idle_notifier_state.notify_activity(&state.seat);
+
         let pointer = match state.seat.get_pointer() {
             Some(p) => p,
             None => return,
@@ -3222,7 +3258,7 @@ impl CompositorApp {
             return;
         }
 
-        let time = state.clock.now().as_millis() as u32;
+        let time = state.clock.now().as_millis();
         let mut frame = AxisFrame::new(time).source(if is_wheel {
             AxisSource::Wheel
         } else {
@@ -3259,13 +3295,16 @@ impl CompositorApp {
             None => return,
         };
 
+        // Reset idle timer on user input. See forward_pointer_motion for rationale.
+        state.idle_notifier_state.notify_activity(&state.seat);
+
         // Session-lock gate: forward the button event so the lock surface
         // can react (swaylock toggles password-field focus on click etc),
         // but skip the WM-focus / desktop-menu / drag-init bookkeeping
         // that would otherwise leak interaction to hidden windows.
         if state.session_locked {
             let serial = SERIAL_COUNTER.next_serial();
-            let time = state.clock.now().as_millis() as u32;
+            let time = state.clock.now().as_millis();
             let button_state = if pressed {
                 smithay::backend::input::ButtonState::Pressed
             } else {
@@ -3286,6 +3325,19 @@ impl CompositorApp {
 
         let (x, y) = self.pointer_pos;
         let over_client_popup = self.popup_surface_under(state, x, y).is_some();
+
+        // Popup dismissal on click outside (the only thing approximating
+        // popup-grab semantics without a full `PopupManager` refactor).
+        // When the user presses anywhere that's NOT a popup, send
+        // `xdg_popup.popup_done` to every tracked popup so context menus,
+        // GTK comboboxes, Qt menus close cleanly. Without this, popups
+        // stay glued on screen until their parent dies.
+        if pressed && !over_client_popup && !state.popups.is_empty() {
+            let to_dismiss: Vec<_> = state.popups.iter().map(|p| p.popup.clone()).collect();
+            for popup in to_dismiss {
+                popup.send_popup_done();
+            }
+        }
 
         // On left press: update WM focus.
         // - Click on a window  → focus it (existing behaviour).
@@ -3338,8 +3390,8 @@ impl CompositorApp {
         // context menu (Minimize / Maximize / Close). We test the hit
         // zone before the desktop check below; only fall through if
         // the cursor wasn't on a titlebar.
-        if button == 0x111 && pressed {
-            if !over_client_popup {
+        if button == 0x111 && pressed
+            && !over_client_popup {
                 let win_rects = self.window_rects(state);
                 if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
                     if hit.zone == cursor::HitZone::TitleBar {
@@ -3348,7 +3400,6 @@ impl CompositorApp {
                     }
                 }
             }
-        }
 
         // Right-click on the desktop opens our generic context menu.
         if button == 0x111 && pressed {
@@ -3426,7 +3477,7 @@ impl CompositorApp {
             let have_id = pointer.current_focus().map(|s| s.id().protocol_id() as i64);
             if want_id != have_id {
                 let serial_m = SERIAL_COUNTER.next_serial();
-                let time_m = state.clock.now().as_millis() as u32;
+                let time_m = state.clock.now().as_millis();
                 if let Some((surface, ox, oy)) = hit {
                     tracing::debug!(
                         "pointer focus refresh on press: forcing motion to surface_id={} origin=({:.1},{:.1})",
@@ -3461,7 +3512,7 @@ impl CompositorApp {
         }
 
         let serial = SERIAL_COUNTER.next_serial();
-        let time = state.clock.now().as_millis() as u32;
+        let time = state.clock.now().as_millis();
         let button_state = if pressed {
             smithay::backend::input::ButtonState::Pressed
         } else {
@@ -3507,7 +3558,7 @@ impl CompositorApp {
         };
 
         let focused_app_id: Option<String> =
-            state.active_surface.as_ref().and_then(|s| app_id_for(s));
+            state.active_surface.as_ref().and_then(&app_id_for);
 
         // Collect every running app_id from the toplevel list.
         let mut running_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3540,7 +3591,7 @@ impl CompositorApp {
                     .any(|rid| matches_pinned(rid, app_id_str));
                 let focused = focused_app_id
                     .as_deref()
-                    .map_or(false, |fid| matches_pinned(fid, app_id_str));
+                    .is_some_and(|fid| matches_pinned(fid, app_id_str));
                 DockItem {
                     icon: entry.item.icon.clone(),
                     app_id: entry.item.app_id.clone(),
@@ -3574,7 +3625,7 @@ impl CompositorApp {
             };
             let focused = focused_app_id
                 .as_deref()
-                .map_or(false, |fid| matches_pinned(fid, app_id));
+                .is_some_and(|fid| matches_pinned(fid, app_id));
             items.push(DockItem {
                 icon,
                 app_id: SharedString::from(app_id.as_str()),
@@ -3783,8 +3834,36 @@ impl CompositorApp {
                             tl.x = nx;
                             tl.y = ny;
                             let surface = tl.surface.clone();
-                            let cw = nw.max(resize::MIN_WINDOW_SIZE);
-                            let ch = nh.max(resize::MIN_WINDOW_SIZE);
+                            // Honour the client's declared min/max size
+                            // (xdg_toplevel.set_min_size / set_max_size).
+                            // Without this, the user can force GTK clients
+                            // below the size their layout supports, ending up
+                            // with broken text-overflow + clipped widgets.
+                            let (client_min, client_max) =
+                                smithay::wayland::compositor::with_states(&surface, |states| {
+                                    let mut cs = states
+                                        .cached_state
+                                        .get::<smithay::wayland::shell::xdg::SurfaceCachedState>(
+                                    );
+                                    let cur = cs.current();
+                                    (cur.min_size, cur.max_size)
+                                });
+                            let mut cw = nw;
+                            let mut ch = nh;
+                            if client_min.w > 0 {
+                                cw = cw.max(client_min.w);
+                            }
+                            if client_min.h > 0 {
+                                ch = ch.max(client_min.h);
+                            }
+                            if client_max.w > 0 {
+                                cw = cw.min(client_max.w);
+                            }
+                            if client_max.h > 0 {
+                                ch = ch.min(client_max.h);
+                            }
+                            let cw = cw.max(resize::MIN_WINDOW_SIZE);
+                            let ch = ch.max(resize::MIN_WINDOW_SIZE);
 
                             // Throttle configures to ~60Hz so we don't flood
                             // the client with size churn.
@@ -3793,7 +3872,7 @@ impl CompositorApp {
                                 Some(ActiveDrag::Resize {
                                     last_configure_at, ..
                                 }) => {
-                                    let send = last_configure_at.map_or(true, |t| {
+                                    let send = last_configure_at.is_none_or(|t| {
                                         now.duration_since(t)
                                             >= std::time::Duration::from_millis(16)
                                     });
@@ -3964,14 +4043,14 @@ impl CompositorApp {
                         let ow = self.wm.output_w;
                         let oh = self.wm.output_h;
                         match crate::snap::detect(x, y, ow, oh) {
-                            Some((_zone, rect)) => {
+                            Some((zone, rect)) => {
                                 ui.set_snap_preview_visible(true);
                                 ui.set_snap_preview_x(rect.x);
                                 ui.set_snap_preview_y(rect.y);
                                 ui.set_snap_preview_w(rect.w);
                                 ui.set_snap_preview_h(rect.h);
                                 if let Some(id) = maybe_wm_id {
-                                    self.pending_snap = Some((id, rect));
+                                    self.pending_snap = Some((id, zone, rect));
                                 }
                             }
                             None => {
@@ -4013,7 +4092,7 @@ impl CompositorApp {
                 .and_then(|idx| state.toplevels.get(idx))
                 .and_then(|tl| self.wm.id_for_surface(&tl.surface))
                 .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                .map_or(false, |w| w.maximized);
+                .is_some_and(|w| w.maximized);
             if maximized {
                 HitZone::None
             } else {
@@ -4042,11 +4121,11 @@ impl CompositorApp {
                             .windows
                             .values()
                             .find(|w| {
-                                state.toplevels.get(idx).map_or(false, |t| {
+                                state.toplevels.get(idx).is_some_and(|t| {
                                     self.wm.id_for_surface(&t.surface) == Some(w.id)
                                 })
                             })
-                            .map_or(false, |w| w.maximized);
+                            .is_some_and(|w| w.maximized);
                         let (ox, oy) = self.maybe_unsnap_for_move(state, idx, x, y);
                         self.active_drag = Some(ActiveDrag::Move {
                             toplevel_idx: idx,
@@ -4120,7 +4199,7 @@ impl CompositorApp {
                             .get(idx)
                             .and_then(|t| self.wm.id_for_surface(&t.surface))
                             .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                            .map_or(false, |w| w.maximized);
+                            .is_some_and(|w| w.maximized);
                         let (ox, oy) = self.maybe_unsnap_for_move(state, idx, x, y);
                         self.active_drag = Some(ActiveDrag::Move {
                             toplevel_idx: idx,
@@ -4452,6 +4531,14 @@ impl CompositorApp {
                 toplevel.with_pending_state(
                     |s: &mut smithay::wayland::shell::xdg::ToplevelState| {
                         s.size = Some((ow, oh).into());
+                        // Clear the tiled/maximized bits we set on snap so
+                        // GTK4/libadwaita brings its rounded corners back.
+                        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel as xt;
+                        s.states.unset(xt::State::TiledLeft);
+                        s.states.unset(xt::State::TiledRight);
+                        s.states.unset(xt::State::TiledTop);
+                        s.states.unset(xt::State::TiledBottom);
+                        s.states.unset(xt::State::Maximized);
                     },
                 );
                 toplevel.send_configure();
@@ -4746,7 +4833,7 @@ impl CompositorApp {
         if let Some(ui) = self.ui.as_ref() {
             ui.set_snap_preview_visible(false);
         }
-        let Some((wm_id, rect)) = self.pending_snap.take() else {
+        let Some((wm_id, zone, rect)) = self.pending_snap.take() else {
             return;
         };
 
@@ -4778,13 +4865,55 @@ impl CompositorApp {
             .find(|ts| ts.wl_surface() == &surface)
             .cloned();
         if let Some(toplevel) = maybe_ts {
+            // xdg-toplevel v2+ `tiled_*` states let GTK4/libadwaita drop their
+            // rounded corners on the snapped edges. Maximize snap also sets
+            // the Maximized state so client header bars compact.
+            use crate::snap::SnapZone;
+            use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel as xt;
             toplevel.with_pending_state(|s: &mut smithay::wayland::shell::xdg::ToplevelState| {
                 s.size = Some((rect.w, rect.h).into());
+                // Clear all tiled/maximized bits before re-applying.
+                s.states.unset(xt::State::TiledLeft);
+                s.states.unset(xt::State::TiledRight);
+                s.states.unset(xt::State::TiledTop);
+                s.states.unset(xt::State::TiledBottom);
+                s.states.unset(xt::State::Maximized);
+                match zone {
+                    SnapZone::Maximize => {
+                        s.states.set(xt::State::Maximized);
+                    }
+                    SnapZone::LeftHalf => {
+                        s.states.set(xt::State::TiledLeft);
+                        s.states.set(xt::State::TiledTop);
+                        s.states.set(xt::State::TiledBottom);
+                    }
+                    SnapZone::RightHalf => {
+                        s.states.set(xt::State::TiledRight);
+                        s.states.set(xt::State::TiledTop);
+                        s.states.set(xt::State::TiledBottom);
+                    }
+                    SnapZone::TopLeftQuarter => {
+                        s.states.set(xt::State::TiledLeft);
+                        s.states.set(xt::State::TiledTop);
+                    }
+                    SnapZone::TopRightQuarter => {
+                        s.states.set(xt::State::TiledRight);
+                        s.states.set(xt::State::TiledTop);
+                    }
+                    SnapZone::BottomLeftQuarter => {
+                        s.states.set(xt::State::TiledLeft);
+                        s.states.set(xt::State::TiledBottom);
+                    }
+                    SnapZone::BottomRightQuarter => {
+                        s.states.set(xt::State::TiledRight);
+                        s.states.set(xt::State::TiledBottom);
+                    }
+                }
             });
             toplevel.send_configure();
             debug!(
-                "snap: configure {}×{} at ({},{})",
-                rect.w, rect.h, rect.x, rect.y
+                "snap: configure {}×{} at ({},{}) zone={:?}",
+                rect.w, rect.h, rect.x, rect.y, zone
             );
         }
         for tl in state.toplevels.iter_mut() {
@@ -4848,35 +4977,14 @@ impl CompositorApp {
     pub fn refresh_calendar(&self) {
         let Some(ui) = self.ui.as_ref() else { return };
         let today = chrono::Local::now().date_naive();
-        let displayed = add_months(today, self.calendar_month_offset);
+        let displayed = calendar::add_months(today, self.calendar_month_offset);
         ui.set_popout_calendar_month_text(SharedString::from(
             displayed.format("%B %Y").to_string(),
         ));
-        let cal = build_calendar_grid_for(displayed, today);
+        let cal = calendar::build_calendar_grid_for(displayed, today);
         let model = std::rc::Rc::new(VecModel::from(cal));
         ui.set_popout_calendar_days(slint::ModelRc::from(model));
     }
-}
-
-/// Add `delta` months to `base`, clamping the day to whatever the
-/// destination month actually has (so e.g. Jan 31 + 1 month = Feb 28).
-fn add_months(base: chrono::NaiveDate, delta: i32) -> chrono::NaiveDate {
-    use chrono::{Datelike, NaiveDate};
-    let total = base.year() * 12 + (base.month() as i32 - 1) + delta;
-    let year = total.div_euclid(12);
-    let month = (total.rem_euclid(12) + 1) as u32;
-    let last_day = {
-        let next = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1)
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1)
-        }
-        .expect("valid next month");
-        let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
-        (next - first).num_days() as u32
-    };
-    let day = base.day().min(last_day);
-    NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -4887,67 +4995,6 @@ fn add_months(base: chrono::NaiveDate, delta: i32) -> chrono::NaiveDate {
 pub struct ResolvedDockEntry {
     pub item: DockItem,
     pub exec: String,
-}
-
-/// Build a 42-cell flat calendar grid (6 rows × 7 cols, Monday-first).
-/// Pads the start with prev-month trail days and the end with next-month
-/// trail days so every cell has a number — `is_other_month` flags the
-/// padding for muted rendering.
-fn build_calendar_grid(today: chrono::NaiveDate) -> Vec<crate::CalendarDay> {
-    build_calendar_grid_for(today, today)
-}
-
-/// Build a 42-cell grid for the month containing `displayed`. Today's
-/// cell is highlighted iff `today` falls within that month — when
-/// browsing prev/next via the popout chevrons, the highlight
-/// disappears and reappears as the user scrolls back.
-fn build_calendar_grid_for(
-    displayed: chrono::NaiveDate,
-    today: chrono::NaiveDate,
-) -> Vec<crate::CalendarDay> {
-    use chrono::{Datelike, NaiveDate};
-    let year = displayed.year();
-    let month = displayed.month();
-    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
-    let lead = first.weekday().num_days_from_monday() as i64;
-    let days_in_month: u32 = {
-        let next_month = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1)
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1)
-        }
-        .expect("valid next month");
-        (next_month - first).num_days() as u32
-    };
-    let highlight_today = today.year() == year && today.month() == month;
-    let mut cells = Vec::with_capacity(42);
-    let prev_last = first - chrono::Duration::days(1);
-    let prev_total = prev_last.day();
-    for i in 0..lead {
-        let day = prev_total - lead as u32 + 1 + i as u32;
-        cells.push(crate::CalendarDay {
-            day_num: day as i32,
-            is_today: false,
-            is_other_month: true,
-        });
-    }
-    for d in 1..=days_in_month {
-        cells.push(crate::CalendarDay {
-            day_num: d as i32,
-            is_today: highlight_today && d == today.day(),
-            is_other_month: false,
-        });
-    }
-    let mut trail = 1u32;
-    while cells.len() < 42 {
-        cells.push(crate::CalendarDay {
-            day_num: trail as i32,
-            is_today: false,
-            is_other_month: true,
-        });
-        trail += 1;
-    }
-    cells
 }
 
 pub fn load_dock_entries() -> Vec<ResolvedDockEntry> {
@@ -6061,185 +6108,4 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
             }
         }
     }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Menu sizing helper
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Compute the rendered height of a `ContextMenu` from its item list.
-///
-/// Matches `ContextMenu.slint`'s layout exactly:
-///   * separator row: 7 px
-///   * normal row: 28 px
-///   * outer chrome (6 px top + 6 px bottom padding around items-col): 12 px
-///
-/// Used by the right-click placement code so menus that have to flip up
-/// (cursor too close to the bottom of the screen) anchor their bottom
-/// edge AT the cursor, not 60–70 px above it. The previous hardcoded
-/// estimate of 260 px was systematically too tall.
-fn compute_menu_height(items_model: &slint::ModelRc<crate::MenuItem>) -> f64 {
-    let n = items_model.row_count();
-    let mut h = 12.0_f64; // top + bottom chrome padding
-    for i in 0..n {
-        if let Some(it) = items_model.row_data(i) {
-            h += if it.separator { 7.0 } else { 28.0 };
-        }
-    }
-    h.max(28.0 + 12.0)
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Input forwarding
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
-    use smithay::{backend::input::KeyState, input::keyboard::Keycode, utils::SERIAL_COUNTER};
-
-    // Session-lock gate: keys go ONLY to the lock surface. Without this,
-    // the user could keep typing into a focused toplevel that's hidden
-    // behind the lock — a textbook lock-screen bypass.
-    let surface = if state.session_locked {
-        state
-            .lock_surfaces
-            .first()
-            .map(|li| li.surface.wl_surface().clone())
-    } else {
-        // ── BEGIN layer-shell keyboard-routing block ───────────────────
-        // A mapped Top/Overlay layer surface with
-        // KeyboardInteractivity::Exclusive (lock screens, password
-        // prompts, app launchers like fuzzel) wins over the WM's
-        // focused toplevel. OnDemand layer surfaces still rely on
-        // active_surface being set by click-to-focus. None layer
-        // surfaces never receive keys.
-        state
-            .exclusive_keyboard_layer()
-            .cloned()
-            .or_else(|| state.active_surface.clone())
-        // ── END layer-shell keyboard-routing block ─────────────────────
-    };
-    let Some(surface) = surface else { return };
-    let Some(keyboard) = state.seat.get_keyboard() else {
-        return;
-    };
-    keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
-    let serial = SERIAL_COUNTER.next_serial();
-    let time = state.clock.now().as_millis() as u32;
-    let keycode = Keycode::new(key_event.scancode + 8);
-    let ks = if key_event.pressed {
-        KeyState::Pressed
-    } else {
-        KeyState::Released
-    };
-    keyboard.input_forward(state, keycode, ks, serial, time, false);
-}
-
-/// Map an ASCII character to its Linux evdev scancode + whether SHIFT is required.
-/// Used by the IPC `TypeText` command. Coverage: a-z, A-Z, 0-9, common punctuation,
-/// space, newline, tab. Returns None for chars we don't know how to type.
-fn ascii_to_scancode(ch: char) -> Option<(u32, bool)> {
-    Some(match ch {
-        // letters (lowercase + shifted uppercase)
-        'a' => (30, false),
-        'A' => (30, true),
-        'b' => (48, false),
-        'B' => (48, true),
-        'c' => (46, false),
-        'C' => (46, true),
-        'd' => (32, false),
-        'D' => (32, true),
-        'e' => (18, false),
-        'E' => (18, true),
-        'f' => (33, false),
-        'F' => (33, true),
-        'g' => (34, false),
-        'G' => (34, true),
-        'h' => (35, false),
-        'H' => (35, true),
-        'i' => (23, false),
-        'I' => (23, true),
-        'j' => (36, false),
-        'J' => (36, true),
-        'k' => (37, false),
-        'K' => (37, true),
-        'l' => (38, false),
-        'L' => (38, true),
-        'm' => (50, false),
-        'M' => (50, true),
-        'n' => (49, false),
-        'N' => (49, true),
-        'o' => (24, false),
-        'O' => (24, true),
-        'p' => (25, false),
-        'P' => (25, true),
-        'q' => (16, false),
-        'Q' => (16, true),
-        'r' => (19, false),
-        'R' => (19, true),
-        's' => (31, false),
-        'S' => (31, true),
-        't' => (20, false),
-        'T' => (20, true),
-        'u' => (22, false),
-        'U' => (22, true),
-        'v' => (47, false),
-        'V' => (47, true),
-        'w' => (17, false),
-        'W' => (17, true),
-        'x' => (45, false),
-        'X' => (45, true),
-        'y' => (21, false),
-        'Y' => (21, true),
-        'z' => (44, false),
-        'Z' => (44, true),
-        // digits + shifted symbols (US layout)
-        '1' => (2, false),
-        '!' => (2, true),
-        '2' => (3, false),
-        '@' => (3, true),
-        '3' => (4, false),
-        '#' => (4, true),
-        '4' => (5, false),
-        '$' => (5, true),
-        '5' => (6, false),
-        '%' => (6, true),
-        '6' => (7, false),
-        '^' => (7, true),
-        '7' => (8, false),
-        '&' => (8, true),
-        '8' => (9, false),
-        '*' => (9, true),
-        '9' => (10, false),
-        '(' => (10, true),
-        '0' => (11, false),
-        ')' => (11, true),
-        // punctuation
-        '-' => (12, false),
-        '_' => (12, true),
-        '=' => (13, false),
-        '+' => (13, true),
-        '[' => (26, false),
-        '{' => (26, true),
-        ']' => (27, false),
-        '}' => (27, true),
-        '\\' => (43, false),
-        '|' => (43, true),
-        ';' => (39, false),
-        ':' => (39, true),
-        '\'' => (40, false),
-        '"' => (40, true),
-        '`' => (41, false),
-        '~' => (41, true),
-        ',' => (51, false),
-        '<' => (51, true),
-        '.' => (52, false),
-        '>' => (52, true),
-        '/' => (53, false),
-        '?' => (53, true),
-        // whitespace
-        ' ' => (57, false),  // space
-        '\n' => (28, false), // enter
-        '\t' => (15, false), // tab
-        _ => return None,
-    })
 }
