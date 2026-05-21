@@ -54,6 +54,16 @@ export component WindowChrome {
     // so we hide our SSD titlebar + Slint border + drop-shadow and let the
     // client surface fill the entire window rect.
     in property <bool>   csd: false;
+    // Maximized — the window fills the work area. Corner rounding + drop-
+    // shadow collapse so the window sits flush against the screen edges.
+    in property <bool>   maximized: false;
+    // Geometry is animating (maximize / unmaximize) or being drag-resized.
+    in property <bool>   resizing: false;
+
+    // Effective corner radius — 0 when maximized so the window squares off
+    // against the screen edges; the squircle radius otherwise.
+    property <length> corner-radius:
+        root.maximized ? 0px : Tokens.window-corner-radius-outer;
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     callback close-clicked();
@@ -160,16 +170,19 @@ export component WindowChrome {
         // intends, so the corner blend reads correctly. The clip
         // radius matches GTK's default (14 px) so visible area
         // matches.
-        border-radius: Tokens.window-corner-radius-outer;
+        border-radius: root.corner-radius;
         border-width:  root.csd ? 0px : 1px;
         border-color:  root.resolved-border;
         background:    root.csd ? transparent : root.resolved-content-bg;
         clip:          true;
 
-        // Drop shadow — single Slint layer (skipped for CSD).
-        drop-shadow-blur:     root.csd ? 0px : 24px;
-        drop-shadow-offset-y: root.csd ? 0px : 8px;
-        drop-shadow-color:    root.csd ? rgba(0, 0, 0, 0.0) : rgba(0, 0, 0, 0.45);
+        // Drop shadow — single Slint layer. Skipped for CSD (client paints
+        // its own) and when maximized (window is flush to the screen edges,
+        // a shadow would just bleed onto the panel / dock).
+        drop-shadow-blur:     (root.csd || root.maximized) ? 0px : 24px;
+        drop-shadow-offset-y: (root.csd || root.maximized) ? 0px : 8px;
+        drop-shadow-color:    (root.csd || root.maximized)
+            ? rgba(0, 0, 0, 0.0) : rgba(0, 0, 0, 0.45);
 
         // ── Solid titlebar backing — SSD only ──────────────────────────
         // For CSD, the client owns its header bar (GTK headerbar, app
@@ -185,8 +198,8 @@ export component WindowChrome {
             width: parent.width;
             height: Tokens.titlebar-height;
             background: root.resolved-titlebar-solid-bg;
-            border-top-left-radius: Tokens.window-corner-radius-outer;
-            border-top-right-radius: Tokens.window-corner-radius-outer;
+            border-top-left-radius: root.corner-radius;
+            border-top-right-radius: root.corner-radius;
             border-bottom-left-radius: 0px;
             border-bottom-right-radius: 0px;
             visible: !root.csd;
@@ -202,8 +215,8 @@ export component WindowChrome {
             height: Tokens.titlebar-height;
             visible: !root.csd;
             background: root.resolved-titlebar-bg;
-            border-top-left-radius: Tokens.window-corner-radius-outer;
-            border-top-right-radius: Tokens.window-corner-radius-outer;
+            border-top-left-radius: root.corner-radius;
+            border-top-right-radius: root.corner-radius;
             border-bottom-left-radius: 0px;
             border-bottom-right-radius: 0px;
 
@@ -337,19 +350,22 @@ export component WindowChrome {
             // corners rounded to match outer-frame's squircle. For SSD
             // only the bottom corners — the titlebar above carries the top
             // corners.
-            border-top-left-radius:     root.csd ? Tokens.window-corner-radius-outer : 0px;
-            border-top-right-radius:    root.csd ? Tokens.window-corner-radius-outer : 0px;
-            border-bottom-left-radius:  Tokens.window-corner-radius-outer;
-            border-bottom-right-radius: Tokens.window-corner-radius-outer;
+            border-top-left-radius:     root.csd ? root.corner-radius : 0px;
+            border-top-right-radius:    root.csd ? root.corner-radius : 0px;
+            border-bottom-left-radius:  root.corner-radius;
+            border-bottom-right-radius: root.corner-radius;
             clip: true;
 
             // Legacy single-texture path — used when the per-surface
             // `surfaces` list is empty (a freshly-mapped window before
-            // its first commit, or any code path that hasn't been
-            // migrated to the new render-element model yet). Rendered
-            // first so the surface Repeater below paints on top.
+            // its first commit) AND while the window is resizing. During
+            // a maximize / unmaximize / drag-resize the chrome animates
+            // at 60 fps but the client re-commits its buffer far slower;
+            // this single texture is `image-fit: fill` so it stretches to
+            // the animating frame, keeping the content visually smooth
+            // (it snaps back to the crisp per-surface path once settled).
             Image {
-                visible: root.surfaces.length == 0;
+                visible: root.surfaces.length == 0 || root.resizing;
                 width: parent.width;
                 height: parent.height;
                 source: root.content;
@@ -367,8 +383,10 @@ export component WindowChrome {
             // independently with its own src-clip. When this list is
             // non-empty it covers the legacy Image above. Source-clip
             // honours wp_viewporter src crop and (for the toplevel)
-            // xdg_surface.set_window_geometry.
+            // xdg_surface.set_window_geometry. Hidden during a resize so
+            // the stretched legacy texture above carries the animation.
             for s in root.surfaces: Image {
+                visible: !root.resizing;
                 x: s.x-in-window * 1px;
                 y: s.y-in-window * 1px;
                 width: s.w * 1px;
@@ -395,10 +413,15 @@ export component WindowChrome {
             y: 0;
             width: parent.width;
             height: parent.height;
-            border-radius: Tokens.window-corner-radius-outer;
+            border-radius: root.corner-radius;
             background: transparent;
             border-width: 0;
             clip: true;
+            // SSD only. For CSD the client paints its own headerbar / top
+            // edge; stamping our white top-edge gradient over it reads as a
+            // bright inner glow strip across the top of the window — the
+            // "glow in CSD windows" the user reported.
+            visible: !root.csd;
 
             // Top-edge highlight strip — fades over the first 12 px so it
             // reads as a soft glow, not a hard 2 px band.
@@ -421,7 +444,7 @@ export component WindowChrome {
             y: -2px;
             width: parent.width + 4px;
             height: parent.height + 4px;
-            border-radius: Tokens.window-corner-radius-outer + 2px;
+            border-radius: root.corner-radius + 2px;
             border-width: 2px;
             border-color: rgba(100, 180, 255, 0.90);
             background: transparent;

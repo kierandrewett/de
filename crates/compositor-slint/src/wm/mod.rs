@@ -977,22 +977,44 @@ impl WindowManager {
     pub fn update_geometry(&mut self, surface: &WlSurface, w: i32, h: i32) {
         let key = Self::key(surface);
         if let Some(win) = self.windows.get_mut(&key) {
-            if !win.maximized {
-                win.w = w;
-                win.h = h;
-                // Snap geometry springs to the committed size ONLY when the
-                // springs have already settled. If they're mid-flight (e.g.
-                // an unmaximize geometry animation in progress), snapping
-                // here would cut the animation short — we let the spring run
-                // and trust the next commit to land at the same target.
-                if win.phase == AnimPhase::Open
-                    && win.anim.geo_w.is_done()
-                    && win.anim.geo_h.is_done()
-                {
-                    win.anim.geo_w.set_instant(w as f64);
-                    win.anim.geo_h.set_instant(h as f64);
-                }
+            if win.maximized {
+                return;
             }
+            win.w = w;
+            win.h = h;
+            let cur_w = win.anim.geo_w.value().round() as i32;
+            let cur_h = win.anim.geo_h.value().round() as i32;
+            if cur_w == w && cur_h == h {
+                return;
+            }
+            if win.awaiting_first_render {
+                // First real buffer. `WindowAnimState::new_opening` seeded
+                // the geometry springs at the DEFAULT_WINDOW_W/H placeholder
+                // (the client hadn't told us its size yet). Snap them to the
+                // client's actual size NOW so the open animation runs at the
+                // right size from frame one — otherwise the window plays its
+                // whole open at 800x600 then jumps to its real size the
+                // instant the animation settles (the GNOME Calculator
+                // "resizes after opening" glitch).
+                win.anim.geo_w.set_instant(w as f64);
+                win.anim.geo_h.set_instant(h as f64);
+            } else if win.phase == AnimPhase::Opening {
+                // The client re-laid-out while still opening (GTK content
+                // reflow is common). Absorb it as a smooth spring rather
+                // than a snap, so the resize rides along with the open
+                // animation instead of cutting it.
+                win.anim.geo_w.set_target(w as f64);
+                win.anim.geo_h.set_target(h as f64);
+            } else if win.phase == AnimPhase::Open
+                && win.anim.geo_w.is_done()
+                && win.anim.geo_h.is_done()
+            {
+                // Settled, mapped window — adopt the client's size directly.
+                win.anim.geo_w.set_instant(w as f64);
+                win.anim.geo_h.set_instant(h as f64);
+            }
+            // else: mid maximize / unmaximize / other geometry animation —
+            // let the spring run to its target; the next commit lands there.
         }
     }
 

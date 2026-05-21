@@ -2170,6 +2170,16 @@ impl CompositorApp {
                 geom_w,
                 geom_h,
                 csd: toplevel.csd,
+                maximized: win.maximized,
+                // Resizing = geometry springs mid-flight (maximize /
+                // unmaximize) OR this window is being interactively
+                // drag-resized. Drives the stretched-texture render path.
+                resizing: !win.anim.geo_w.is_done()
+                    || !win.anim.geo_h.is_done()
+                    || resizing_idx
+                        .and_then(|i| state.toplevels.get(i))
+                        .map(|t| t.surface == win.surface)
+                        .unwrap_or(false),
             });
         }
 

@@ -91,6 +91,16 @@ export struct WindowItem {
     // skips its own titlebar / border / shadow and shows only the buffer —
     // the client paints its full chrome inside the surface.
     csd: bool,
+    // True when the window is maximized. WindowChrome drops its corner
+    // rounding + drop-shadow so the window sits flush to the screen edges.
+    maximized: bool,
+    // True while the window geometry is animating (maximize / unmaximize)
+    // or being drag-resized. WindowChrome renders the legacy single
+    // texture stretched to fill the animating frame instead of the
+    // fixed-size per-surface elements — the client commits new buffers
+    // far slower than 60 fps, so without the stretch the content visibly
+    // steps while the chrome animates smoothly.
+    resizing: bool,
 }
 
 // A layer-shell surface from an external client.
@@ -412,6 +422,8 @@ export component Compositor inherits Window {
             anim-scale: win.anim-scale;
             alt-tab-selected: win.alt-tab-selected;
             csd: win.csd;
+            maximized: win.maximized;
+            resizing: win.resizing;
 
             close-clicked    => { root.close-window(win.id); }
             minimize-clicked => { root.minimize-window(win.id); }

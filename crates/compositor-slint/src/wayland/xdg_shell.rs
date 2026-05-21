@@ -110,6 +110,20 @@ impl XdgShellHandler for SpikeState {
             s.geometry = geom;
             s.positioner = positioner;
         });
+        // Register the popup with smithay's PopupManager. This is what makes
+        // `find_popup_root_surface` resolve a NESTED popup's root (popup →
+        // popup → toplevel), drives `xdg_popup.configure` from
+        // `popup_manager.commit`, and lets `grab_popup` install the grab.
+        // GTK menus are single-level so they limped along without it;
+        // Firefox nests its menus, so an untracked intermediate popup made
+        // the whole chain fail to configure / position. anvil tracks every
+        // popup here too.
+        if let Err(e) = self
+            .popup_manager
+            .track_popup(smithay::desktop::PopupKind::Xdg(surface.clone()))
+        {
+            tracing::warn!("failed to track popup: {e}");
+        }
         // Re-run the constraint solver against the output so the popup never
         // renders off-screen — anvil/shell/xdg.rs:63.
         self.unconstrain_popup(&surface);
