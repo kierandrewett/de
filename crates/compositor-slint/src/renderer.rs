@@ -676,15 +676,21 @@ impl ApplicationHandler for CompositorApp {
                 if self.slint_pointer_overlay_open() {
                     return;
                 }
-                // Wayland axis convention: positive = down/right, matching
-                // winit's "content moves right/down" for positive deltas. No
-                // sign flip needed.
+                // Sign convention: winit reports a positive LineDelta/PixelDelta
+                // y when the wheel is scrolled UP (away from the user); the
+                // wl_pointer.axis protocol wants a POSITIVE value for scroll
+                // DOWN (libinput's convention — see backend/udev.rs which
+                // forwards libinput amounts unflipped). They're opposite, so
+                // negate both axes for the wayland path. The Slint path above
+                // keeps winit's signs because Slint's PointerScrolled uses the
+                // same convention winit does.
+                let discrete_v120 = discrete_v120.map(|(vx, vy)| (-vx, -vy));
                 self.pending_pointers
                     .lock()
                     .unwrap()
                     .push_back(PendingPointerEvent::Axis {
-                        dx: dx_px,
-                        dy: dy_px,
+                        dx: -dx_px,
+                        dy: -dy_px,
                         discrete_v120,
                         is_wheel,
                     });

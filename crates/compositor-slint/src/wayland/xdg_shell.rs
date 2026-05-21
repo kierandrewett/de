@@ -42,13 +42,17 @@ impl XdgShellHandler for SpikeState {
 
         info!("new xdg toplevel #{} at ({},{})", idx, x, y);
 
-        // Pre-set the initial content size; the actual `send_configure()`
-        // is deferred to the commit handler so the client has had a chance
-        // to set app_id / title / decoration mode first (avoids a stale
-        // first round-trip and bad initial decoration negotiation).
-        surface.with_pending_state(|s| {
-            s.size = Some((800, 600).into());
-        });
+        // Do NOT force an initial size. The initial xdg_toplevel.configure
+        // is left at size (0, 0) — per xdg-shell that means "client picks
+        // its own size". Forcing 800x600 made every freshly-opened window
+        // visibly resize: the client honoured 800x600 for its first commit,
+        // then re-laid-out to its real preferred size and committed again,
+        // so the user saw the window snap to a different size right after
+        // it appeared. Letting the client size itself from the start means
+        // our chrome is correct on frame one. Maximize / snap / fullscreen
+        // still send explicit sizes through their own configure paths.
+        // (`send_configure()` itself is still deferred to the commit handler
+        // so the client can set app_id / title / decoration mode first.)
 
         let wl_surface = surface.wl_surface().clone();
 
