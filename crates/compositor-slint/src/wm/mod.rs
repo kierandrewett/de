@@ -174,10 +174,13 @@ impl Spring {
         // Relative settle: terminate once within ~0.4 % of the travel
         // distance (imperceptible) instead of an absolute 0.001 — the
         // latter forced large pixel-magnitude springs through a long
-        // asymptotic tail. The velocity gate uses the same relative
-        // scale so a still-moving spring isn't cut short.
+        // asymptotic tail. The velocity gate is deliberately loose: for
+        // a critically-damped spring (monotonic, no overshoot) the
+        // position test is what matters; the velocity test only exists
+        // to avoid cutting an under-damped spring short mid-oscillation,
+        // so it must not bind before the position test for normal runs.
         let eps = self.settle_eps();
-        if (self.pos - self.target).abs() < eps && self.vel.abs() < eps * 16.0 {
+        if (self.pos - self.target).abs() < eps && self.vel.abs() < eps * 64.0 {
             self.pos = self.target;
             self.vel = 0.0;
             self.done = true;
