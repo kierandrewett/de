@@ -153,6 +153,10 @@ export component Panel {
                     }
 
                     entry-touch := TouchArea {
+                        // A TouchArea has no implicit size — without an
+                        // explicit fill it stays 0×0 and never sees clicks.
+                        width: parent.width;
+                        height: parent.height;
                         // Report the entry's screen-x so Rust can drop the
                         // submenu popup directly below this entry.
                         clicked => {
