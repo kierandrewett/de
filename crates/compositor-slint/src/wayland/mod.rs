@@ -4,6 +4,8 @@
 //! group and calls the matching `delegate_*!` macro.  The `SpikeState` struct
 //! stays in `wayland_state.rs`; only the trait impls live here.
 
+pub mod appmenu;
+pub mod appmenu_protocol;
 pub mod compositor;
 pub mod decoration;
 pub mod idle;

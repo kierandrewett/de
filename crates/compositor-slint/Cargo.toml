@@ -30,6 +30,12 @@ wayland-server = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 wayland-protocols-misc = { version = "0.3", features = ["server"] }
+# wayland-scanner: codegen for the vendored org_kde_kwin_appmenu protocol
+# (protocols/appmenu.xml) — KDE-style global menu support. Not in
+# wayland-protocols-misc, so we generate bindings ourselves.
+# wayland-backend is referenced by the generated interface tables.
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
 
 # Slint UI toolkit — GPU renderer via FemtoVG + wgpu-28
 # renderer-femtovg-wgpu enables FemtoVGWGPURenderer

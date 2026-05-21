@@ -26,7 +26,7 @@
 
 import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { Wallpaper } from "./Wallpaper.slint";
-import { Panel } from "./Panel.slint";
+import { Panel, GlobalMenuTopItem } from "./Panel.slint";
 import { Dock, DockItem } from "./Dock.slint";
 import { WindowChrome } from "./WindowChrome.slint";
 import { SurfaceItem } from "./SurfaceItem.slint";
@@ -137,6 +137,8 @@ export struct PopupItem {
 
 // Re-export DockItem so importers of Compositor.slint can use it directly.
 export { DockItem }
+// Re-export GlobalMenuTopItem (defined in Panel.slint) for Rust bindings.
+export { GlobalMenuTopItem }
 // Re-export TokenMode for Rust bindings.
 export { TokenMode }
 
@@ -192,6 +194,24 @@ export component Compositor inherits Window {
     in-out property <int>            window-menu-selected: -1;
     in property      <[MenuItem]>    window-menu-items;
     callback window-menu-clicked(int, int);  // (target-id, action-id)
+
+    // ── Global menu (KDE-style appmenu) ──────────────────────────────────────
+    // Top-level menu bar for the focused window, rendered in the panel's
+    // left zone. Empty when the focused app exports no global menu.
+    in property      <[GlobalMenuTopItem]> global-menu-bar;
+    // The submenu popup — a ContextMenu dropped below the clicked bar entry.
+    in property      <[MenuItem]>    global-menu-items;
+    in-out property  <bool>          global-menu-open: false;
+    in-out property  <int>           global-menu-x: 0;
+    in-out property  <int>           global-menu-y: 0;
+    in-out property  <int>           global-menu-selected: -1;
+    // Index of the bar entry whose submenu is currently open (-1 = none) —
+    // the panel highlights it.
+    in-out property  <int>           global-menu-open-index: -1;
+    // Bar entry clicked: (dbusmenu node id, screen x of the entry).
+    callback global-menu-entry-clicked(int, length);
+    // Submenu row activated: dbusmenu node id.
+    callback global-menu-item-activated(int);
 
     // ── Desktop context menu ─────────────────────────────────────────────────
     in-out property <bool>           desktop-menu-open: false;
@@ -451,6 +471,9 @@ export component Compositor inherits Window {
         tray-items: root.tray-items;
         tray-clicked(id) => { root.tray-clicked(id); }
         tray-right-clicked(id) => { root.tray-right-clicked(id); }
+        global-menu-bar: root.global-menu-bar;
+        global-menu-open-index: root.global-menu-open-index;
+        global-menu-clicked(id, x) => { root.global-menu-entry-clicked(id, x); }
         backdrop: root.wallpaper-blurred;
         backdrop-screen-w: parent.width;
         backdrop-screen-h: parent.height;
@@ -623,6 +646,47 @@ export component Compositor inherits Window {
         dismiss => {
             root.tray-menu-open = false;
             root.tray-menu-selected = -1;
+        }
+    }
+
+    // ── Global menu submenu popup (KDE appmenu) ─────────────────────────────
+    // Dropped below the panel from whichever bar entry was clicked.
+    if root.global-menu-open: TouchArea {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        z: 87;
+        clicked => {
+            root.global-menu-open = false;
+            root.global-menu-selected = -1;
+            root.global-menu-open-index = -1;
+        }
+    }
+    global-menu := ContextMenu {
+        x: root.global-menu-x * 1px;
+        y: root.global-menu-y * 1px;
+        z: 88;
+        items: root.global-menu-items;
+        open: root.global-menu-open;
+        selected-index: root.global-menu-selected;
+        // Drops straight down out of the panel bar entry.
+        origin-x: 0px;
+        origin-y: 0px;
+        backdrop: root.wallpaper-blurred;
+        backdrop-screen-w: parent.width;
+        backdrop-screen-h: parent.height;
+        menu-x: root.global-menu-x * 1px;
+        menu-y: root.global-menu-y * 1px;
+        item-clicked(id) => {
+            root.global-menu-open = false;
+            root.global-menu-selected = -1;
+            root.global-menu-open-index = -1;
+            root.global-menu-item-activated(id);
+        }
+        dismiss => {
+            root.global-menu-open = false;
+            root.global-menu-selected = -1;
+            root.global-menu-open-index = -1;
         }
     }
 

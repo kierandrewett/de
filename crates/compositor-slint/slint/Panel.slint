@@ -9,9 +9,26 @@ import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { StatusIcon } from "./widgets/StatusIcon.slint";
 import { TrayIconItem } from "./widgets/TrayItem.slint";
 
+// One top-level entry of the KDE-style global menu bar (File / Edit / …).
+// `id` is the com.canonical.dbusmenu node id — passed back so Rust can
+// fetch that submenu's children.
+export struct GlobalMenuTopItem {
+    id:    int,
+    label: string,
+}
+
 export component Panel {
     in property <string> focused-app: "";
     in property <string> clock-text: "00:00";
+    /// KDE-style global menu bar for the focused window. Empty when the
+    /// focused app exports no appmenu — then the left zone shows only the
+    /// app name.
+    in property <[GlobalMenuTopItem]> global-menu-bar;
+    /// Index of the bar entry whose submenu is currently open (-1 = none).
+    in property <int> global-menu-open-index: -1;
+    /// Bar entry clicked: (dbusmenu node id, screen-x of the entry's left
+    /// edge) so the submenu popup drops directly below it.
+    callback global-menu-clicked(int, length);
     /// Short date string shown next to the time (e.g. "Wed 29 Apr").
     in property <string> date-text: "";
     /// Registered StatusNotifierItem icons rendered to the right of the
@@ -85,23 +102,66 @@ export component Panel {
             background: root.resolved-border;
         }
 
-        // Focused-app text (left).
+        // Left zone — focused-app name + (when the app exports one) the
+        // KDE-style global menu bar laid out to its right.
         left-zone := Rectangle {
             x: 0; y: 0;
-            width: parent.width / 3;
+            width: parent.width / 2;
             height: parent.height;
 
-            Text {
-                x: 14px; y: 0;
-                width: parent.width - 14px;
+            HorizontalLayout {
+                x: 0; y: 0;
+                width: parent.width;
                 height: parent.height;
-                text: root.focused-app;
-                color: root.resolved-fg;
-                font-family: Tokens.font-family;
-                font-size: Tokens.panel-font-size;
-                font-weight: 500;
-                vertical-alignment: center;
-                overflow: elide;
+                padding-left: 14px;
+                spacing: 2px;
+                alignment: start;
+
+                // App name — bold, like macOS / KDE.
+                Text {
+                    text: root.focused-app;
+                    color: root.resolved-fg;
+                    font-family: Tokens.font-family;
+                    font-size: Tokens.panel-font-size;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                // Global menu bar entries.
+                for entry[i] in root.global-menu-bar: entry-rect := Rectangle {
+                    property <bool> active: root.global-menu-open-index == i;
+                    width: label-text.preferred-width + 16px;
+                    height: parent.height - 8px;
+                    y: 4px;
+                    border-radius: 6px;
+                    background: entry-touch.has-hover || self.active
+                        ? root.resolved-hover-bg
+                        : transparent;
+
+                    label-text := Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: entry.label;
+                        color: root.resolved-fg;
+                        font-family: Tokens.font-family;
+                        font-size: Tokens.panel-font-size;
+                        font-weight: 500;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    entry-touch := TouchArea {
+                        // Report the entry's screen-x so Rust can drop the
+                        // submenu popup directly below this entry.
+                        clicked => {
+                            root.global-menu-clicked(
+                                entry.id,
+                                entry-rect.absolute-position.x);
+                        }
+                    }
+                }
             }
         }
 

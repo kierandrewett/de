@@ -244,6 +244,12 @@ pub struct ToplevelInfo {
     /// is human-readable. Stored for future session-management consumers.
     pub tag: Option<String>,
     pub description: Option<String>,
+    /// `(dbus_service_name, dbus_object_path)` of this window's exported
+    /// `com.canonical.dbusmenu` — set via `org_kde_kwin_appmenu` (Wayland)
+    /// or the `com.canonical.AppMenu.Registrar` D-Bus service (X11/legacy).
+    /// `None` when the app exports no global menu (most GTK4/GNOME apps).
+    /// The panel renders this window's menu when it has keyboard focus.
+    pub appmenu: Option<(String, String)>,
 }
 
 /// A mapped xdg_popup — context menus, dropdowns, autocomplete, etc.
@@ -397,6 +403,12 @@ pub struct SpikeState {
     /// buffers for compositing). PopupManager doesn't need pixels — just
     /// the popup hierarchy + grab state.
     pub popup_manager: smithay::desktop::PopupManager,
+    /// `org_kde_kwin_appmenu_manager` global — KDE-style global menus.
+    pub appmenu_manager_state: crate::wayland::appmenu::AppmenuManagerState,
+    /// Appmenu addresses set via `org_kde_kwin_appmenu::set_address` before
+    /// the owning toplevel was tracked. Drained into `ToplevelInfo.appmenu`
+    /// when the toplevel maps. Keyed by the surface's ObjectId.
+    pub pending_appmenu: std::collections::HashMap<ObjectId, (String, String)>,
     pub xdg_toplevel_tag_manager: XdgToplevelTagManager,
 
     // ── P2 Screen capture (ext-image-copy-capture-v1) ─────────────────────
@@ -652,6 +664,7 @@ impl SpikeState {
         let xdg_dialog_state =
             smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<Self>(dh);
         let popup_manager = smithay::desktop::PopupManager::default();
+        let appmenu_manager_state = crate::wayland::appmenu::AppmenuManagerState::new(dh);
         let xdg_toplevel_tag_manager = XdgToplevelTagManager::new::<Self>(dh);
 
         let image_capture_source_state = ImageCaptureSourceState::new();
@@ -721,6 +734,8 @@ impl SpikeState {
             xdg_toplevel_icon_manager,
             xdg_dialog_state,
             popup_manager,
+            appmenu_manager_state,
+            pending_appmenu: std::collections::HashMap::new(),
             xdg_toplevel_tag_manager,
             image_capture_source_state,
             output_capture_source_state,

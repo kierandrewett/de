@@ -28,6 +28,7 @@
 //! WM (Wave 1A): WindowManager drives focus stack, z-order, animations.
 
 use std::{
+    cell::RefCell,
     collections::{HashSet, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex},
@@ -321,6 +322,11 @@ struct CompositorApp {
     /// frames when neither the toplevel's window id nor the individual
     /// surface's buffer version has advanced.
     client_image_cache_per_surface: std::collections::HashMap<(i32, u32), (u64, slint::Image)>,
+    /// `(dbus_service, dbus_path)` of the focused window's global menu, or
+    /// None. Shared with the panel's menu-click callbacks so they can fetch
+    /// submenus / dispatch activations. `update_windows` rewrites it when
+    /// keyboard focus moves to a window with a different appmenu address.
+    appmenu_addr: Rc<RefCell<Option<(String, String)>>>,
 }
 
 /// Per-frame snapshot of the active lock surface for the renderer.
@@ -357,6 +363,7 @@ impl CompositorApp {
         pending_keys: Arc<Mutex<VecDeque<PendingKeyEvent>>>,
         pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
         dock_entries: Vec<ResolvedDockEntry>,
+        appmenu_addr: Rc<RefCell<Option<(String, String)>>>,
     ) -> Self {
         Self {
             window: None,
@@ -414,6 +421,7 @@ impl CompositorApp {
             last_layers_fingerprint: Vec::new(),
             client_image_cache: std::collections::HashMap::new(),
             client_image_cache_per_surface: std::collections::HashMap::new(),
+            appmenu_addr,
         }
     }
 
@@ -2148,6 +2156,51 @@ impl CompositorApp {
                 .map(|it| it.title.to_string())
                 .unwrap_or_else(|| "Desktop".to_string());
             ui.set_focused_app(SharedString::from(focused_title));
+
+            // Global menu (KDE-style appmenu): when keyboard focus moves to a
+            // window whose exported menu address differs from the cached one,
+            // refetch the top-level bar (or clear it if the new window has no
+            // appmenu). The address is also stashed in `appmenu_addr` for the
+            // panel's menu-click callbacks.
+            let focused_appmenu: Option<(String, String)> = self
+                .wm
+                .windows
+                .values()
+                .find(|w| w.focused)
+                .and_then(|w| state.toplevels.iter().find(|t| t.surface == w.surface))
+                .and_then(|t| t.appmenu.clone());
+            if *self.appmenu_addr.borrow() != focused_appmenu {
+                *self.appmenu_addr.borrow_mut() = focused_appmenu.clone();
+                // Focus moved — any open submenu belongs to the old window.
+                ui.set_global_menu_open(false);
+                ui.set_global_menu_open_index(-1);
+                match focused_appmenu {
+                    Some((service, path)) => {
+                        let weak = ui.as_weak();
+                        crate::dbusmenu::fetch_appmenu_children(service, path, 0, move |nodes| {
+                            let weak = weak.clone();
+                            let _ = slint::invoke_from_event_loop(move || {
+                                let Some(ui) = weak.upgrade() else { return };
+                                let bar: Vec<crate::GlobalMenuTopItem> = nodes
+                                    .into_iter()
+                                    .filter(|n| !n.separator && !n.label.is_empty())
+                                    .map(|n| crate::GlobalMenuTopItem {
+                                        id: n.id,
+                                        label: SharedString::from(n.label),
+                                    })
+                                    .collect();
+                                ui.set_global_menu_bar(slint::ModelRc::new(VecModel::from(bar)));
+                            });
+                        });
+                    }
+                    None => {
+                        ui.set_global_menu_bar(slint::ModelRc::new(VecModel::<
+                            crate::GlobalMenuTopItem,
+                        >::default(
+                        )));
+                    }
+                }
+            }
 
             // Honour `wl_pointer.set_cursor` requests from clients:
             //   * Hidden  → set cursor-visible=false (video / drawing apps).
@@ -5132,6 +5185,11 @@ pub fn run() -> Result<()> {
 
     let ui = Compositor::new().context("failed to create Compositor UI")?;
 
+    // Focused window's global-menu D-Bus address. Created here so both the
+    // panel menu-click callbacks (wired below) and `CompositorApp` (which
+    // rewrites it on focus change) share the same cell.
+    let appmenu_addr: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+
     ui.set_clock_text(SharedString::from(
         chrono::Local::now().format("%H:%M:%S").to_string(),
     ));
@@ -5581,6 +5639,88 @@ pub fn run() -> Result<()> {
             }
         });
     }
+    // Global menu: a top-level bar entry was clicked → fetch that submenu's
+    // children from the focused window's com.canonical.dbusmenu and drop a
+    // ContextMenu popup below the entry.
+    {
+        let weak = ui.as_weak();
+        let addr = appmenu_addr.clone();
+        ui.on_global_menu_entry_clicked(move |node_id, entry_x| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some((service, path)) = addr.borrow().clone() else {
+                return;
+            };
+            // Index of the clicked bar entry — drives the open-highlight.
+            let bar = ui.get_global_menu_bar();
+            let mut idx = -1i32;
+            for i in 0..bar.row_count() {
+                if let Some(e) = bar.row_data(i) {
+                    if e.id == node_id {
+                        idx = i as i32;
+                        break;
+                    }
+                }
+            }
+            // Position now (synchronous); items + open flip on fetch.
+            ui.set_global_menu_x(entry_x as i32);
+            ui.set_global_menu_y(34);
+            ui.set_global_menu_open_index(idx);
+            ui.set_global_menu_selected(-1);
+            let weak2 = weak.clone();
+            crate::dbusmenu::fetch_appmenu_children(service, path, node_id, move |nodes| {
+                let weak3 = weak2.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak3.upgrade() else { return };
+                    use crate::MenuItem;
+                    let items: Vec<MenuItem> = nodes
+                        .into_iter()
+                        .map(|n| {
+                            if n.separator {
+                                MenuItem {
+                                    id: -1,
+                                    label: SharedString::default(),
+                                    accelerator: SharedString::default(),
+                                    separator: true,
+                                    enabled: false,
+                                }
+                            } else {
+                                MenuItem {
+                                    id: n.id,
+                                    // Submenu rows get a trailing chevron —
+                                    // nested-menu open isn't wired yet, but
+                                    // the affordance shouldn't lie about depth.
+                                    label: SharedString::from(if n.has_submenu {
+                                        format!("{}  \u{25B8}", n.label)
+                                    } else {
+                                        n.label
+                                    }),
+                                    accelerator: SharedString::default(),
+                                    separator: false,
+                                    enabled: n.enabled,
+                                }
+                            }
+                        })
+                        .collect();
+                    if items.is_empty() {
+                        ui.set_global_menu_open_index(-1);
+                        return;
+                    }
+                    ui.set_global_menu_items(slint::ModelRc::new(VecModel::from(items)));
+                    ui.set_global_menu_open(true);
+                });
+            });
+        });
+    }
+    // Global menu: a submenu row was activated → fire the dbusmenu
+    // `Event(id, "clicked", …)` on the focused window's menu.
+    {
+        let addr = appmenu_addr.clone();
+        ui.on_global_menu_item_activated(move |item_id| {
+            if let Some((service, path)) = addr.borrow().clone() {
+                crate::dbusmenu::send_appmenu_event(service, path, item_id, "clicked");
+            }
+        });
+    }
     {
         let exec_map_q = exec_map.clone();
         let q = pending_dock_action.clone();
@@ -5792,6 +5932,7 @@ pub fn run() -> Result<()> {
         pending_keys.clone(),
         pending_pointers.clone(),
         dock_entries,
+        appmenu_addr.clone(),
     );
 
     // Sync the Rust ThemeState with the wallpaper-driven default mode so

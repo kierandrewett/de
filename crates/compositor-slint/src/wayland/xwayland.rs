@@ -262,6 +262,7 @@ impl XWaylandShellHandler for SpikeState {
             icon_name: None,
             tag: None,
             description: None,
+            appmenu: None,
         });
         // OR windows aren't focusable / managed — they piggyback on the
         // parent's keyboard focus (xterm popup menu, GTK dropdown).
@@ -375,6 +376,7 @@ impl XwmHandler for SpikeState {
                     icon_name: None,
                     tag: None,
                     description: None,
+                    appmenu: None,
                 });
                 self.active_surface = Some(wl_surface.clone());
                 if let Some(kb) = self.seat.get_keyboard() {
@@ -442,6 +444,7 @@ impl XwmHandler for SpikeState {
                     icon_name: None,
                     tag: None,
                     description: None,
+                    appmenu: None,
                 });
             }
         } else {

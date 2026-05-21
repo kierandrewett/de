@@ -180,6 +180,180 @@ where
     });
 }
 
+// ── KDE-style global menu (appmenu) ─────────────────────────────────────────
+//
+// Unlike the SNI tray menu, the appmenu address arrives directly as
+// `(service, object_path)` via `org_kde_kwin_appmenu::set_address` — there's
+// no `Menu` property indirection. We also need the menu in two levels: the
+// top-level bar (root's direct children → File / Edit / View / …) and, on
+// click, one menu's items. `fetch_appmenu_children` serves both: pass
+// `parent_id = 0` for the bar, `parent_id = N` for submenu N.
+
+/// One node in a global menu — either a bar entry or a submenu row.
+#[derive(Debug, Clone)]
+pub struct AppMenuNode {
+    pub id: i32,
+    pub label: String,
+    pub enabled: bool,
+    pub separator: bool,
+    /// `children-display == "submenu"` — the row opens a nested menu.
+    pub has_submenu: bool,
+}
+
+/// Extract the DIRECT children of a GetLayout node (non-recursive). The
+/// node itself is `(i32 id, a{sv} props, av children)`; we walk
+/// `children` one level deep.
+fn extract_children(node_value: &Value<'_>, out: &mut Vec<AppMenuNode>) {
+    let Value::Structure(s) = node_value else {
+        return;
+    };
+    let fields = s.fields();
+    if fields.len() < 3 {
+        return;
+    }
+    let Value::Array(arr) = &fields[2] else {
+        return;
+    };
+    for child_v in arr.iter() {
+        // Children arrive as variant-wrapped structures.
+        let inner = match child_v {
+            Value::Value(boxed) => boxed.as_ref(),
+            other => other,
+        };
+        let Value::Structure(cs) = inner else {
+            continue;
+        };
+        let cf = cs.fields();
+        if cf.len() < 3 {
+            continue;
+        }
+        let id: i32 = match &cf[0] {
+            Value::I32(i) => *i,
+            _ => continue,
+        };
+        let mut props: HashMap<String, OwnedValue> = HashMap::new();
+        if let Value::Dict(dict) = &cf[1] {
+            for (k, v) in dict.iter() {
+                if let Value::Str(ks) = k {
+                    if let Ok(owned) = v.try_clone().and_then(OwnedValue::try_from) {
+                        props.insert(ks.to_string(), owned);
+                    }
+                }
+            }
+        }
+        let label_raw: String = prop(&props, "label").unwrap_or_default();
+        // dbusmenu labels carry '_' mnemonic markers — strip them.
+        let label = label_raw.replace('_', "");
+        let item_type: String = prop(&props, "type").unwrap_or_default();
+        let separator = item_type == "separator";
+        let enabled: bool = prop(&props, "enabled").unwrap_or(true);
+        let visible: bool = prop(&props, "visible").unwrap_or(true);
+        let children_display: String = prop(&props, "children-display").unwrap_or_default();
+        if !visible || (!separator && label.is_empty()) {
+            continue;
+        }
+        out.push(AppMenuNode {
+            id,
+            label,
+            enabled,
+            separator,
+            has_submenu: children_display == "submenu",
+        });
+    }
+}
+
+async fn appmenu_proxy<'a>(
+    conn: &'a Connection,
+    service: &str,
+    menu_path: &str,
+) -> Option<Proxy<'a>> {
+    let bus_name = BusName::try_from(service.to_string()).ok()?;
+    // Own the object path (`'static`) so the returned Proxy borrows only
+    // from `conn`, not from the caller's `menu_path` slice.
+    let obj_path = ObjectPath::try_from(menu_path.to_string()).ok()?;
+    Proxy::new(conn, bus_name, obj_path, "com.canonical.dbusmenu")
+        .await
+        .ok()
+}
+
+/// Fetch the direct children of `parent_id` from a `com.canonical.dbusmenu`
+/// at `(service, menu_path)`. `parent_id = 0` → the top-level menu bar.
+pub fn fetch_appmenu_children<F>(service: String, menu_path: String, parent_id: i32, done: F)
+where
+    F: FnOnce(Vec<AppMenuNode>) + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let rt = match Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(_) => {
+                done(Vec::new());
+                return;
+            }
+        };
+        let nodes = rt.block_on(async move {
+            let conn = match Connection::session().await {
+                Ok(c) => c,
+                Err(_) => return Vec::new(),
+            };
+            let Some(proxy) = appmenu_proxy(&conn, &service, &menu_path).await else {
+                return Vec::new();
+            };
+            // Let the app populate the submenu lazily if it wants to.
+            let _ = proxy.call::<_, _, bool>("AboutToShow", &(parent_id)).await;
+            let response: (u32, OwnedValue) = match proxy
+                .call(
+                    "GetLayout",
+                    &(
+                        parent_id,
+                        1i32,
+                        vec!["label", "type", "enabled", "visible", "children-display"],
+                    ),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!("appmenu GetLayout({parent_id}) failed: {e}");
+                    return Vec::new();
+                }
+            };
+            let mut nodes = Vec::new();
+            let root_val: Value<'_> = response.1.into();
+            extract_children(&root_val, &mut nodes);
+            nodes
+        });
+        done(nodes);
+    });
+}
+
+/// Send `Event(item_id, kind, null, now)` to a `com.canonical.dbusmenu`
+/// addressed directly by `(service, menu_path)`. `kind` is "clicked" to
+/// activate a row, or "opened"/"closed" for submenu lifecycle hints.
+pub fn send_appmenu_event(service: String, menu_path: String, item_id: i32, kind: &'static str) {
+    std::thread::spawn(move || {
+        let rt = match Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        rt.block_on(async move {
+            let conn = match Connection::session().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let Some(proxy) = appmenu_proxy(&conn, &service, &menu_path).await else {
+                return;
+            };
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            let _ = proxy
+                .call::<_, _, ()>("Event", &(item_id, kind, Value::U32(0), timestamp))
+                .await;
+        });
+    });
+}
+
 /// Send `Event(id, "clicked", null, now)` to the DBusMenu service. Used
 /// when the user picks an entry in the rendered menu.
 pub fn send_clicked(bus: String, sni_path: String, item_id: i32) {

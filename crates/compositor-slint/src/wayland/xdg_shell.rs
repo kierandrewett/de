@@ -66,6 +66,13 @@ impl XdgShellHandler for SpikeState {
                 .new_toplevel::<Self>("", ""),
         );
 
+        // Adopt an appmenu address if the client called
+        // `org_kde_kwin_appmenu::set_address` before this toplevel existed.
+        let appmenu = {
+            use smithay::reexports::wayland_server::Resource;
+            self.pending_appmenu.remove(&wl_surface.id())
+        };
+
         // Add to toplevels list.
         self.toplevels.push(ToplevelInfo {
             surface: wl_surface.clone(),
@@ -83,6 +90,7 @@ impl XdgShellHandler for SpikeState {
             icon_name: None,
             tag: None,
             description: None,
+            appmenu,
         });
 
         // Focus the new toplevel (most recently mapped = focused).
