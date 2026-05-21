@@ -94,12 +94,14 @@ impl Dispatch<OrgKdeKwinAppmenu, WlSurface> for SpikeState {
                 );
                 if let Some(tl) = state.toplevels.iter_mut().find(|t| &t.surface == surface) {
                     tl.appmenu = Some((service_name, object_path));
+                    tracing::debug!("appmenu: bound to live toplevel");
                 } else {
                     // Surface mapped after the appmenu object — store on the
                     // pending map so the toplevel adopts it when it appears.
                     state
                         .pending_appmenu
                         .insert(surface.id(), (service_name, object_path));
+                    tracing::debug!("appmenu: toplevel not yet mapped — queued as pending");
                 }
             }
             org_kde_kwin_appmenu::Request::Release => {

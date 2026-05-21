@@ -327,6 +327,25 @@ struct CompositorApp {
     /// submenus / dispatch activations. `update_windows` rewrites it when
     /// keyboard focus moves to a window with a different appmenu address.
     appmenu_addr: Rc<RefCell<Option<(String, String)>>>,
+    /// Async appmenu fetch results, pushed by worker threads and drained
+    /// each `update_windows` tick onto the Slint model.
+    appmenu_results: Arc<Mutex<VecDeque<AppMenuFetchResult>>>,
+}
+
+/// Result of an async appmenu D-Bus fetch. The fetch runs on a worker
+/// thread; results are pushed onto `CompositorApp::appmenu_results` and
+/// drained on the next `update_windows` tick. (slint's
+/// `invoke_from_event_loop` is unavailable here — the compositor drives
+/// its own winit loop, not slint's.)
+enum AppMenuFetchResult {
+    /// Top-level menu bar for the focused window.
+    Bar(Vec<crate::dbusmenu::AppMenuNode>),
+    /// A submenu opened from a bar entry — carries the popup placement.
+    Submenu {
+        items: Vec<crate::dbusmenu::AppMenuNode>,
+        x: i32,
+        open_index: i32,
+    },
 }
 
 /// Per-frame snapshot of the active lock surface for the renderer.
@@ -364,6 +383,7 @@ impl CompositorApp {
         pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
         dock_entries: Vec<ResolvedDockEntry>,
         appmenu_addr: Rc<RefCell<Option<(String, String)>>>,
+        appmenu_results: Arc<Mutex<VecDeque<AppMenuFetchResult>>>,
     ) -> Self {
         Self {
             window: None,
@@ -422,6 +442,7 @@ impl CompositorApp {
             client_image_cache: std::collections::HashMap::new(),
             client_image_cache_per_surface: std::collections::HashMap::new(),
             appmenu_addr,
+            appmenu_results,
         }
     }
 
@@ -2157,6 +2178,70 @@ impl CompositorApp {
                 .unwrap_or_else(|| "Desktop".to_string());
             ui.set_focused_app(SharedString::from(focused_title));
 
+            // Drain any appmenu fetch results delivered by worker threads
+            // since the last frame and apply them to the Slint models.
+            loop {
+                let next = self.appmenu_results.lock().unwrap().pop_front();
+                let Some(result) = next else { break };
+                match result {
+                    AppMenuFetchResult::Bar(nodes) => {
+                        let bar: Vec<crate::GlobalMenuTopItem> = nodes
+                            .into_iter()
+                            .filter(|n| !n.separator && !n.label.is_empty())
+                            .map(|n| crate::GlobalMenuTopItem {
+                                id: n.id,
+                                label: SharedString::from(n.label),
+                            })
+                            .collect();
+                        tracing::debug!("appmenu: menu bar applied, {} entries", bar.len());
+                        ui.set_global_menu_bar(slint::ModelRc::new(VecModel::from(bar)));
+                    }
+                    AppMenuFetchResult::Submenu {
+                        items,
+                        x,
+                        open_index,
+                    } => {
+                        use crate::MenuItem;
+                        let menu: Vec<MenuItem> = items
+                            .into_iter()
+                            .map(|n| {
+                                if n.separator {
+                                    MenuItem {
+                                        id: -1,
+                                        label: SharedString::default(),
+                                        accelerator: SharedString::default(),
+                                        separator: true,
+                                        enabled: false,
+                                    }
+                                } else {
+                                    MenuItem {
+                                        id: n.id,
+                                        label: SharedString::from(if n.has_submenu {
+                                            format!("{}  \u{25B8}", n.label)
+                                        } else {
+                                            n.label
+                                        }),
+                                        accelerator: SharedString::default(),
+                                        separator: false,
+                                        enabled: n.enabled,
+                                    }
+                                }
+                            })
+                            .collect();
+                        if menu.is_empty() {
+                            ui.set_global_menu_open_index(-1);
+                        } else {
+                            ui.set_global_menu_items(slint::ModelRc::new(VecModel::from(menu)));
+                            ui.set_global_menu_x(x);
+                            ui.set_global_menu_y(34);
+                            ui.set_global_menu_open_index(open_index);
+                            ui.set_global_menu_selected(-1);
+                            ui.set_global_menu_open(true);
+                        }
+                    }
+                }
+            }
+
             // Global menu (KDE-style appmenu): when keyboard focus moves to a
             // window whose exported menu address differs from the cached one,
             // refetch the top-level bar (or clear it if the new window has no
@@ -2170,27 +2255,19 @@ impl CompositorApp {
                 .and_then(|w| state.toplevels.iter().find(|t| t.surface == w.surface))
                 .and_then(|t| t.appmenu.clone());
             if *self.appmenu_addr.borrow() != focused_appmenu {
+                tracing::debug!("appmenu: focused window menu changed → {:?}", focused_appmenu);
                 *self.appmenu_addr.borrow_mut() = focused_appmenu.clone();
                 // Focus moved — any open submenu belongs to the old window.
                 ui.set_global_menu_open(false);
                 ui.set_global_menu_open_index(-1);
                 match focused_appmenu {
                     Some((service, path)) => {
-                        let weak = ui.as_weak();
+                        let results = self.appmenu_results.clone();
                         crate::dbusmenu::fetch_appmenu_children(service, path, 0, move |nodes| {
-                            let weak = weak.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                let Some(ui) = weak.upgrade() else { return };
-                                let bar: Vec<crate::GlobalMenuTopItem> = nodes
-                                    .into_iter()
-                                    .filter(|n| !n.separator && !n.label.is_empty())
-                                    .map(|n| crate::GlobalMenuTopItem {
-                                        id: n.id,
-                                        label: SharedString::from(n.label),
-                                    })
-                                    .collect();
-                                ui.set_global_menu_bar(slint::ModelRc::new(VecModel::from(bar)));
-                            });
+                            results
+                                .lock()
+                                .unwrap()
+                                .push_back(AppMenuFetchResult::Bar(nodes));
                         });
                     }
                     None => {
@@ -5189,6 +5266,10 @@ pub fn run() -> Result<()> {
     // panel menu-click callbacks (wired below) and `CompositorApp` (which
     // rewrites it on focus change) share the same cell.
     let appmenu_addr: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+    // Async appmenu fetch results — worker threads push, the render loop
+    // drains. (Shared with the menu-click callbacks wired below.)
+    let appmenu_results: Arc<Mutex<VecDeque<AppMenuFetchResult>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
 
     ui.set_clock_text(SharedString::from(
         chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -5645,6 +5726,7 @@ pub fn run() -> Result<()> {
     {
         let weak = ui.as_weak();
         let addr = appmenu_addr.clone();
+        let results = appmenu_results.clone();
         ui.on_global_menu_entry_clicked(move |node_id, entry_x| {
             let Some(ui) = weak.upgrade() else { return };
             let Some((service, path)) = addr.borrow().clone() else {
@@ -5661,52 +5743,13 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
-            // Position now (synchronous); items + open flip on fetch.
-            ui.set_global_menu_x(entry_x as i32);
-            ui.set_global_menu_y(34);
-            ui.set_global_menu_open_index(idx);
-            ui.set_global_menu_selected(-1);
-            let weak2 = weak.clone();
-            crate::dbusmenu::fetch_appmenu_children(service, path, node_id, move |nodes| {
-                let weak3 = weak2.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    let Some(ui) = weak3.upgrade() else { return };
-                    use crate::MenuItem;
-                    let items: Vec<MenuItem> = nodes
-                        .into_iter()
-                        .map(|n| {
-                            if n.separator {
-                                MenuItem {
-                                    id: -1,
-                                    label: SharedString::default(),
-                                    accelerator: SharedString::default(),
-                                    separator: true,
-                                    enabled: false,
-                                }
-                            } else {
-                                MenuItem {
-                                    id: n.id,
-                                    // Submenu rows get a trailing chevron —
-                                    // nested-menu open isn't wired yet, but
-                                    // the affordance shouldn't lie about depth.
-                                    label: SharedString::from(if n.has_submenu {
-                                        format!("{}  \u{25B8}", n.label)
-                                    } else {
-                                        n.label
-                                    }),
-                                    accelerator: SharedString::default(),
-                                    separator: false,
-                                    enabled: n.enabled,
-                                }
-                            }
-                        })
-                        .collect();
-                    if items.is_empty() {
-                        ui.set_global_menu_open_index(-1);
-                        return;
-                    }
-                    ui.set_global_menu_items(slint::ModelRc::new(VecModel::from(items)));
-                    ui.set_global_menu_open(true);
+            let x = entry_x as i32;
+            let results = results.clone();
+            crate::dbusmenu::fetch_appmenu_children(service, path, node_id, move |items| {
+                results.lock().unwrap().push_back(AppMenuFetchResult::Submenu {
+                    items,
+                    x,
+                    open_index: idx,
                 });
             });
         });
@@ -5933,6 +5976,7 @@ pub fn run() -> Result<()> {
         pending_pointers.clone(),
         dock_entries,
         appmenu_addr.clone(),
+        appmenu_results.clone(),
     );
 
     // Sync the Rust ThemeState with the wallpaper-driven default mode so

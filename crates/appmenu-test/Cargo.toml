@@ -1,0 +1,18 @@
+[package]
+name = "appmenu-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Manual verification client for the compositor's KDE-style global menu.
+# Opens a plain wayland window, exports a com.canonical.dbusmenu over the
+# session bus, and links the two with org_kde_kwin_appmenu::set_address —
+# so the compositor's panel should show this window's File/Edit/View menu.
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+zbus = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

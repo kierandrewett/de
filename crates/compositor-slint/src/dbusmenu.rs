@@ -200,66 +200,66 @@ pub struct AppMenuNode {
     pub has_submenu: bool,
 }
 
-/// Extract the DIRECT children of a GetLayout node (non-recursive). The
-/// node itself is `(i32 id, a{sv} props, av children)`; we walk
-/// `children` one level deep.
-fn extract_children(node_value: &Value<'_>, out: &mut Vec<AppMenuNode>) {
-    let Value::Structure(s) = node_value else {
-        return;
+/// Parse one GetLayout child node — `(i32 id, a{sv} props, av children)`,
+/// possibly variant-wrapped — into an `AppMenuNode`. Grandchildren are
+/// ignored (we fetch one level at a time).
+fn parse_menu_child(child_v: &Value<'_>) -> Option<AppMenuNode> {
+    // Children arrive variant-wrapped inside the `av` array.
+    let inner = match child_v {
+        Value::Value(boxed) => boxed.as_ref(),
+        other => other,
     };
-    let fields = s.fields();
-    if fields.len() < 3 {
-        return;
+    let Value::Structure(cs) = inner else {
+        tracing::warn!("appmenu parse: child is not a structure: {:?}", inner);
+        return None;
+    };
+    let cf = cs.fields();
+    if cf.len() < 3 {
+        return None;
     }
-    let Value::Array(arr) = &fields[2] else {
-        return;
+    let id: i32 = match &cf[0] {
+        Value::I32(i) => *i,
+        _ => return None,
     };
-    for child_v in arr.iter() {
-        // Children arrive as variant-wrapped structures.
-        let inner = match child_v {
-            Value::Value(boxed) => boxed.as_ref(),
-            other => other,
-        };
-        let Value::Structure(cs) = inner else {
-            continue;
-        };
-        let cf = cs.fields();
-        if cf.len() < 3 {
-            continue;
-        }
-        let id: i32 = match &cf[0] {
-            Value::I32(i) => *i,
-            _ => continue,
-        };
-        let mut props: HashMap<String, OwnedValue> = HashMap::new();
-        if let Value::Dict(dict) = &cf[1] {
-            for (k, v) in dict.iter() {
-                if let Value::Str(ks) = k {
-                    if let Ok(owned) = v.try_clone().and_then(OwnedValue::try_from) {
-                        props.insert(ks.to_string(), owned);
-                    }
+    let mut props: HashMap<String, OwnedValue> = HashMap::new();
+    if let Value::Dict(dict) = &cf[1] {
+        for (k, v) in dict.iter() {
+            if let Value::Str(ks) = k {
+                // `a{sv}` dict values are variants — unwrap to the inner
+                // value so `String::try_from` / `bool::try_from` work.
+                let unwrapped = match v {
+                    Value::Value(boxed) => boxed.as_ref(),
+                    other => other,
+                };
+                if let Ok(owned) = unwrapped.try_clone().and_then(OwnedValue::try_from) {
+                    props.insert(ks.to_string(), owned);
                 }
             }
         }
-        let label_raw: String = prop(&props, "label").unwrap_or_default();
-        // dbusmenu labels carry '_' mnemonic markers — strip them.
-        let label = label_raw.replace('_', "");
-        let item_type: String = prop(&props, "type").unwrap_or_default();
-        let separator = item_type == "separator";
-        let enabled: bool = prop(&props, "enabled").unwrap_or(true);
-        let visible: bool = prop(&props, "visible").unwrap_or(true);
-        let children_display: String = prop(&props, "children-display").unwrap_or_default();
-        if !visible || (!separator && label.is_empty()) {
-            continue;
-        }
-        out.push(AppMenuNode {
-            id,
-            label,
-            enabled,
-            separator,
-            has_submenu: children_display == "submenu",
-        });
     }
+    let label_raw: String = prop(&props, "label").unwrap_or_default();
+    // dbusmenu labels carry '_' mnemonic markers — strip them.
+    let label = label_raw.replace('_', "");
+    let item_type: String = prop(&props, "type").unwrap_or_default();
+    let separator = item_type == "separator";
+    let enabled: bool = prop(&props, "enabled").unwrap_or(true);
+    let visible: bool = prop(&props, "visible").unwrap_or(true);
+    let children_display: String = prop(&props, "children-display").unwrap_or_default();
+    if !visible || (!separator && label.is_empty()) {
+        tracing::warn!(
+            "appmenu parse: dropping node id={id} label={label:?} sep={separator} \
+             prop_keys={:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        return None;
+    }
+    Some(AppMenuNode {
+        id,
+        label,
+        enabled,
+        separator,
+        has_submenu: children_display == "submenu",
+    })
 }
 
 async fn appmenu_proxy<'a>(
@@ -293,14 +293,24 @@ where
         let nodes = rt.block_on(async move {
             let conn = match Connection::session().await {
                 Ok(c) => c,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    tracing::warn!("appmenu fetch: session bus connect failed: {e}");
+                    return Vec::new();
+                }
             };
             let Some(proxy) = appmenu_proxy(&conn, &service, &menu_path).await else {
+                tracing::warn!("appmenu fetch: could not build proxy for {service} {menu_path}");
                 return Vec::new();
             };
+            tracing::debug!("appmenu fetch: calling GetLayout({parent_id}) on {service}");
             // Let the app populate the submenu lazily if it wants to.
             let _ = proxy.call::<_, _, bool>("AboutToShow", &(parent_id)).await;
-            let response: (u32, OwnedValue) = match proxy
+            // GetLayout → `(u revision, (ia{sv}av) layout)`. The layout is a
+            // bare structure (NOT a variant), and its third field is the
+            // `av` children array. Deserialize it with the exact shape so
+            // zbus matches the `(u(ia{sv}av))` signature.
+            type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+            let response: (u32, Layout) = match proxy
                 .call(
                     "GetLayout",
                     &(
@@ -317,9 +327,17 @@ where
                     return Vec::new();
                 }
             };
+            let (_revision, (_root_id, _root_props, children)) = response;
+            tracing::debug!(
+                "appmenu fetch: GetLayout({parent_id}) ok — {} raw children",
+                children.len()
+            );
             let mut nodes = Vec::new();
-            let root_val: Value<'_> = response.1.into();
-            extract_children(&root_val, &mut nodes);
+            for child in &children {
+                if let Some(node) = parse_menu_child(child) {
+                    nodes.push(node);
+                }
+            }
             nodes
         });
         done(nodes);

@@ -16,6 +16,9 @@ members = [
 
     # Slint-based compositor.
     "crates/compositor-slint",
+
+    # Manual-test clients.
+    "crates/appmenu-test",
 ]
 
 [workspace.package]
