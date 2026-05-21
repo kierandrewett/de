@@ -3091,14 +3091,26 @@ impl CompositorApp {
                 continue;
             };
             let (px, py) = self.pointer_pos;
+            // If the window is maximized, arm the drag-to-unmaximize path
+            // (same as the SSD titlebar drag). Without this, dragging a
+            // maximized CSD window's headerbar slid the full-screen window
+            // around instead of restoring it.
+            let maximized = self
+                .wm
+                .id_for_surface(&surface)
+                .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
+                .is_some_and(|w| w.maximized);
             let t = &state.toplevels[idx];
             self.active_drag = Some(ActiveDrag::Move {
                 toplevel_idx: idx,
                 offset_x: px - t.x as f64,
                 offset_y: py - t.y as f64,
-                pending_unmaximize: None,
+                pending_unmaximize: if maximized { Some((px, py)) } else { None },
             });
-            debug!("xdg client move_request → ActiveDrag::Move on tl#{}", idx);
+            debug!(
+                "xdg client move_request → ActiveDrag::Move on tl#{} (maximized={})",
+                idx, maximized
+            );
         }
 
         // Resize

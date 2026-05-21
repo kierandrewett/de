@@ -147,46 +147,46 @@ impl ChromeRenderer {
 
             let mut shadow_slots = Vec::new();
 
-            // Skip the GPU drop-shadow for CSD windows: the client paints
-            // its own shadow into the buffer (we crop most of it via the
-            // geom rect, but stacking another shadow on top desyncs visual
-            // bounds from the WM hit-rect — clicks on the visible-but-
-            // unhittable shadow band fall through to the desktop and the
-            // window appears unresponsive).
-            if !win.csd {
-                for li in 0..2 {
-                    let a =
-                        inactive[li].alpha + win.focus_t * (active[li].alpha - inactive[li].alpha);
-                    let b = inactive[li].blur_sigma
-                        + win.focus_t * (active[li].blur_sigma - inactive[li].blur_sigma);
-                    let oy = inactive[li].offset_y
-                        + win.focus_t * (active[li].offset_y - inactive[li].offset_y);
-                    let layer = shadow::ShadowLayer {
-                        offset_x: active[li].offset_x,
-                        offset_y: oy,
-                        blur_sigma: b,
-                        alpha: a,
-                    };
-                    let mut u = uniforms_for_layer(win.x, win.y, win.w, win.h, sw, sh, layer, 1.0);
-                    u.mode_t = win.mode_t;
-                    u.focus_t = win.focus_t;
-                    u.radius_px = win.radius;
-                    let slot = raw_uniforms.len() as u32;
-                    raw_uniforms.push(u);
-                    shadow_slots.push(slot);
-                }
+            // GPU drop-shadow — drawn for SSD AND CSD windows. CSD clients
+            // do paint their own shadow into the buffer, but we crop that
+            // off via the `set_window_geometry` rect, so without our shadow
+            // a CSD window has none at all. The GPU shadow is laid around
+            // the visible window rect with the window's corner radius, so
+            // it matches whatever the client drew. (It's not hidden when
+            // maximized — see below — because the radius going to 0 already
+            // squares it off; a maximized window's shadow is harmless,
+            // mostly occluded by the panel/dock.)
+            for li in 0..2 {
+                let a = inactive[li].alpha + win.focus_t * (active[li].alpha - inactive[li].alpha);
+                let b = inactive[li].blur_sigma
+                    + win.focus_t * (active[li].blur_sigma - inactive[li].blur_sigma);
+                let oy = inactive[li].offset_y
+                    + win.focus_t * (active[li].offset_y - inactive[li].offset_y);
+                let layer = shadow::ShadowLayer {
+                    offset_x: active[li].offset_x,
+                    offset_y: oy,
+                    blur_sigma: b,
+                    alpha: a,
+                };
+                let mut u = uniforms_for_layer(win.x, win.y, win.w, win.h, sw, sh, layer, 1.0);
+                u.mode_t = win.mode_t;
+                u.focus_t = win.focus_t;
+                u.radius_px = win.radius;
+                let slot = raw_uniforms.len() as u32;
+                raw_uniforms.push(u);
+                shadow_slots.push(slot);
+            }
 
-                if win.focus_t > 0.001 {
-                    let layer3 = active[2];
-                    let mut u =
-                        uniforms_for_layer(win.x, win.y, win.w, win.h, sw, sh, layer3, win.focus_t);
-                    u.mode_t = win.mode_t;
-                    u.focus_t = win.focus_t;
-                    u.radius_px = win.radius;
-                    let slot = raw_uniforms.len() as u32;
-                    raw_uniforms.push(u);
-                    shadow_slots.push(slot);
-                }
+            if win.focus_t > 0.001 {
+                let layer3 = active[2];
+                let mut u =
+                    uniforms_for_layer(win.x, win.y, win.w, win.h, sw, sh, layer3, win.focus_t);
+                u.mode_t = win.mode_t;
+                u.focus_t = win.focus_t;
+                u.radius_px = win.radius;
+                let slot = raw_uniforms.len() as u32;
+                raw_uniforms.push(u);
+                shadow_slots.push(slot);
             }
 
             let clip_slot = if self.enable_squircle_clip {
