@@ -55,6 +55,13 @@ pub struct WindowChromeParams {
     /// window). Border + highlight passes are also skipped because they
     /// would draw a thin inset line over the client's own chrome.
     pub csd: bool,
+    /// Outer corner radius in PHYSICAL pixels for this window's GPU chrome
+    /// (shadow / border / highlight squircle). 0 when the window is
+    /// maximized so the chrome squares off against the screen edges;
+    /// otherwise the themed window radius. Must track WindowChrome.slint's
+    /// `window-corner-radius-outer` or the Slint clip and the GPU chrome
+    /// disagree at the corners.
+    pub radius: f32,
 }
 
 pub struct ChromeRenderer {
@@ -163,6 +170,7 @@ impl ChromeRenderer {
                     let mut u = uniforms_for_layer(win.x, win.y, win.w, win.h, sw, sh, layer, 1.0);
                     u.mode_t = win.mode_t;
                     u.focus_t = win.focus_t;
+                    u.radius_px = win.radius;
                     let slot = raw_uniforms.len() as u32;
                     raw_uniforms.push(u);
                     shadow_slots.push(slot);
@@ -174,6 +182,7 @@ impl ChromeRenderer {
                         uniforms_for_layer(win.x, win.y, win.w, win.h, sw, sh, layer3, win.focus_t);
                     u.mode_t = win.mode_t;
                     u.focus_t = win.focus_t;
+                    u.radius_px = win.radius;
                     let slot = raw_uniforms.len() as u32;
                     raw_uniforms.push(u);
                     shadow_slots.push(slot);
@@ -190,6 +199,7 @@ impl ChromeRenderer {
                 u.surface_h = sh;
                 u.mode_t = win.mode_t;
                 u.focus_t = win.focus_t;
+                u.radius_px = win.radius;
                 let slot = raw_uniforms.len() as u32;
                 raw_uniforms.push(u);
                 Some(slot)
@@ -207,6 +217,7 @@ impl ChromeRenderer {
                 u.surface_h = sh;
                 u.mode_t = win.mode_t;
                 u.focus_t = win.focus_t;
+                u.radius_px = win.radius;
                 let slot = raw_uniforms.len() as u32;
                 raw_uniforms.push(u);
                 slot
@@ -222,6 +233,7 @@ impl ChromeRenderer {
                 u.surface_h = sh;
                 u.mode_t = win.mode_t;
                 u.focus_t = win.focus_t;
+                u.radius_px = win.radius;
                 let slot = raw_uniforms.len() as u32;
                 raw_uniforms.push(u);
                 slot

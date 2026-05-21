@@ -1399,6 +1399,12 @@ impl CompositorApp {
                                 focus_t,
                                 mode_t,
                                 csd: item.csd,
+                                // Square off the GPU chrome when maximized;
+                                // otherwise the themed 18 px window radius
+                                // (mirrors WindowChrome.slint's
+                                // window-corner-radius-outer). Physical px,
+                                // so scale by the output scale factor.
+                                radius: if item.maximized { 0.0 } else { 18.0 * s },
                             }
                         })
                         .collect()
@@ -5068,10 +5074,26 @@ impl CompositorApp {
         let Some(surface) = surface else { return };
 
         if let Some(win) = self.wm.windows.values_mut().find(|w| w.id == wm_id) {
-            // Save pre-snap rect (only on the FIRST snap — re-snapping
-            // preserves the original unsnapped geometry).
-            if win.pre_snap.is_none() {
-                win.pre_snap = Some((win.x, win.y, win.w, win.h));
+            if zone == crate::snap::SnapZone::Maximize {
+                // Snap-to-top IS maximize: a window covering the whole work
+                // area is maximized. Stash the pre-maximize geometry for
+                // restore and flag the window maximized so the chrome
+                // squares off (corners + GPU shadow) and a titlebar-drag
+                // unmaximizes it via the `pending_unmaximize` path.
+                if win.pre_maximize.is_none() {
+                    win.pre_maximize = Some((win.x, win.y, win.w, win.h));
+                }
+                win.maximized = true;
+            } else {
+                // Half / quarter tiling — restored by dragging off the snap.
+                // Save pre-snap rect (only on the FIRST snap — re-snapping
+                // preserves the original unsnapped geometry).
+                if win.pre_snap.is_none() {
+                    win.pre_snap = Some((win.x, win.y, win.w, win.h));
+                }
+                // Tiling to a half/quarter is not maximized — clear the flag
+                // so the chrome rounds again (e.g. maximized → snap-left).
+                win.maximized = false;
             }
             win.x = rect.x;
             win.y = rect.y;
