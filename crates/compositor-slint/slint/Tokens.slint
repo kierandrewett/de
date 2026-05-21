@@ -113,8 +113,14 @@ export global CcPalette {
 
 export global Tokens {
     // ── Corner radii ──────────────────────────────────────────────────────────
-    out property <length> window-corner-radius-outer: 14px;
-    out property <length> window-corner-radius-inner: 12px;
+    // 18px outer: the content-area clip must round AT LEAST as much as the
+    // client's own window-corner radius for CSD apps. GTK4/libadwaita rounds
+    // its windows at ~15-16px; at our old 14px the clip arc sat *inside* the
+    // client's, leaving a thin ring of the client's drop-shadow visible past
+    // our corner — the "glow inside the window" reported on CSD apps. 18px
+    // clips at or beyond the client corner so that ring is masked.
+    out property <length> window-corner-radius-outer: 18px;
+    out property <length> window-corner-radius-inner: 16px;
     out property <length> dock-corner-radius: 20px;
     out property <length> panel-corner-radius: 0px;
 
