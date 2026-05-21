@@ -6318,7 +6318,15 @@ pub fn run() -> Result<()> {
             }
         }
 
-        std::thread::sleep(Duration::from_millis(4));
+        // Frame pacing. While a window animation is in flight the render's
+        // vsync-blocked `present()` already paces the loop at the host
+        // refresh — an extra sleep here just pushes the next frame past the
+        // vsync deadline and drops the animation below 60fps (choppy). Only
+        // sleep when idle, where it stops the event poll busy-spinning.
+        let animating = app.wm.windows.values().any(|w| !w.anim.is_settled());
+        if !animating {
+            std::thread::sleep(Duration::from_millis(4));
+        }
     }
 
     info!("GPU compositor exiting cleanly");

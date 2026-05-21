@@ -37,19 +37,30 @@ pub const WINDOW_CORNER_RADIUS: f64 = 18.0;
 
 /// Spring stiffness for open/close/min/max animations.
 ///
-/// Calibrated against the panel/popout cubic-bezier (160 ms duration).
-/// Critically-damped spring with stiffness ω² has 99 %-settle time
-/// `5 / ω`; ω = √700 ≈ 26.5 rad/s gives ~190 ms. Reads as the same
-/// "snappy without bounce" beat the panels use.
+/// Critically-damped spring (ζ = 1). The animation is perceptually
+/// "done" once it's within ~0.4 % of its travel distance — see
+/// `Spring::tick`'s relative settle test. For a critically-damped
+/// spring that point is ≈ 8 / ω; ω = √1500 ≈ 38.7 rad/s gives ≈ 205 ms.
 ///
-/// Bumped from 200 (≈ 350 ms) — that felt sluggish next to the
-/// panels and made every window open look like it was easing into
-/// place from a long way off.
-pub const SPRING_STIFFNESS: f64 = 700.0;
+/// Was 700 with a fixed 0.001 *absolute* settle epsilon. That epsilon
+/// was catastrophic for the geometry springs: their targets are in
+/// pixels, so an 800 px maximize had to crawl to within 1/1000 px of
+/// the target before terminating — a 400–600 ms asymptotic tail that
+/// read as "laggy and slow". The fix is the relative settle test
+/// below; the stiffness bump just tightens the snappy ones to ~205 ms.
+pub const SPRING_STIFFNESS: f64 = 1500.0;
 /// Damping ratio. 1.0 = critically damped (no bounce, smooth ease-out feel).
 pub const SPRING_DAMPING: f64 = 1.0;
-/// Spring settle epsilon.
+/// Absolute floor for the spring settle threshold. Kept tiny so the
+/// relative term (0.4 % of travel) governs every real animation; this
+/// only guards degenerate near-zero-travel cases. Note the 0–1 opacity
+/// /scale springs have a small absolute travel — the floor must stay
+/// well below their travel or it would truncate them visibly.
 pub const SPRING_EPSILON: f64 = 0.001;
+/// Fraction of the total travel distance within which a spring is
+/// considered settled. 0.4 % is imperceptible (sub-pixel on any real
+/// window) yet cuts the long critically-damped tail.
+const SPRING_SETTLE_FRACTION: f64 = 0.004;
 
 /// Open animation start scale. Bumped 0.85 → 0.94 to match the
 /// panels' subtler 0.95 scale-from — windows are big enough that a
@@ -89,22 +100,27 @@ pub enum AnimPhase {
 pub struct Spring {
     stiffness: f64,
     damping_ratio: f64,
-    epsilon: f64,
+    /// Absolute floor for the settle threshold (tiny-travel animations).
+    min_epsilon: f64,
     pos: f64,
     vel: f64,
     target: f64,
+    /// Position when the current `target` was set — gives the travel
+    /// distance for the relative settle test.
+    start: f64,
     done: bool,
 }
 
 impl Spring {
-    pub fn new(stiffness: f64, damping_ratio: f64, epsilon: f64) -> Self {
+    pub fn new(stiffness: f64, damping_ratio: f64, min_epsilon: f64) -> Self {
         Self {
             stiffness,
             damping_ratio,
-            epsilon,
+            min_epsilon,
             pos: 0.0,
             vel: 0.0,
             target: 0.0,
+            start: 0.0,
             done: true,
         }
     }
@@ -113,16 +129,28 @@ impl Spring {
     pub fn set_instant(&mut self, value: f64) {
         self.pos = value;
         self.target = value;
+        self.start = value;
         self.vel = 0.0;
         self.done = true;
     }
 
-    /// Animate toward `target`.
+    /// Animate toward `target`. Idempotent: re-setting the same target
+    /// (callers poll this every frame) doesn't restart the travel.
     pub fn set_target(&mut self, target: f64) {
-        self.target = target;
-        if (self.pos - target).abs() >= self.epsilon {
-            self.done = false;
+        if (target - self.target).abs() < 1e-9 {
+            return;
         }
+        // New target — `start` snapshots the current position so the
+        // settle test below measures THIS leg's travel.
+        self.start = self.pos;
+        self.target = target;
+        self.done = false;
+    }
+
+    /// Settle threshold for the current leg: a fraction of the travel
+    /// distance, floored so a near-zero travel still terminates.
+    fn settle_eps(&self) -> f64 {
+        ((self.target - self.start).abs() * SPRING_SETTLE_FRACTION).max(self.min_epsilon)
     }
 
     /// Advance by `dt` seconds (subdivided into 1 ms steps for stability).
@@ -143,7 +171,13 @@ impl Spring {
             self.vel += accel * step;
             self.pos += self.vel * step;
         }
-        if (self.pos - self.target).abs() < self.epsilon && self.vel.abs() < self.epsilon {
+        // Relative settle: terminate once within ~0.4 % of the travel
+        // distance (imperceptible) instead of an absolute 0.001 — the
+        // latter forced large pixel-magnitude springs through a long
+        // asymptotic tail. The velocity gate uses the same relative
+        // scale so a still-moving spring isn't cut short.
+        let eps = self.settle_eps();
+        if (self.pos - self.target).abs() < eps && self.vel.abs() < eps * 16.0 {
             self.pos = self.target;
             self.vel = 0.0;
             self.done = true;
@@ -163,7 +197,7 @@ impl Spring {
     }
 
     pub fn at_target(&self) -> bool {
-        self.done && (self.pos - self.target).abs() < self.epsilon
+        self.done
     }
 }
 
