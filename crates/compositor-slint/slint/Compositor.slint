@@ -91,9 +91,13 @@ export struct WindowItem {
     // skips its own titlebar / border / shadow and shows only the buffer —
     // the client paints its full chrome inside the surface.
     csd: bool,
-    // True when the window is maximized. WindowChrome drops its corner
-    // rounding + drop-shadow so the window sits flush to the screen edges.
+    // True when the window is maximized. WindowChrome drops its
+    // drop-shadow so the window sits flush to the screen edges.
     maximized: bool,
+    // Animated outer corner radius in logical px. Rust springs this
+    // between the themed radius and 0 as the window maximizes /
+    // unmaximizes, so the corners round off and square up smoothly.
+    corner-radius: float,
     // True while the window geometry is animating (maximize / unmaximize)
     // or being drag-resized. WindowChrome renders the legacy single
     // texture stretched to fill the animating frame instead of the
@@ -424,6 +428,7 @@ export component Compositor inherits Window {
             csd: win.csd;
             maximized: win.maximized;
             resizing: win.resizing;
+            corner-radius-px: win.corner-radius;
 
             close-clicked    => { root.close-window(win.id); }
             minimize-clicked => { root.minimize-window(win.id); }

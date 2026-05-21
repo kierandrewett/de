@@ -30,6 +30,11 @@ const CASCADE_STEP: i32 = 30;
 pub const DEFAULT_WINDOW_W: i32 = 800;
 pub const DEFAULT_WINDOW_H: i32 = 600;
 
+/// Outer window corner radius in logical px — mirrors WindowChrome.slint's
+/// `Tokens.window-corner-radius-outer`. A maximized window animates this
+/// to 0. Keep the two values in sync.
+pub const WINDOW_CORNER_RADIUS: f64 = 18.0;
+
 /// Spring stiffness for open/close/min/max animations.
 ///
 /// Calibrated against the panel/popout cubic-bezier (160 ms duration).
@@ -176,6 +181,10 @@ pub struct WindowAnimState {
     pub geo_y: Spring,
     pub geo_w: Spring,
     pub geo_h: Spring,
+    /// Outer corner radius in logical px. Animates between the themed
+    /// window radius and 0 as the window maximizes / unmaximizes, so the
+    /// corners round off and square up smoothly instead of snapping.
+    pub corner_radius: Spring,
 }
 
 impl WindowAnimState {
@@ -197,6 +206,9 @@ impl WindowAnimState {
         let mut geo_h = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
         geo_h.set_instant(h as f64);
 
+        let mut corner_radius = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        corner_radius.set_instant(WINDOW_CORNER_RADIUS);
+
         Self {
             opacity,
             scale,
@@ -204,6 +216,7 @@ impl WindowAnimState {
             geo_y,
             geo_w,
             geo_h,
+            corner_radius,
         }
     }
 
@@ -214,6 +227,7 @@ impl WindowAnimState {
         self.geo_y.tick(dt);
         self.geo_w.tick(dt);
         self.geo_h.tick(dt);
+        self.corner_radius.tick(dt);
     }
 
     pub fn is_settled(&self) -> bool {
@@ -223,6 +237,7 @@ impl WindowAnimState {
             && self.geo_y.is_done()
             && self.geo_w.is_done()
             && self.geo_h.is_done()
+            && self.corner_radius.is_done()
     }
 
     /// Set geometry instantly (no animation).
@@ -345,6 +360,8 @@ impl WindowState {
         geo_w.set_instant(w as f64);
         let mut geo_h = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
         geo_h.set_instant(h as f64);
+        let mut corner_radius = Spring::new(SPRING_STIFFNESS, SPRING_DAMPING, SPRING_EPSILON);
+        corner_radius.set_instant(WINDOW_CORNER_RADIUS);
         let anim = WindowAnimState {
             opacity,
             scale,
@@ -352,6 +369,7 @@ impl WindowState {
             geo_y,
             geo_w,
             geo_h,
+            corner_radius,
         };
 
         Self {
@@ -476,6 +494,14 @@ impl WindowState {
 
     /// Advance springs by `dt` seconds; returns true when the open phase settles.
     pub fn tick(&mut self, dt: f64) {
+        // Drive the corner-radius spring from the maximized state so the
+        // corners round off / square up smoothly. `set_target` is
+        // idempotent, so re-setting it every tick is free.
+        self.anim.corner_radius.set_target(if self.maximized {
+            0.0
+        } else {
+            WINDOW_CORNER_RADIUS
+        });
         self.anim.tick(dt);
         if self.phase == AnimPhase::Opening
             && self.anim.opacity.is_done()

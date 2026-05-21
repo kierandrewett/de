@@ -1399,12 +1399,12 @@ impl CompositorApp {
                                 focus_t,
                                 mode_t,
                                 csd: item.csd,
-                                // Square off the GPU chrome when maximized;
-                                // otherwise the themed 18 px window radius
-                                // (mirrors WindowChrome.slint's
-                                // window-corner-radius-outer). Physical px,
-                                // so scale by the output scale factor.
-                                radius: if item.maximized { 0.0 } else { 18.0 * s },
+                                // Spring-animated outer radius (logical px,
+                                // 18 → 0 across a maximize); scale to
+                                // physical px for the GPU chrome so the
+                                // shaders round/square in lockstep with the
+                                // Slint chrome.
+                                radius: item.corner_radius * s,
                             }
                         })
                         .collect()
@@ -2177,6 +2177,9 @@ impl CompositorApp {
                 geom_h,
                 csd: toplevel.csd,
                 maximized: win.maximized,
+                // Spring-animated outer corner radius (logical px) — eased
+                // between the themed radius and 0 across a maximize.
+                corner_radius: win.anim.corner_radius.value() as f32,
                 // Resizing = geometry springs mid-flight (maximize /
                 // unmaximize) OR this window is being interactively
                 // drag-resized. Drives the stretched-texture render path.

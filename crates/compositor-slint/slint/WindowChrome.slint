@@ -59,11 +59,13 @@ export component WindowChrome {
     in property <bool>   maximized: false;
     // Geometry is animating (maximize / unmaximize) or being drag-resized.
     in property <bool>   resizing: false;
+    // Animated outer corner radius in logical px (Rust springs it between
+    // the themed radius and 0 across a maximize / unmaximize).
+    in property <float>  corner-radius-px: 18;
 
-    // Effective corner radius — 0 when maximized so the window squares off
-    // against the screen edges; the squircle radius otherwise.
-    property <length> corner-radius:
-        root.maximized ? 0px : Tokens.window-corner-radius-outer;
+    // Effective corner radius as a length — squared off (0) when maximized,
+    // the themed squircle radius otherwise, smoothly interpolated.
+    property <length> corner-radius: root.corner-radius-px * 1px;
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     callback close-clicked();
