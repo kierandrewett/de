@@ -306,6 +306,39 @@ impl CompositorHandler for SpikeState {
             let surface_pixels_arc = self.popups[pidx].surface_pixels.clone();
             let _ = import_shm_buffer(&popup_surf, &pixels_arc);
             let _ = import_shm_per_surface(&popup_surf, &surface_pixels_arc);
+            // Consume DMA-BUF pending pixels populated by import_dmabuf_for_surface
+            // earlier in this commit. Layer surfaces + toplevels already do this;
+            // popups were left out, which is why GTK context menus (which use
+            // DMA-BUF via libwayland-cursor / GL) appeared to "not show" —
+            // popup.pixels stayed at width=0 and the renderer skipped them.
+            if pixels_arc.lock().unwrap().width == 0 {
+                if let Some(data) = self.dmabuf_pending.remove(&popup_surf.id()) {
+                    debug!(
+                        "DMA-BUF: consuming pending {}x{} pixels for popup",
+                        data.width, data.height
+                    );
+                    *pixels_arc.lock().unwrap() = data;
+                }
+            }
+            // Read xdg_surface.set_window_geometry — the VISIBLE rect within
+            // the popup's buffer. Firefox/Chromium/Electron paint a drop-
+            // shadow gutter into the buffer; without this the gutter renders
+            // as a "large border around the context menu".
+            let (gx, gy, gw, gh) = with_states(&popup_surf, |states| {
+                let mut cs = states
+                    .cached_state
+                    .get::<smithay::wayland::shell::xdg::SurfaceCachedState>();
+                cs.current()
+                    .geometry
+                    .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h))
+                    .unwrap_or((0, 0, 0, 0))
+            });
+            if gw > 0 && gh > 0 {
+                self.popups[pidx].geom_x = gx;
+                self.popups[pidx].geom_y = gy;
+                self.popups[pidx].geom_w = gw;
+                self.popups[pidx].geom_h = gh;
+            }
             return;
         }
 

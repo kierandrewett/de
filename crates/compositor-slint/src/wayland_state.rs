@@ -271,6 +271,15 @@ pub struct PopupInfo {
     /// `SurfaceItem` per entry so libadwaita-style popovers with
     /// animated subsurfaces render correctly.
     pub surface_pixels: Arc<Mutex<std::collections::HashMap<u32, ClientSurfaceData>>>,
+    /// `xdg_surface.set_window_geometry` rect — the VISIBLE menu within the
+    /// buffer. Firefox / Chromium / Electron paint a drop-shadow gutter in
+    /// the buffer; without honouring this rect we'd render the gutter too
+    /// (manifest: "large border around the context menu"). Zero means
+    /// "client hasn't set one, treat the whole buffer as visible".
+    pub geom_x: i32,
+    pub geom_y: i32,
+    pub geom_w: i32,
+    pub geom_h: i32,
 }
 
 /// Active drag-and-drop icon surface paired with the accumulated buffer

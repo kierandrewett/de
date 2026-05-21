@@ -2431,14 +2431,30 @@ impl CompositorApp {
             };
             let popup_surfaces = slint::ModelRc::new(slint::VecModel::from(popup_surfaces_model));
 
-            let w = if popup.w > 0 { popup.w } else { bw };
-            let h = if popup.h > 0 { popup.h } else { bh };
+            // If the client set an xdg_surface.set_window_geometry, the
+            // VISIBLE rect within the buffer is (geom_x, geom_y, geom_w,
+            // geom_h). The buffer itself is bw × bh (with shadow gutter
+            // around the visible rect). Render the visible rect at
+            // (abs_x, abs_y) and crop the buffer accordingly. If the
+            // client didn't set a window-geometry (geom_w == 0), fall
+            // back to "whole buffer is visible".
+            let (w, h, vis_x, vis_y) = if popup.geom_w > 0 && popup.geom_h > 0 {
+                (popup.geom_w, popup.geom_h, popup.geom_x, popup.geom_y)
+            } else if popup.w > 0 {
+                (popup.w, popup.h, 0, 0)
+            } else {
+                (bw, bh, 0, 0)
+            };
             popup_items.push(crate::PopupItem {
                 id: pi as i32,
                 x: abs_x,
                 y: abs_y,
                 w,
                 h,
+                buf_w: bw,
+                buf_h: bh,
+                vis_x,
+                vis_y,
                 texture,
                 surfaces: popup_surfaces,
             });
@@ -2487,6 +2503,12 @@ impl CompositorApp {
                 y: geo.loc.y,
                 w,
                 h,
+                // X11 OR windows have no window-geometry concept; the
+                // whole buffer is the visible rect.
+                buf_w: bw,
+                buf_h: bh,
+                vis_x: 0,
+                vis_y: 0,
                 texture,
                 // X11 OR windows currently keep using the legacy single
                 // texture. Migrating them needs the same per-surface
@@ -5888,8 +5910,9 @@ pub fn run() -> Result<()> {
         // AND with a non-zero client buffer", plus all layer surfaces
         // (always visible if mapped). Without this gate every mapped
         // client gets driven at full output framerate even when invisible.
-        let mut visible_surfaces: Vec<WlSurface> =
-            Vec::with_capacity(app.wm.windows.len() + state.layer_surfaces.len());
+        let mut visible_surfaces: Vec<WlSurface> = Vec::with_capacity(
+            app.wm.windows.len() + state.layer_surfaces.len() + state.popups.len(),
+        );
         for win in app.wm.windows_sorted() {
             if win.minimized || win.closing {
                 continue;
@@ -5907,6 +5930,31 @@ pub fn run() -> Result<()> {
         }
         for li in &state.layer_surfaces {
             visible_surfaces.push(li.surface.wl_surface().clone());
+        }
+        // Popups need wl_surface.frame callbacks too — without them the
+        // client never commits a buffer for the popup, which is why GTK
+        // context menus appeared to "not show". Include popups
+        // unconditionally; smithay's send_frame_callbacks skips surfaces
+        // with no pending callbacks so the cost is a free walk.
+        for popup in &state.popups {
+            visible_surfaces.push(popup.surface.clone());
+        }
+        // X11 override-redirect surfaces also need frame callbacks. They live
+        // in state.toplevels but aren't tracked by WindowManager (we treat
+        // them as popups in the render path), so the wm.windows loop above
+        // misses them.
+        for tl in &state.toplevels {
+            if tl
+                .x11_surface
+                .as_ref()
+                .and_then(|x| {
+                    x.user_data()
+                        .get::<crate::wayland::xwayland::X11OverrideRedirect>()
+                })
+                .is_some()
+            {
+                visible_surfaces.push(tl.surface.clone());
+            }
         }
 
         state.send_frame_callbacks_for(&output, &visible_surfaces);

@@ -127,6 +127,10 @@ impl XdgShellHandler for SpikeState {
             surface_pixels: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            geom_x: 0,
+            geom_y: 0,
+            geom_w: 0,
+            geom_h: 0,
         });
     }
 

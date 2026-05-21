@@ -122,6 +122,15 @@ export struct PopupItem {
     h:       int,
     texture: image,
     surfaces: [SurfaceItem],
+    // Buffer dimensions and the VISIBLE rect within the buffer (from
+    // xdg_surface.set_window_geometry). When set, the legacy texture path
+    // crops the buffer to (vis-x, vis-y, w, h) so we don't render the
+    // client's own drop-shadow gutter as a second border around our chrome.
+    // Zero `buf-w/h` → use the whole buffer (no client-side gutter).
+    buf-w:   int,
+    buf-h:   int,
+    vis-x:   int,
+    vis-y:   int,
 }
 
 // TrayIconItem now lives in widgets/TrayItem.slint so Panel can import it.
@@ -627,16 +636,11 @@ export component Compositor inherits Window {
         width: popup.w * 1px;
         height: popup.h * 1px;
         z: 65;
-        background: Theme.window-content-bg;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: Theme.mode == TokenMode.Dark
-            ? rgba(255, 255, 255, 0.12)
-            : rgba(0, 0, 0, 0.10);
-        drop-shadow-blur: 18px;
-        drop-shadow-offset-y: 6px;
-        drop-shadow-color: rgba(0, 0, 0, 0.40);
         clip: true;
+        // No background / border / drop-shadow on this container — modern
+        // popup clients (Firefox, Chromium, libadwaita) paint their own
+        // chrome into the buffer. Stacking ours on top doubles the border
+        // and shadow, which manifests as a "thick frame around the menu".
         // Legacy single-texture path — used when surfaces[] is empty
         // (X11 override-redirect popups, or popups before first commit).
         Image {
@@ -645,6 +649,13 @@ export component Compositor inherits Window {
             height: parent.height;
             source: popup.texture;
             image-fit: fill;
+            // Crop the buffer to the VISIBLE rect set via
+            // xdg_surface.set_window_geometry. Zero buf-w/h means the
+            // whole buffer is visible (client didn't set a window-geometry).
+            source-clip-x: popup.vis-x;
+            source-clip-y: popup.vis-y;
+            source-clip-width: popup.buf-w > 0 ? popup.w : 0;
+            source-clip-height: popup.buf-h > 0 ? popup.h : 0;
         }
         // Per-surface render path: lets libadwaita / GTK popovers
         // animate their internal subsurfaces (transitions on dropdown
