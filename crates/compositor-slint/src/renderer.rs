@@ -329,22 +329,29 @@ struct CompositorApp {
     appmenu_addr: Rc<RefCell<Option<(String, String)>>>,
     /// Async appmenu fetch results, pushed by worker threads and drained
     /// each `update_windows` tick onto the Slint model.
-    appmenu_results: Arc<Mutex<VecDeque<AppMenuFetchResult>>>,
+    appmenu_results: Arc<Mutex<VecDeque<MenuFetchResult>>>,
 }
 
-/// Result of an async appmenu D-Bus fetch. The fetch runs on a worker
-/// thread; results are pushed onto `CompositorApp::appmenu_results` and
-/// drained on the next `update_windows` tick. (slint's
+/// Result of an async `com.canonical.dbusmenu` D-Bus fetch. The fetch runs
+/// on a worker thread; results are pushed onto `CompositorApp::appmenu_results`
+/// and drained on the next `update_windows` tick. (slint's
 /// `invoke_from_event_loop` is unavailable here — the compositor drives
 /// its own winit loop, not slint's.)
-enum AppMenuFetchResult {
-    /// Top-level menu bar for the focused window.
+enum MenuFetchResult {
+    /// Top-level global-menu bar for the focused window.
     Bar(Vec<crate::dbusmenu::AppMenuNode>),
-    /// A submenu opened from a bar entry — carries the popup placement.
+    /// A global-menu submenu opened from a bar entry — with popup placement.
     Submenu {
         items: Vec<crate::dbusmenu::AppMenuNode>,
         x: i32,
         open_index: i32,
+    },
+    /// A StatusNotifierItem tray icon's right-click menu.
+    TrayMenu {
+        items: Vec<crate::dbusmenu::AppMenuNode>,
+        x: i32,
+        y: i32,
+        sni_id: i32,
     },
 }
 
@@ -383,7 +390,7 @@ impl CompositorApp {
         pending_pointers: Arc<Mutex<VecDeque<PendingPointerEvent>>>,
         dock_entries: Vec<ResolvedDockEntry>,
         appmenu_addr: Rc<RefCell<Option<(String, String)>>>,
-        appmenu_results: Arc<Mutex<VecDeque<AppMenuFetchResult>>>,
+        appmenu_results: Arc<Mutex<VecDeque<MenuFetchResult>>>,
     ) -> Self {
         Self {
             window: None,
@@ -2184,7 +2191,7 @@ impl CompositorApp {
                 let next = self.appmenu_results.lock().unwrap().pop_front();
                 let Some(result) = next else { break };
                 match result {
-                    AppMenuFetchResult::Bar(nodes) => {
+                    MenuFetchResult::Bar(nodes) => {
                         let bar: Vec<crate::GlobalMenuTopItem> = nodes
                             .into_iter()
                             .filter(|n| !n.separator && !n.label.is_empty())
@@ -2196,7 +2203,7 @@ impl CompositorApp {
                         tracing::debug!("appmenu: menu bar applied, {} entries", bar.len());
                         ui.set_global_menu_bar(slint::ModelRc::new(VecModel::from(bar)));
                     }
-                    AppMenuFetchResult::Submenu {
+                    MenuFetchResult::Submenu {
                         items,
                         x,
                         open_index,
@@ -2239,6 +2246,53 @@ impl CompositorApp {
                             ui.set_global_menu_open(true);
                         }
                     }
+                    MenuFetchResult::TrayMenu {
+                        items,
+                        x,
+                        y,
+                        sni_id,
+                    } => {
+                        use crate::MenuItem;
+                        // dbusmenu ids can be 0 or negative; MenuItem reserves
+                        // -1 for separators, so remap non-positive clickable
+                        // ids onto a growing fallback range.
+                        let mut row_id: i32 = 1_000_000;
+                        let menu: Vec<MenuItem> = items
+                            .into_iter()
+                            .map(|n| {
+                                if n.separator {
+                                    MenuItem {
+                                        id: -1,
+                                        label: SharedString::default(),
+                                        accelerator: SharedString::default(),
+                                        separator: true,
+                                        enabled: false,
+                                    }
+                                } else {
+                                    let id = if n.id <= 0 {
+                                        row_id += 1;
+                                        row_id - 1
+                                    } else {
+                                        n.id
+                                    };
+                                    MenuItem {
+                                        id,
+                                        label: SharedString::from(n.label),
+                                        accelerator: SharedString::default(),
+                                        separator: false,
+                                        enabled: n.enabled,
+                                    }
+                                }
+                            })
+                            .collect();
+                        if !menu.is_empty() {
+                            ui.set_tray_menu_items(slint::ModelRc::new(VecModel::from(menu)));
+                            ui.set_tray_menu_x(x);
+                            ui.set_tray_menu_y(y);
+                            ui.set_tray_menu_id(sni_id);
+                            ui.set_tray_menu_open(true);
+                        }
+                    }
                 }
             }
 
@@ -2267,7 +2321,7 @@ impl CompositorApp {
                             results
                                 .lock()
                                 .unwrap()
-                                .push_back(AppMenuFetchResult::Bar(nodes));
+                                .push_back(MenuFetchResult::Bar(nodes));
                         });
                     }
                     None => {
@@ -5268,7 +5322,7 @@ pub fn run() -> Result<()> {
     let appmenu_addr: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
     // Async appmenu fetch results — worker threads push, the render loop
     // drains. (Shared with the menu-click callbacks wired below.)
-    let appmenu_results: Arc<Mutex<VecDeque<AppMenuFetchResult>>> =
+    let appmenu_results: Arc<Mutex<VecDeque<MenuFetchResult>>> =
         Arc::new(Mutex::new(VecDeque::new()));
 
     ui.set_clock_text(SharedString::from(
@@ -5613,6 +5667,7 @@ pub fn run() -> Result<()> {
     // `tray-menu-open = true` so the ContextMenu pops near the cursor.
     {
         let weak = ui.as_weak();
+        let results = appmenu_results.clone();
         ui.on_tray_right_clicked(move |id| {
             let Some(ui) = weak.upgrade() else { return };
             let model = ui.get_tray_items();
@@ -5633,67 +5688,22 @@ pub fn run() -> Result<()> {
             let Some((service, object_path, cx, cy)) = endpoint else {
                 return;
             };
-            let weak2 = weak.clone();
+            // Position the popup just below + slightly right of the cursor.
+            // ContextMenu is 220 px wide and sizes its height to fit; clamp
+            // so it doesn't fall off the right edge of the screen.
+            let menu_w = 220.0_f64;
+            let pad = 8.0_f64;
+            let screen_w = ui.window().size().width as f64;
+            let max_x = (screen_w - menu_w - pad).max(pad);
+            let x = (cx as f64 - 10.0).clamp(pad, max_x) as i32;
+            let y = ((cy as f64) + 6.0).max(pad) as i32;
+            let results = results.clone();
             crate::dbusmenu::fetch_layout(service, object_path, move |items| {
-                let weak3 = weak2.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    let Some(ui) = weak3.upgrade() else { return };
-                    use crate::MenuItem;
-                    let mut row_id: i32 = 1_000_000;
-                    let menu_items: Vec<MenuItem> = items
-                        .into_iter()
-                        .map(|it| {
-                            if it.separator {
-                                MenuItem {
-                                    id: -1,
-                                    label: SharedString::default(),
-                                    accelerator: SharedString::default(),
-                                    separator: true,
-                                    enabled: false,
-                                }
-                            } else {
-                                // The DBusMenu item id can be 0 (synthetic
-                                // root has 0; some apps reuse it). MenuItem
-                                // requires non-(-1) for clickable rows so
-                                // shift positive ids by an offset and stash
-                                // the real id in a side table — but we can
-                                // just trust the numeric id here as long as
-                                // it's not -1, which dbusmenu uses for "no
-                                // id". Map any negative or zero ids onto a
-                                // monotonically growing fallback so the
-                                // ContextMenu doesn't think they're separators.
-                                let id = if it.id <= 0 {
-                                    row_id += 1;
-                                    row_id - 1
-                                } else {
-                                    it.id
-                                };
-                                MenuItem {
-                                    id,
-                                    label: SharedString::from(it.label),
-                                    accelerator: SharedString::default(),
-                                    separator: false,
-                                    enabled: it.enabled,
-                                }
-                            }
-                        })
-                        .collect();
-                    let model = std::rc::Rc::new(VecModel::from(menu_items));
-                    ui.set_tray_menu_items(slint::ModelRc::from(model));
-                    // Position the popup just below + slightly right of
-                    // the cursor. ContextMenu is 220 px wide and sizes
-                    // its height to fit; clamp so it doesn't fall off
-                    // the right edge of the screen.
-                    let menu_w = 220.0_f64;
-                    let pad = 8.0_f64;
-                    let screen_w = ui.window().size().width as f64;
-                    let max_x = (screen_w - menu_w - pad).max(pad);
-                    let x = (cx as f64 - 10.0).clamp(pad, max_x);
-                    let y = (cy as f64 + 6.0).max(pad);
-                    ui.set_tray_menu_x(x as i32);
-                    ui.set_tray_menu_y(y as i32);
-                    ui.set_tray_menu_id(id);
-                    ui.set_tray_menu_open(true);
+                results.lock().unwrap().push_back(MenuFetchResult::TrayMenu {
+                    items,
+                    x,
+                    y,
+                    sni_id: id,
                 });
             });
         });
@@ -5746,7 +5756,7 @@ pub fn run() -> Result<()> {
             let x = entry_x as i32;
             let results = results.clone();
             crate::dbusmenu::fetch_appmenu_children(service, path, node_id, move |items| {
-                results.lock().unwrap().push_back(AppMenuFetchResult::Submenu {
+                results.lock().unwrap().push_back(MenuFetchResult::Submenu {
                     items,
                     x,
                     open_index: idx,

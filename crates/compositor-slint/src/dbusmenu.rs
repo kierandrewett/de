@@ -15,22 +15,7 @@ use zbus::{
     Connection, Proxy,
 };
 
-/// A single rendered menu entry. Submenus are flattened so v1 just shows
-/// the top-level list — nested submenus would need an inline-expand UI
-/// or a popup-on-hover delay we don't implement yet.
-#[derive(Debug, Clone)]
-pub struct DbusMenuItem {
-    pub id: i32,
-    pub label: String,
-    pub enabled: bool,
-    /// Visibility flag from the DBusMenu protocol. Currently read only at
-    /// parse time (we drop invisible items before exposing the model to
-    /// Slint), but the field is kept so a future "hidden items toggle" or
-    /// remote-UI consumer doesn't have to re-introduce it.
-    #[allow(dead_code)]
-    pub visible: bool,
-    pub separator: bool,
-}
+
 
 /// Read the `Menu` object-path property from a StatusNotifierItem. Some
 /// SNI clients don't ship a menu — return None and the caller falls back
@@ -59,71 +44,13 @@ fn prop<T: TryFrom<OwnedValue>>(props: &HashMap<String, OwnedValue>, key: &str) 
     T::try_from(cloned).ok()
 }
 
-/// Recursive walk of a `(i32, a{sv}, av)` GetLayout response, flattening
-/// to a single list of renderable entries. The synthetic root (id == 0)
-/// is skipped; everything else with a non-empty label or `type=separator`
-/// is appended in document order.
-fn flatten_node(node_value: &Value<'_>, out: &mut Vec<DbusMenuItem>) {
-    let Value::Structure(s) = node_value else {
-        return;
-    };
-    let fields = s.fields();
-    if fields.len() < 3 {
-        return;
-    }
-
-    let id: i32 = match &fields[0] {
-        Value::I32(i) => *i,
-        _ => return,
-    };
-
-    // properties dict
-    let mut props: HashMap<String, OwnedValue> = HashMap::new();
-    if let Value::Dict(dict) = &fields[1] {
-        for (k, v) in dict.iter() {
-            if let Value::Str(ks) = k {
-                if let Ok(owned) = v.try_clone().and_then(OwnedValue::try_from) {
-                    props.insert(ks.to_string(), owned);
-                }
-            }
-        }
-    }
-
-    let label_raw: String = prop(&props, "label").unwrap_or_default();
-    let label = label_raw.replace('_', "");
-    let item_type: String = prop(&props, "type").unwrap_or_default();
-    let separator = item_type == "separator";
-    let enabled: bool = prop(&props, "enabled").unwrap_or(true);
-    let visible: bool = prop(&props, "visible").unwrap_or(true);
-
-    if id != 0 && visible && (separator || !label.is_empty()) {
-        out.push(DbusMenuItem {
-            id,
-            label,
-            enabled,
-            visible,
-            separator,
-        });
-    }
-
-    // children: array of variants, each variant wraps a recursive
-    // (i32, a{sv}, av) tuple
-    if let Value::Array(arr) = &fields[2] {
-        for child_v in arr.iter() {
-            if let Value::Value(boxed) = child_v {
-                flatten_node(boxed, out);
-            } else {
-                flatten_node(child_v, out);
-            }
-        }
-    }
-}
-
-/// Spawn a worker that fetches the DBusMenu layout and invokes `done`
-/// with the flattened item list. Runs entirely off the wayland thread.
+/// Fetch the menu for a StatusNotifierItem tray icon: read its `Menu`
+/// object-path property, then pull the top-level entries from the
+/// `com.canonical.dbusmenu` there. Runs off the wayland thread; `done`
+/// receives a flat list (depth-1 — SNI menus are shallow in practice).
 pub fn fetch_layout<F>(bus: String, sni_path: String, done: F)
 where
-    F: FnOnce(Vec<DbusMenuItem>) + Send + 'static,
+    F: FnOnce(Vec<AppMenuNode>) + Send + 'static,
 {
     std::thread::spawn(move || {
         let rt = match Builder::new_current_thread().enable_all().build() {
@@ -134,47 +61,10 @@ where
             }
         };
         let items = rt.block_on(async move {
-            let menu_path = match read_menu_property(&bus, &sni_path).await {
-                Some(p) => p,
-                None => return Vec::new(),
+            let Some(menu_path) = read_menu_property(&bus, &sni_path).await else {
+                return Vec::new();
             };
-            let conn = match Connection::session().await {
-                Ok(c) => c,
-                Err(_) => return Vec::new(),
-            };
-            let bus_name = match BusName::try_from(bus) {
-                Ok(b) => b,
-                Err(_) => return Vec::new(),
-            };
-            let obj_path = match ObjectPath::try_from(menu_path.as_str()) {
-                Ok(p) => p,
-                Err(_) => return Vec::new(),
-            };
-            let proxy = match Proxy::new(&conn, bus_name, obj_path, "com.canonical.dbusmenu").await
-            {
-                Ok(p) => p,
-                Err(_) => return Vec::new(),
-            };
-            // Tell the client we're about to show the menu — some apps
-            // populate state lazily in response.
-            let _ = proxy.call::<_, _, bool>("AboutToShow", &(0i32)).await;
-            let response: (u32, OwnedValue) = match proxy
-                .call(
-                    "GetLayout",
-                    &(0i32, 1i32, vec!["label", "type", "enabled", "visible"]),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!("dbusmenu GetLayout failed: {e}");
-                    return Vec::new();
-                }
-            };
-            let mut items = Vec::new();
-            let root_val: Value<'_> = response.1.into();
-            flatten_node(&root_val, &mut items);
-            items
+            fetch_dbusmenu_children(&bus, &menu_path, 0).await
         });
         done(items);
     });
@@ -290,58 +180,60 @@ where
                 return;
             }
         };
-        let nodes = rt.block_on(async move {
-            let conn = match Connection::session().await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("appmenu fetch: session bus connect failed: {e}");
-                    return Vec::new();
-                }
-            };
-            let Some(proxy) = appmenu_proxy(&conn, &service, &menu_path).await else {
-                tracing::warn!("appmenu fetch: could not build proxy for {service} {menu_path}");
-                return Vec::new();
-            };
-            tracing::debug!("appmenu fetch: calling GetLayout({parent_id}) on {service}");
-            // Let the app populate the submenu lazily if it wants to.
-            let _ = proxy.call::<_, _, bool>("AboutToShow", &(parent_id)).await;
-            // GetLayout → `(u revision, (ia{sv}av) layout)`. The layout is a
-            // bare structure (NOT a variant), and its third field is the
-            // `av` children array. Deserialize it with the exact shape so
-            // zbus matches the `(u(ia{sv}av))` signature.
-            type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
-            let response: (u32, Layout) = match proxy
-                .call(
-                    "GetLayout",
-                    &(
-                        parent_id,
-                        1i32,
-                        vec!["label", "type", "enabled", "visible", "children-display"],
-                    ),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!("appmenu GetLayout({parent_id}) failed: {e}");
-                    return Vec::new();
-                }
-            };
-            let (_revision, (_root_id, _root_props, children)) = response;
-            tracing::debug!(
-                "appmenu fetch: GetLayout({parent_id}) ok — {} raw children",
-                children.len()
-            );
-            let mut nodes = Vec::new();
-            for child in &children {
-                if let Some(node) = parse_menu_child(child) {
-                    nodes.push(node);
-                }
-            }
-            nodes
-        });
+        let nodes =
+            rt.block_on(async move { fetch_dbusmenu_children(&service, &menu_path, parent_id).await });
         done(nodes);
     });
+}
+
+/// The actual async `GetLayout` round-trip — shared by the appmenu and the
+/// SNI tray paths. Returns the direct children of `parent_id`.
+async fn fetch_dbusmenu_children(
+    service: &str,
+    menu_path: &str,
+    parent_id: i32,
+) -> Vec<AppMenuNode> {
+    let conn = match Connection::session().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("dbusmenu fetch: session bus connect failed: {e}");
+            return Vec::new();
+        }
+    };
+    let Some(proxy) = appmenu_proxy(&conn, service, menu_path).await else {
+        tracing::warn!("dbusmenu fetch: could not build proxy for {service} {menu_path}");
+        return Vec::new();
+    };
+    tracing::debug!("dbusmenu fetch: calling GetLayout({parent_id}) on {service}");
+    // Let the app populate the submenu lazily if it wants to.
+    let _ = proxy.call::<_, _, bool>("AboutToShow", &(parent_id)).await;
+    // GetLayout → `(u revision, (ia{sv}av) layout)`. The layout is a bare
+    // structure (NOT a variant), and its third field is the `av` children
+    // array. Deserialize the exact shape so zbus matches `(u(ia{sv}av))`.
+    type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+    let response: (u32, Layout) = match proxy
+        .call(
+            "GetLayout",
+            &(
+                parent_id,
+                1i32,
+                vec!["label", "type", "enabled", "visible", "children-display"],
+            ),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("dbusmenu GetLayout({parent_id}) failed: {e}");
+            return Vec::new();
+        }
+    };
+    let (_revision, (_root_id, _root_props, children)) = response;
+    tracing::debug!(
+        "dbusmenu fetch: GetLayout({parent_id}) ok — {} raw children",
+        children.len()
+    );
+    children.iter().filter_map(|c| parse_menu_child(c)).collect()
 }
 
 /// Send `Event(item_id, kind, null, now)` to a `com.canonical.dbusmenu`
