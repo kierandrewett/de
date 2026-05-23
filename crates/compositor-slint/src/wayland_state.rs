@@ -517,6 +517,14 @@ pub struct SpikeState {
     /// All mapped layer-shell surfaces (populated by WlrLayerShellHandler).
     pub layer_surfaces: Vec<LayerInfo>,
 
+    /// Per-surface output membership recorded by the compositor's explicit
+    /// surface/output refresh pass. Smithay's primary-scanout helper is tied
+    /// to render-element state, while this renderer still mirrors surfaces
+    /// into Slint models, so this map is the local source of truth for
+    /// `wl_surface.enter`, preferred scale/transform, and fractional-scale
+    /// updates until render elements drive presentation per output.
+    pub surface_outputs: std::collections::HashMap<ObjectId, Output>,
+
     /// Shared pixel buffer (SHM surface → Slint texture) — legacy single-window path.
     pub client_pixels: Arc<Mutex<ClientSurfaceData>>,
 
@@ -785,6 +793,7 @@ impl SpikeState {
             toplevels: Vec::new(),
             popups: Vec::new(),
             layer_surfaces: Vec::new(),
+            surface_outputs: std::collections::HashMap::new(),
             client_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             destroyed_surfaces: Vec::new(),
             pending_xdg_move: Vec::new(),
