@@ -375,20 +375,18 @@ impl CompositorHandler for SpikeState {
         if let Some(idx) = toplevel_idx {
             let pixels_arc = self.toplevels[idx].pixels.clone();
 
-            // Composite the surface tree (toplevel + subsurfaces) into a
-            // single RGBA buffer. > 1 surface is our heuristic for "this app
-            // draws its own chrome" (Firefox, GTK header-bar apps).
+            // Composite the surface tree (toplevel + subsurfaces) into
+            // a single RGBA buffer. Cropping to the client's
+            // `xdg_surface.set_window_geometry` rect happens on the
+            // Slint side, so CSD clients' shadow/corner padding is
+            // excluded there and our chrome stays 1:1 with the visible
+            // window (no stretching, no blur).
             //
-            // We DON'T re-configure CSD clients to a larger size — instead
-            // we'll crop the composited buffer to the client's
-            // `xdg_surface.set_window_geometry` rect on the Slint side.
-            // That rect already excludes the client's own shadow / corner
-            // padding, so cropping there gives us the visible window at 1:1
-            // and our chrome is sized to match (no stretching, no blur).
-            let n_surfaces = import_shm_buffer(surface, &pixels_arc);
-            if n_surfaces > 1 {
-                self.toplevels[idx].csd = true;
-            }
+            // The return value's surface-count used to flip `csd = true`
+            // when > 1 — a pixel/topology heuristic that's been removed.
+            // SSD vs CSD is now protocol-authoritative (xdg-decoration /
+            // KDE-server-decoration handlers + `ack_configure`).
+            let _ = import_shm_buffer(surface, &pixels_arc);
 
             // Per-surface render-element model (runs alongside the legacy
             // composite during the staged rewrite). Imports each surface

@@ -20,14 +20,20 @@ use crate::wayland_state::SpikeState;
 
 impl XdgDecorationHandler for SpikeState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        // Default to ServerSide — we draw our own titlebar. Clients that
-        // genuinely want CSD (and respect the negotiation) will request it
-        // via `request_mode(ClientSide)`. Apps like Firefox always paint
-        // their own header bar internally regardless, but our SSD chrome
-        // still wraps the window so the user gets consistent decorations.
+        tracing::debug!("decoration: new_decoration → defaulting ClientSide");
+        // Default to ClientSide. Modern Wayland apps almost universally
+        // draw their own headerbar (libadwaita, GTK4, Qt, Firefox,
+        // Chromium/Electron). Forcing SSD on them double-decorates,
+        // because their headerbar is app content we can't hide. Clients
+        // that genuinely want SSD ask for it via `set_mode(ServerSide)`
+        // and `request_mode` below honours them. Matches anvil + cosmic.
         toplevel.with_pending_state(|s| {
-            s.decoration_mode = Some(Mode::ServerSide);
+            s.decoration_mode = Some(Mode::ClientSide);
         });
+        let wl = toplevel.wl_surface();
+        if let Some(tl) = self.toplevels.iter_mut().find(|t| &t.surface == wl) {
+            tl.csd = true;
+        }
         // Don't fire send_configure if the initial configure hasn't gone
         // out yet — the deferred path in `wayland/compositor.rs` will
         // pick up our pending-state change and emit the first configure
@@ -40,6 +46,7 @@ impl XdgDecorationHandler for SpikeState {
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Mode) {
         let csd = matches!(mode, Mode::ClientSide);
+        tracing::debug!("decoration: request_mode csd={csd}");
         toplevel.with_pending_state(|s| {
             s.decoration_mode = Some(if csd {
                 Mode::ClientSide
@@ -58,15 +65,17 @@ impl XdgDecorationHandler for SpikeState {
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        // Client withdrew its preference — fall back to our default
+        // (ClientSide).
         toplevel.with_pending_state(|s| {
-            s.decoration_mode = Some(Mode::ServerSide);
+            s.decoration_mode = Some(Mode::ClientSide);
         });
         if toplevel.is_initial_configure_sent() {
             toplevel.send_configure();
         }
         let wl = toplevel.wl_surface();
         if let Some(tl) = self.toplevels.iter_mut().find(|t| &t.surface == wl) {
-            tl.csd = false;
+            tl.csd = true;
         }
     }
 }
@@ -87,14 +96,14 @@ impl KdeDecorationHandler for SpikeState {
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         decoration: &wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration,
     ) {
-        // Tell the Qt/KWin-style client up-front that we draw decorations
-        // server-side (default mode). Without this, Qt 5/6 apps that opt
-        // into kde-server-decoration but not xdg-decoration end up either
-        // double-decorated or fully undecorated depending on the Qt
-        // version. Pattern matches the protocol's `default_mode` semantics.
+        // Default to Client. Same rationale as xdg-decoration above: most
+        // modern Qt/KDE apps draw their own decorations. Apps that want
+        // SSD ask explicitly via `request_mode(Server)`.
         use wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
-        decoration.mode(Mode::Server);
-        let _ = surface;
+        decoration.mode(Mode::Client);
+        if let Some(tl) = self.toplevels.iter_mut().find(|t| &t.surface == surface) {
+            tl.csd = true;
+        }
     }
 
     fn request_mode(
@@ -105,19 +114,15 @@ impl KdeDecorationHandler for SpikeState {
             wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode,
         >,
     ) {
-        // Mirror what we do for xdg-decoration: clients may request CSD via
-        // Client mode; anything else gets ServerSide. Apps that don't
-        // honour our reply (Qt5 on some versions) will end up double-
-        // decorated, which is preferable to undecorated.
+        // Honour an explicit Server request; treat anything else as
+        // Client (our default).
         use smithay::reexports::wayland_server::WEnum;
         use wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode;
         let resolved = match mode {
-            WEnum::Value(Mode::Client) => Mode::Client,
-            _ => Mode::Server,
+            WEnum::Value(Mode::Server) => Mode::Server,
+            _ => Mode::Client,
         };
         decoration.mode(resolved);
-        // Mirror into our ToplevelInfo so the chrome renderer knows whether
-        // to draw an SSD titlebar over this surface.
         let csd = matches!(resolved, Mode::Client);
         if let Some(tl) = self.toplevels.iter_mut().find(|t| &t.surface == surface) {
             tl.csd = csd;

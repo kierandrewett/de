@@ -1879,7 +1879,14 @@ impl CompositorApp {
             } else {
                 (0, 0, bw, bh)
             };
-            let has_padding = bw > 0 && bh > 0 && (gx > 0 || gy > 0 || gw < bw || gh < bh);
+            // SSD vs CSD is protocol-authoritative: `tl.csd` is set by
+            // the xdg-decoration / KDE-server-decoration handlers and by
+            // `ack_configure`'s mirror — no pixel/buffer heuristics
+            // layered on top. (This block previously OR'd in a
+            // `has_padding` heuristic and pass 2 stickily forced csd to
+            // true; both papered over the real defect — decoration
+            // negotiation wasn't authoritative — and could mis-classify
+            // windows in either direction.)
             metas.push(ToplevelMeta {
                 surface: tl.surface.clone(),
                 gx,
@@ -1889,7 +1896,7 @@ impl CompositorApp {
                 bw,
                 bh,
                 csd_now: tl.csd,
-                csd_verdict: tl.csd || has_padding,
+                csd_verdict: tl.csd,
                 is_resizing: Some(i) == resizing_idx,
                 app_id,
             });
@@ -1915,11 +1922,10 @@ impl CompositorApp {
                     win.app_id = m.app_id.clone();
                 }
             }
-            if m.csd_verdict && !m.csd_now {
-                if let Some(t) = state.toplevels.iter_mut().find(|t| t.surface == m.surface) {
-                    t.csd = true;
-                }
-            }
+            // No sticky csd-promotion here — the authority is the
+            // decoration protocol, mirrored into `tl.csd` by the
+            // decoration handlers + `ack_configure`.
+            let _ = m.csd_now;
             // Push the VISIBLE window-geometry size to the WM, not the
             // raw buffer dims. GTK CSD apps render a buffer that's
             // larger than the visible window — typically ~30 px of

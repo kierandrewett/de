@@ -82,7 +82,13 @@ impl XdgShellHandler for SpikeState {
             y,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            csd: false,
+            // Default to client-side decorations. The xdg-decoration /
+            // KDE-server-decoration handlers flip this to false when a
+            // client genuinely requests / acks ServerSide. Matches anvil
+            // and cosmic-comp; the previous default-SSD double-decorated
+            // libadwaita apps (their AdwHeaderBar is always app content,
+            // so an extra SSD titlebar stacks on top).
+            csd: true,
             foreign_handle,
             last_advertised_title: String::new(),
             last_advertised_app_id: String::new(),
@@ -268,13 +274,24 @@ impl XdgShellHandler for SpikeState {
         surface.send_repositioned(token);
     }
 
-    fn ack_configure(&mut self, _surface: WlSurface, _configure: Configure) {
-        // Smithay caches acknowledged configures internally; we have no
-        // resize-grab state machine on the wayland side to advance (the
-        // renderer drives configures during drags and treats the next
-        // committed buffer as confirmation). Implementing this handler at
-        // all is what stops GTK4 etc. spinning in a configure storm — the
-        // protocol just needs the trait method to be reachable.
+    fn ack_configure(&mut self, surface: WlSurface, configure: Configure) {
+        // Mirror the acknowledged decoration mode into our ToplevelInfo so
+        // the renderer's SSD/CSD decision is protocol-authoritative — not
+        // a heuristic on the buffer. Anvil does the same (anvil/shell/xdg.rs).
+        // The other configure state (size, maximized, fullscreen…) is
+        // already cached by smithay; we don't have a resize-grab state
+        // machine to advance here (the renderer drives drag-resize and
+        // treats the next commit as confirmation), so this is the only
+        // thing we need to mirror.
+        if let Configure::Toplevel(cfg) = configure {
+            if let Some(mode) = cfg.state.decoration_mode {
+                use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+                let csd = matches!(mode, Mode::ClientSide);
+                if let Some(tl) = self.toplevels.iter_mut().find(|t| t.surface == surface) {
+                    tl.csd = csd;
+                }
+            }
+        }
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: WlSeat, serial: Serial) {
