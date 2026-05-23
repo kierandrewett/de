@@ -49,7 +49,7 @@ use slint::{ComponentHandle, LogicalPosition, Model, SharedString, VecModel};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop as WinitEventLoop},
     keyboard::{KeyCode, PhysicalKey},
     platform::{
@@ -104,9 +104,15 @@ pub struct PendingKeyEvent {
 #[derive(Debug, Clone)]
 pub enum PendingPointerEvent {
     /// Pointer moved to compositor-space (x, y).
-    Motion { x: f64, y: f64 },
+    Motion {
+        x: f64,
+        y: f64,
+    },
     /// Mouse button pressed/released. `button` is the Linux evdev button code.
-    Button { button: u32, pressed: bool },
+    Button {
+        button: u32,
+        pressed: bool,
+    },
     /// Scroll wheel / touchpad axis. Pixel-delta semantics; line/discrete scrolls
     /// from a wheel are pre-multiplied by 15 (a typical line height) on the
     /// winit→PendingPointerEvent edge so all events are normalised to pixels
@@ -118,6 +124,21 @@ pub enum PendingPointerEvent {
         discrete_v120: Option<(i32, i32)>,
         is_wheel: bool,
     },
+    TouchDown {
+        slot: smithay::backend::input::TouchSlot,
+        x: f64,
+        y: f64,
+    },
+    TouchMotion {
+        slot: smithay::backend::input::TouchSlot,
+        x: f64,
+        y: f64,
+    },
+    TouchUp {
+        slot: smithay::backend::input::TouchSlot,
+    },
+    TouchCancel,
+    TouchFrame,
 }
 
 // `winit_button_to_evdev`, `forward_keyboard_event`, `ascii_to_scancode`, and
@@ -813,6 +834,33 @@ impl ApplicationHandler for CompositorApp {
                     });
             }
 
+            WindowEvent::Touch(touch) => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor())
+                    .unwrap_or(1.0)
+                    .max(0.0001);
+                let x = touch.location.x / scale;
+                let y = touch.location.y / scale;
+                let Some(slot_id) = u32::try_from(touch.id).ok() else {
+                    return;
+                };
+                let slot = smithay::backend::input::TouchSlot::from(Some(slot_id));
+                let mut pending = self.pending_pointers.lock().unwrap();
+                match touch.phase {
+                    TouchPhase::Started => {
+                        pending.push_back(PendingPointerEvent::TouchDown { slot, x, y })
+                    }
+                    TouchPhase::Moved => {
+                        pending.push_back(PendingPointerEvent::TouchMotion { slot, x, y })
+                    }
+                    TouchPhase::Ended => pending.push_back(PendingPointerEvent::TouchUp { slot }),
+                    TouchPhase::Cancelled => pending.push_back(PendingPointerEvent::TouchCancel),
+                }
+                pending.push_back(PendingPointerEvent::TouchFrame);
+            }
+
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
@@ -931,7 +979,9 @@ impl ApplicationHandler for CompositorApp {
                         }
                         127 if pressed => {
                             if let Some(focused_id) = self.wm.focused_id() {
-                                if let Some(win) = self.wm.windows.values().find(|w| w.id == focused_id) {
+                                if let Some(win) =
+                                    self.wm.windows.values().find(|w| w.id == focused_id)
+                                {
                                     let (wx, wy, ww) = (
                                         win.anim.current_x() as f64,
                                         win.anim.current_y() as f64,
@@ -2360,7 +2410,10 @@ impl CompositorApp {
                 .and_then(|w| state.toplevels.iter().find(|t| t.surface == w.surface))
                 .and_then(|t| t.appmenu.clone());
             if *self.appmenu_addr.borrow() != focused_appmenu {
-                tracing::debug!("appmenu: focused window menu changed → {:?}", focused_appmenu);
+                tracing::debug!(
+                    "appmenu: focused window menu changed → {:?}",
+                    focused_appmenu
+                );
                 *self.appmenu_addr.borrow_mut() = focused_appmenu.clone();
                 // Focus moved — any open submenu belongs to the old window.
                 ui.set_global_menu_open(false);
@@ -3264,9 +3317,8 @@ impl CompositorApp {
         state.active_surface = self.wm.focused_surface();
         if let Some(surface) = &state.active_surface {
             if let Some(kb) = state.seat.get_keyboard() {
-                let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
-                    state, surface,
-                );
+                let focus =
+                    crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(state, surface);
                 kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
             }
         }
@@ -3524,16 +3576,15 @@ impl CompositorApp {
         // context menu (Minimize / Maximize / Close). We test the hit
         // zone before the desktop check below; only fall through if
         // the cursor wasn't on a titlebar.
-        if button == 0x111 && pressed
-            && !over_client_popup {
-                let win_rects = self.window_rects(state);
-                if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
-                    if hit.zone == cursor::HitZone::TitleBar {
-                        self.open_window_menu(hit.window_id, x, y);
-                        return;
-                    }
+        if button == 0x111 && pressed && !over_client_popup {
+            let win_rects = self.window_rects(state);
+            if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
+                if hit.zone == cursor::HitZone::TitleBar {
+                    self.open_window_menu(hit.window_id, x, y);
+                    return;
                 }
             }
+        }
 
         // Right-click on the desktop opens our generic context menu.
         if button == 0x111 && pressed {
@@ -3689,8 +3740,7 @@ impl CompositorApp {
             })
         };
 
-        let focused_app_id: Option<String> =
-            state.active_surface.as_ref().and_then(&app_id_for);
+        let focused_app_id: Option<String> = state.active_surface.as_ref().and_then(&app_id_for);
 
         // Collect every running app_id from the toplevel list.
         let mut running_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5658,12 +5708,15 @@ pub fn run() -> Result<()> {
             let y = ((cy as f64) + 6.0).max(pad) as i32;
             let results = results.clone();
             crate::dbusmenu::fetch_layout(service, object_path, move |items| {
-                results.lock().unwrap().push_back(MenuFetchResult::TrayMenu {
-                    items,
-                    x,
-                    y,
-                    sni_id: id,
-                });
+                results
+                    .lock()
+                    .unwrap()
+                    .push_back(MenuFetchResult::TrayMenu {
+                        items,
+                        x,
+                        y,
+                        sni_id: id,
+                    });
             });
         });
     }
@@ -6239,6 +6292,31 @@ pub fn run() -> Result<()> {
                         is_wheel,
                     } => {
                         app.forward_pointer_axis(&mut state, dx, dy, discrete_v120, is_wheel);
+                    }
+                    PendingPointerEvent::TouchDown { slot, x, y } => {
+                        let time = state.clock.now().as_millis();
+                        input_util::forward_touch_down(
+                            &mut state,
+                            slot,
+                            x,
+                            y,
+                            time,
+                            |state, hit_x, hit_y| app.surface_under_full(state, hit_x, hit_y),
+                        );
+                    }
+                    PendingPointerEvent::TouchMotion { slot, x, y } => {
+                        let time = state.clock.now().as_millis();
+                        input_util::forward_touch_motion(&mut state, slot, x, y, time);
+                    }
+                    PendingPointerEvent::TouchUp { slot } => {
+                        let time = state.clock.now().as_millis();
+                        input_util::forward_touch_up(&mut state, slot, time);
+                    }
+                    PendingPointerEvent::TouchCancel => {
+                        input_util::forward_touch_cancel(&mut state);
+                    }
+                    PendingPointerEvent::TouchFrame => {
+                        input_util::forward_touch_frame(&mut state);
                     }
                 }
             }

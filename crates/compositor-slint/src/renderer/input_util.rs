@@ -235,6 +235,114 @@ pub fn forward_pointer_motion<F>(
     pointer.frame(state);
 }
 
+pub fn forward_touch_down<F>(
+    state: &mut SpikeState,
+    slot: smithay::backend::input::TouchSlot,
+    x: f64,
+    y: f64,
+    time: u32,
+    mut surface_under: F,
+) where
+    F: FnMut(&SpikeState, f64, f64) -> SurfaceHit,
+{
+    let Some(touch) = state.seat.get_touch() else {
+        return;
+    };
+
+    state.idle_notifier_state.notify_activity(&state.seat);
+
+    let serial = SERIAL_COUNTER.next_serial();
+    let under = surface_under(state, x, y);
+    if let Some((surface, origin_x, origin_y)) = under.as_ref() {
+        state
+            .touch_focus
+            .insert(slot, (surface.clone(), *origin_x, *origin_y));
+        if let Some(keyboard) = state.seat.get_keyboard() {
+            let focus =
+                crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(state, surface);
+            keyboard.set_focus(state, Some(focus), serial);
+        }
+    } else {
+        state.touch_focus.remove(&slot);
+    }
+
+    touch.down(
+        state,
+        under.map(|(surface, origin_x, origin_y)| (surface, Point::from((origin_x, origin_y)))),
+        &smithay::input::touch::DownEvent {
+            slot,
+            location: Point::from((x, y)),
+            serial,
+            time,
+        },
+    );
+}
+
+pub fn forward_touch_motion(
+    state: &mut SpikeState,
+    slot: smithay::backend::input::TouchSlot,
+    x: f64,
+    y: f64,
+    time: u32,
+) {
+    let Some(touch) = state.seat.get_touch() else {
+        return;
+    };
+
+    state.idle_notifier_state.notify_activity(&state.seat);
+    let under = state
+        .touch_focus
+        .get(&slot)
+        .cloned()
+        .map(|(surface, origin_x, origin_y)| (surface, Point::from((origin_x, origin_y))));
+    touch.motion(
+        state,
+        under,
+        &smithay::input::touch::MotionEvent {
+            slot,
+            location: Point::from((x, y)),
+            time,
+        },
+    );
+}
+
+pub fn forward_touch_up(
+    state: &mut SpikeState,
+    slot: smithay::backend::input::TouchSlot,
+    time: u32,
+) {
+    let Some(touch) = state.seat.get_touch() else {
+        return;
+    };
+
+    state.idle_notifier_state.notify_activity(&state.seat);
+    state.touch_focus.remove(&slot);
+    touch.up(
+        state,
+        &smithay::input::touch::UpEvent {
+            slot,
+            serial: SERIAL_COUNTER.next_serial(),
+            time,
+        },
+    );
+}
+
+pub fn forward_touch_cancel(state: &mut SpikeState) {
+    let Some(touch) = state.seat.get_touch() else {
+        return;
+    };
+
+    state.idle_notifier_state.notify_activity(&state.seat);
+    state.touch_focus.clear();
+    touch.cancel(state);
+}
+
+pub fn forward_touch_frame(state: &mut SpikeState) {
+    if let Some(touch) = state.seat.get_touch() {
+        touch.frame(state);
+    }
+}
+
 pub fn state_surface_under(state: &SpikeState, x: f64, y: f64) -> SurfaceHit {
     use smithay::wayland::shell::wlr_layer::Layer;
 
@@ -277,7 +385,11 @@ fn state_layer_surface_under(
                 origin,
                 WindowSurfaceType::ALL,
             ) {
-                return Some((surface, f64::from(surface_origin.x), f64::from(surface_origin.y)));
+                return Some((
+                    surface,
+                    f64::from(surface_origin.x),
+                    f64::from(surface_origin.y),
+                ));
             }
             return Some((
                 layer.surface.wl_surface().clone(),
@@ -308,7 +420,11 @@ fn state_popup_surface_under(state: &SpikeState, x: f64, y: f64) -> SurfaceHit {
             origin,
             WindowSurfaceType::ALL,
         ) {
-            return Some((surface, f64::from(surface_origin.x), f64::from(surface_origin.y)));
+            return Some((
+                surface,
+                f64::from(surface_origin.x),
+                f64::from(surface_origin.y),
+            ));
         }
         return Some((popup.surface.clone(), px, py));
     }
@@ -325,8 +441,16 @@ fn state_popup_rect(
         (pixels.width as i32, pixels.height as i32)
     };
     let geometry = popup.configured_geometry()?;
-    let width = if geometry.size.w > 0 { geometry.size.w } else { buffer_w };
-    let height = if geometry.size.h > 0 { geometry.size.h } else { buffer_h };
+    let width = if geometry.size.w > 0 {
+        geometry.size.w
+    } else {
+        buffer_w
+    };
+    let height = if geometry.size.h > 0 {
+        geometry.size.h
+    } else {
+        buffer_h
+    };
     if width <= 0 || height <= 0 {
         return None;
     }
@@ -335,22 +459,44 @@ fn state_popup_rect(
     let mut abs_y = geometry.loc.y;
     let mut parent = popup.parent.clone();
     for _ in 0..16 {
-        if let Some(parent_popup) = state.popups.iter().find(|candidate| candidate.surface == parent) {
+        if let Some(parent_popup) = state
+            .popups
+            .iter()
+            .find(|candidate| candidate.surface == parent)
+        {
             let parent_geometry = parent_popup.configured_geometry()?;
             abs_x += parent_geometry.loc.x;
             abs_y += parent_geometry.loc.y;
             parent = parent_popup.parent.clone();
             continue;
         }
-        if let Some(toplevel) = state.toplevels.iter().find(|candidate| candidate.surface == parent) {
+        if let Some(toplevel) = state
+            .toplevels
+            .iter()
+            .find(|candidate| candidate.surface == parent)
+        {
             abs_x += toplevel.x;
             abs_y += toplevel.y;
-            return Some((f64::from(abs_x), f64::from(abs_y), f64::from(width), f64::from(height)));
+            return Some((
+                f64::from(abs_x),
+                f64::from(abs_y),
+                f64::from(width),
+                f64::from(height),
+            ));
         }
-        if let Some(layer) = state.layer_surfaces.iter().find(|layer| layer.surface.wl_surface() == &parent) {
+        if let Some(layer) = state
+            .layer_surfaces
+            .iter()
+            .find(|layer| layer.surface.wl_surface() == &parent)
+        {
             abs_x += layer.x;
             abs_y += layer.y;
-            return Some((f64::from(abs_x), f64::from(abs_y), f64::from(width), f64::from(height)));
+            return Some((
+                f64::from(abs_x),
+                f64::from(abs_y),
+                f64::from(width),
+                f64::from(height),
+            ));
         }
         return None;
     }
@@ -379,7 +525,11 @@ fn state_toplevel_surface_under(state: &SpikeState, x: f64, y: f64) -> SurfaceHi
             origin,
             WindowSurfaceType::ALL,
         ) {
-            return Some((surface, f64::from(surface_origin.x), f64::from(surface_origin.y)));
+            return Some((
+                surface,
+                f64::from(surface_origin.x),
+                f64::from(surface_origin.y),
+            ));
         }
         return Some((toplevel.surface.clone(), origin_x, origin_y));
     }
