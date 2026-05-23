@@ -13,9 +13,10 @@
 use std::time::Duration;
 
 use smithay::{
+    backend::renderer::element::{Id, RenderElementStates},
     desktop::utils::SurfacePresentationFeedback,
     output::Output,
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{backend::ObjectId, protocol::wl_surface::WlSurface, Resource},
     utils::{Monotonic, Time},
     wayland::{
         compositor::{with_surface_tree_downward, TraversalAction},
@@ -46,23 +47,23 @@ fn refresh_nanos_for(output: &Output) -> u64 {
 }
 
 impl SpikeState {
-    /// Drain pending wp_presentation_feedback callbacks for every surface in
-    /// `surfaces` (and their subsurface trees) and fire `presented` with the
-    /// supplied timestamp.
-    ///
-    /// Should be called once per frame for the surfaces the renderer just
-    /// composited. Surfaces we did NOT composite are skipped — the next
-    /// frame that includes them will fire their feedback.
-    pub fn send_presentation_feedback_for(
+    /// Drain pending wp_presentation_feedback callbacks for surfaces that the
+    /// damage tracker reported as presented in the frame that just drew.
+    pub fn send_presentation_feedback_for_render_state(
         &self,
         output: &Output,
         surfaces: &[WlSurface],
+        states: &RenderElementStates,
         present_time: Time<Monotonic>,
         seq: u64,
     ) {
         let mut feedbacks: Vec<SurfacePresentationFeedback> = Vec::new();
+        let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
         for surface in surfaces {
-            collect_feedback(surface, &mut feedbacks);
+            if !seen.insert(surface.id()) {
+                continue;
+            }
+            collect_feedback(surface, states, &mut feedbacks);
         }
 
         if feedbacks.is_empty() {
@@ -90,20 +91,21 @@ impl SpikeState {
     }
 }
 
-/// Walk one surface tree and pull every queued [`SurfacePresentationFeedback`]
-/// into `out`.
-///
-/// Anvil's `take_presentation_feedback_surface_tree` gates on a per-surface
-/// "primary scanout output" stored in surface user-data. We don't run a
-/// damage tracker yet, so no surface has that user-data set; instead we
-/// trust the caller's surface list (caller already filtered for
-/// visibility on this output).
-fn collect_feedback(surface: &WlSurface, out: &mut Vec<SurfacePresentationFeedback>) {
+/// Walk one surface tree and pull feedback only for surfaces that the render
+/// states mark as presented on this output frame.
+fn collect_feedback(
+    surface: &WlSurface,
+    render_states: &RenderElementStates,
+    out: &mut Vec<SurfacePresentationFeedback>,
+) {
     with_surface_tree_downward(
         surface,
         (),
         |_, _, &()| TraversalAction::DoChildren(()),
-        |_surface, states, &()| {
+        |surface, states, &()| {
+            if !render_states.element_was_presented(Id::from(surface)) {
+                return;
+            }
             // Match the flag set in `send_presentation_feedback_for` — Vsync
             // only. See that fn for rationale.
             if let Some(feedback) = SurfacePresentationFeedback::from_states(

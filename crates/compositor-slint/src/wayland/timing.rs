@@ -7,9 +7,10 @@
 //!   3. Transaction queues are drained via `blocker_cleared`.
 
 use smithay::{
+    backend::renderer::element::{Id, RenderElementStates},
     delegate_commit_timing, delegate_fifo, delegate_presentation,
     output::Output,
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::wayland_server::{backend::ObjectId, protocol::wl_surface::WlSurface, Resource},
     wayland::compositor::{with_surface_tree_downward, TraversalAction},
 };
 use tracing::debug;
@@ -30,38 +31,39 @@ delegate_commit_timing!(SpikeState);
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl SpikeState {
-    /// Send wl_surface.frame callbacks to the supplied list of root surfaces.
-    ///
-    /// The renderer is the only thing that knows which surfaces it actually
-    /// composited this frame (i.e. which windows are NOT minimised, NOT
-    /// in their close-settle phase, AND have a non-zero buffer). Walking the
-    /// full `toplevels` list here would fire frame callbacks on invisible
-    /// clients and drive them at full output framerate even when nothing
-    /// they render reaches the screen — battery + idle CPU win is material.
-    pub fn send_frame_callbacks_for(&self, output: &Output, surfaces: &[WlSurface]) {
+    /// Send wl_surface.frame callbacks to surfaces presented according to the
+    /// `OutputDamageTracker` render states for the frame that was just drawn.
+    pub fn send_frame_callbacks_for_render_state(
+        &self,
+        output: &Output,
+        surfaces: &[WlSurface],
+        states: &RenderElementStates,
+    ) {
         use smithay::desktop::utils::send_frames_surface_tree;
         use std::time::Duration;
 
         let time: Duration = self.clock.now().into();
+        let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
 
         for surface in surfaces {
-            // The closure unconditionally returns `Some(output)`: we treat
-            // every surface in this list as on-output since the renderer
-            // already filtered for visibility before passing it in.
-            // Throttle of 1s lets clients with no recently-sent callback
-            // still receive one even if they momentarily fail the visibility
-            // gate (e.g. mid-resize buffer-size dip to zero).
+            if !seen.insert(surface.id()) {
+                continue;
+            }
             send_frames_surface_tree(
                 surface,
                 output,
                 time,
                 Some(Duration::from_secs(1)),
-                |_, _| Some(output.clone()),
+                |surface, _| {
+                    states
+                        .element_was_presented(Id::from(surface))
+                        .then(|| output.clone())
+                },
             );
         }
 
         debug!(
-            "send_frame_callbacks_for: sent to {} surfaces",
+            "send_frame_callbacks_for_render_state: sent to {} surfaces",
             surfaces.len()
         );
     }

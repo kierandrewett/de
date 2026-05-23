@@ -277,7 +277,6 @@ impl UdevRuntime {
         }
 
         self.log_open_devices();
-        self.advertise_dmabuf_global();
 
         Ok(())
     }
@@ -320,7 +319,6 @@ impl UdevRuntime {
             match event {
                 UdevHotplugEvent::Added { device_id, path } => {
                     self.probe_drm_device(DrmDeviceSnapshot { device_id, path })?;
-                    self.advertise_dmabuf_global();
                 }
                 UdevHotplugEvent::Changed { device_id } => {
                     self.refresh_drm_device(device_id)?;
@@ -546,30 +544,6 @@ impl UdevRuntime {
             node = ?device.node,
             path = %device.path.display(),
             "udev backend: DRM device removed from probe list"
-        );
-    }
-
-    fn advertise_dmabuf_global(&mut self) {
-        let Some(device) = self.drm_devices.first() else {
-            return;
-        };
-        let formats: Vec<_> = device
-            .render
-            .renderer
-            .egl_context()
-            .dmabuf_render_formats()
-            .iter()
-            .copied()
-            .collect();
-        let format_count = formats.len();
-        let _dmabuf_global = self
-            .wayland
-            .state
-            .dmabuf_state
-            .create_global::<SpikeState>(&self.wayland.display_handle, formats);
-        info!(
-            format_count,
-            "udev backend: DMA-BUF global advertised from EGL renderer formats"
         );
     }
 

@@ -94,6 +94,10 @@ pub struct LayerInfo {
     /// schedule — `pixels.dirty` then drives whether the renderer needs
     /// to rebuild the Slint `layers` model.
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
+    /// Per-surface pixels for the shared SHM/DMA-BUF render model. The layer
+    /// visual path still consumes `pixels`, but imports land here as well so
+    /// DMA-BUF subsurfaces are not dropped.
+    pub surface_pixels: Arc<Mutex<std::collections::HashMap<u32, ClientSurfaceData>>>,
 }
 
 impl LayerInfo {
@@ -145,6 +149,7 @@ impl WlrLayerShellHandler for SpikeState {
             w: 0,
             h: 0,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
     }
 
