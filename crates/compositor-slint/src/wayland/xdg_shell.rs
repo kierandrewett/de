@@ -153,10 +153,6 @@ impl XdgShellHandler for SpikeState {
             surface: wl,
             popup: surface,
             parent,
-            rel_x: geom.loc.x,
-            rel_y: geom.loc.y,
-            w: geom.size.w,
-            h: geom.size.h,
             pixels: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::wayland_state::ClientSurfaceData::default(),
             )),

@@ -2540,7 +2540,10 @@ impl CompositorApp {
 
         // ── Build PopupItem list from state.popups ──────────────────────────
         // Resolve each popup's compositor-space position by walking up the
-        // parent chain to a toplevel: popup_x = toplevel.x + sum(popup.rel_x).
+        // parent chain to a toplevel. Popup geometry comes from Smithay's
+        // committed xdg_popup state, not the old PopupInfo snapshot, so
+        // unconstrain/reposition configures are reflected after the client's
+        // ack+commit lifecycle.
         // Popups can have popups as parents (nested menus); cap the walk so
         // a malformed chain can't loop forever.
         let mut popup_items: Vec<crate::PopupItem> = Vec::new();
@@ -2554,14 +2557,21 @@ impl CompositorApp {
                 continue;
             }
 
+            let Some(geometry) = popup.configured_geometry() else {
+                continue;
+            };
+
             // Walk parent chain to find the absolute compositor position.
-            let mut abs_x = popup.rel_x;
-            let mut abs_y = popup.rel_y;
+            let mut abs_x = geometry.loc.x;
+            let mut abs_y = geometry.loc.y;
             let mut cur_parent = popup.parent.clone();
             for _ in 0..16 {
                 if let Some(p) = state.popups.iter().find(|p| p.surface == cur_parent) {
-                    abs_x += p.rel_x;
-                    abs_y += p.rel_y;
+                    let Some(parent_geometry) = p.configured_geometry() else {
+                        break;
+                    };
+                    abs_x += parent_geometry.loc.x;
+                    abs_y += parent_geometry.loc.y;
                     cur_parent = p.parent.clone();
                     continue;
                 }
@@ -2689,8 +2699,8 @@ impl CompositorApp {
             // back to "whole buffer is visible".
             let (w, h, vis_x, vis_y) = if popup.geom_w > 0 && popup.geom_h > 0 {
                 (popup.geom_w, popup.geom_h, popup.geom_x, popup.geom_y)
-            } else if popup.w > 0 {
-                (popup.w, popup.h, 0, 0)
+            } else if geometry.size.w > 0 && geometry.size.h > 0 {
+                (geometry.size.w, geometry.size.h, 0, 0)
             } else {
                 (bw, bh, 0, 0)
             };

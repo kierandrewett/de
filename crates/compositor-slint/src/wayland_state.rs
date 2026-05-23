@@ -56,7 +56,7 @@ use smithay::{
             DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Serial},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial},
     wayland::{
         alpha_modifier::AlphaModifierState,
         buffer::BufferHandler,
@@ -253,9 +253,8 @@ pub struct ToplevelInfo {
 }
 
 /// A mapped xdg_popup — context menus, dropdowns, autocomplete, etc.
-/// Position is computed at `new_popup` time from the positioner, but the
-/// final compositor-space placement is resolved per-frame in `update_windows`
-/// (parent toplevel may have moved). Pixels are imported on each commit
+/// Compositor-space placement is resolved per-frame from Smithay's committed
+/// popup geometry plus the parent chain. Pixels are imported on each commit
 /// via the surface-tree composite (popups can have their own subsurfaces).
 #[derive(Debug, Clone)]
 pub struct PopupInfo {
@@ -263,11 +262,6 @@ pub struct PopupInfo {
     pub popup: smithay::wayland::shell::xdg::PopupSurface,
     /// Parent surface (toplevel OR another popup) — pop-up tree origin.
     pub parent: WlSurface,
-    /// Popup geometry rect relative to the parent surface (positioner output).
-    pub rel_x: i32,
-    pub rel_y: i32,
-    pub w: i32,
-    pub h: i32,
     /// Composited pixel buffer from the popup's surface tree (legacy
     /// path; kept for backdrop/screencopy parity with toplevels).
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
@@ -286,6 +280,12 @@ pub struct PopupInfo {
     pub geom_y: i32,
     pub geom_w: i32,
     pub geom_h: i32,
+}
+
+impl PopupInfo {
+    pub fn configured_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        self.popup.with_committed_state(|state| state.map(|state| state.geometry))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
