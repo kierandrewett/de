@@ -936,8 +936,7 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
         InputEvent::Keyboard { event } => {
             let surface = if state.session_locked {
                 state
-                    .lock_surfaces
-                    .first()
+                    .lock_surface_for_point(state.pointer_pos.0, state.pointer_pos.1)
                     .map(|li| li.surface.wl_surface().clone())
             } else {
                 state
@@ -1267,8 +1266,7 @@ fn surface_under_for_touch(
 )> {
     if state.session_locked {
         return state
-            .lock_surfaces
-            .first()
+            .lock_surface_for_point(x, y)
             .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0));
     }
     // Best-effort: the udev backend currently has no access to the WM's

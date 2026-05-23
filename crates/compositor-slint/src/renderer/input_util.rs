@@ -39,8 +39,7 @@ pub fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent
     // behind the lock — a textbook lock-screen bypass.
     let surface: Option<WlSurface> = if state.session_locked {
         state
-            .lock_surfaces
-            .first()
+            .lock_surface_for_point(state.pointer_pos.0, state.pointer_pos.1)
             .map(|li| li.surface.wl_surface().clone())
     } else {
         // A mapped Top/Overlay layer surface with

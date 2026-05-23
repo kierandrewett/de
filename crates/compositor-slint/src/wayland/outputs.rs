@@ -62,12 +62,12 @@ impl SpikeState {
         roots.extend(
             self.layer_surfaces
                 .iter()
-                .map(|layer| (layer.surface.wl_surface().clone(), output.clone())),
+                .map(|layer| (layer.surface.wl_surface().clone(), layer.output.clone())),
         );
         roots.extend(
             self.lock_surfaces
                 .iter()
-                .map(|lock| (lock.surface.wl_surface().clone(), output.clone())),
+                .map(|lock| (lock.surface.wl_surface().clone(), lock.output.clone())),
         );
         if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &self.cursor_status {
             roots.push((surface.clone(), output.clone()));

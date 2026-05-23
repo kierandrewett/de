@@ -2592,8 +2592,9 @@ impl CompositorApp {
                     .iter()
                     .find(|layer| layer.surface.wl_surface() == &cur_parent)
                 {
-                    abs_x += layer.x;
-                    abs_y += layer.y;
+                    let loc = layer.output.current_location();
+                    abs_x += loc.x + layer.x;
+                    abs_y += loc.y + layer.y;
                 }
                 break;
             }
@@ -3216,12 +3217,8 @@ impl CompositorApp {
             );
         }
 
-        // Maximize / unmaximize. Treat fullscreen identically — we have no
-        // separate fullscreen geometry yet; honour the protocol state but
-        // share the maximize geometry.
-        let mut max_actions: Vec<(WlSurface, bool)> =
-            state.pending_xdg_maximize.drain(..).collect();
-        max_actions.append(&mut state.pending_xdg_fullscreen);
+        // Maximize / unmaximize.
+        let max_actions: Vec<(WlSurface, bool)> = state.pending_xdg_maximize.drain(..).collect();
         for (surface, want_max) in max_actions {
             let Some(id) = self.wm.id_for_surface(&surface) else {
                 continue;
@@ -3245,6 +3242,53 @@ impl CompositorApp {
                 .find(|w| w.id == id)
                 .map(|w| (w.w, w.h))
                 .unwrap_or((800, 600));
+            self.send_configure(&surface, new_w, new_h, state);
+            state.update_reactive_popups_for_toplevel(&surface);
+        }
+
+        // Fullscreen requests carry an optional wl_output. Keep this as a
+        // separate path from maximize so a client targeting a secondary output
+        // gets that output's size instead of the primary work area. The WM
+        // still uses the maximize restore slot for now; a distinct fullscreen
+        // state remains a later H13 follow-up.
+        let fullscreen_actions: Vec<(WlSurface, bool)> =
+            state.pending_xdg_fullscreen.drain(..).collect();
+        for (surface, want_fullscreen) in fullscreen_actions {
+            let Some(id) = self.wm.id_for_surface(&surface) else {
+                continue;
+            };
+            let requested_output = state
+                .toplevels
+                .iter()
+                .find(|t| t.surface == surface)
+                .and_then(|t| t.toplevel.as_ref())
+                .and_then(|toplevel| toplevel.with_pending_state(|s| s.fullscreen_output.clone()));
+            let output = state
+                .resolve_wl_output(requested_output.as_ref())
+                .or_else(|| state.output_for_surface(&surface).cloned())
+                .or_else(|| state.primary_output().cloned());
+            let (target_w, target_h) = output
+                .as_ref()
+                .and_then(|output| state.output_logical_size(output))
+                .unwrap_or((self.wm.output_w, self.wm.output_h));
+            {
+                let win = match self.wm.windows.values_mut().find(|w| w.id == id) {
+                    Some(w) => w,
+                    None => continue,
+                };
+                if want_fullscreen && !win.maximized {
+                    win.start_maximize_in(target_w, target_h, 0, 0, 0, 0);
+                } else if !want_fullscreen && win.maximized {
+                    win.start_unmaximize();
+                }
+            }
+            let (new_w, new_h) = self
+                .wm
+                .windows
+                .values()
+                .find(|w| w.id == id)
+                .map(|w| (w.w, w.h))
+                .unwrap_or((target_w, target_h));
             self.send_configure(&surface, new_w, new_h, state);
             state.update_reactive_popups_for_toplevel(&surface);
         }
@@ -4676,7 +4720,8 @@ impl CompositorApp {
                 Layer::Top => 2,
                 Layer::Overlay => 3,
             };
-            layer_entries.push((index, id, li.x, li.y, li.w, li.h, ordinal));
+            let loc = li.output.current_location();
+            layer_entries.push((index, id, loc.x + li.x, loc.y + li.y, li.w, li.h, ordinal));
         }
 
         layer_entries.sort_by_key(|&(index, _, _, _, _, _, ordinal)| (ordinal, index));

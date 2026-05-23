@@ -52,7 +52,7 @@ use smithay::{
         calloop::{LoopHandle, LoopSignal},
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
-            protocol::{wl_buffer::WlBuffer, wl_shm, wl_surface::WlSurface},
+            protocol::{wl_buffer::WlBuffer, wl_output, wl_shm, wl_surface::WlSurface},
             Client, DisplayHandle, Resource,
         },
     },
@@ -124,7 +124,7 @@ use smithay::{
 };
 use tracing::{debug, info, warn};
 
-use crate::wayland::layer_shell::LayerInfo;
+use crate::wayland::layer_shell::{LayerInfo, OutputScopedState};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -318,11 +318,8 @@ pub struct DndIcon {
 #[derive(Clone)]
 pub struct LockSurfaceInfo {
     pub surface: smithay::wayland::session_lock::LockSurface,
-    /// The wl_output this lock surface is bound to. Stored so the per-output
-    /// multi-output story has the handle when it lands; currently read only
-    /// by session_lock.rs at construction time.
-    #[allow(dead_code)]
-    pub output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    /// The compositor output this lock surface covers.
+    pub output: Output,
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
 }
 
@@ -485,6 +482,12 @@ pub struct SpikeState {
     /// one virtual output; the udev backend will populate this from DRM
     /// connectors and keep `output` as the primary/output-0 compatibility shim.
     pub outputs: Vec<Output>,
+    /// Output-scoped compositor state that must not be global in a
+    /// multi-monitor session. This is the data-model bridge for the current
+    /// Slint renderer: each output gets its own work-area reservations now,
+    /// and render/backend code can plug multiple swapchains into the same
+    /// keyed state later.
+    pub output_scopes: Vec<OutputScopedState>,
 
     /// Currently-focused xdg toplevel surface.
     pub active_surface: Option<WlSurface>,
@@ -787,6 +790,7 @@ impl SpikeState {
             lock_surfaces: Vec::new(),
             output: None,
             outputs: Vec::new(),
+            output_scopes: Vec::new(),
             active_surface: None,
             dnd_icon: None,
             dnd_icon_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
@@ -1104,12 +1108,16 @@ impl SpikeState {
             self.output = Some(output.clone());
         }
         if !self.outputs.iter().any(|existing| existing == &output) {
-            self.outputs.push(output);
+            self.outputs.push(output.clone());
+        }
+        if !self.output_scopes.iter().any(|scope| scope.output == output) {
+            self.output_scopes.push(OutputScopedState::new(output));
         }
     }
 
     pub fn unregister_output(&mut self, output: &Output) {
         self.outputs.retain(|existing| existing != output);
+        self.output_scopes.retain(|scope| &scope.output != output);
         if self.output.as_ref() == Some(output) {
             self.output = self.outputs.first().cloned();
         }
@@ -1117,6 +1125,44 @@ impl SpikeState {
 
     pub fn primary_output(&self) -> Option<&Output> {
         self.output.as_ref().or_else(|| self.outputs.first())
+    }
+
+    pub fn resolve_wl_output(&self, wl_output: Option<&wl_output::WlOutput>) -> Option<Output> {
+        wl_output
+            .and_then(Output::from_resource)
+            .and_then(|resolved| {
+                self.outputs
+                    .iter()
+                    .find(|output| **output == resolved)
+                    .cloned()
+            })
+            .or_else(|| self.primary_output().cloned())
+    }
+
+    pub fn output_logical_size(&self, output: &Output) -> Option<(i32, i32)> {
+        let mode = output.current_mode()?;
+        let scale = output.current_scale().fractional_scale();
+        Some((
+            (mode.size.w as f64 / scale).max(1.0) as i32,
+            (mode.size.h as f64 / scale).max(1.0) as i32,
+        ))
+    }
+
+    pub fn output_contains_point(&self, output: &Output, x: f64, y: f64) -> bool {
+        let Some((w, h)) = self.output_logical_size(output) else {
+            return false;
+        };
+        let loc = output.current_location();
+        let x = x as i32;
+        let y = y as i32;
+        x >= loc.x && y >= loc.y && x < loc.x + w && y < loc.y + h
+    }
+
+    pub fn lock_surface_for_point(&self, x: f64, y: f64) -> Option<&LockSurfaceInfo> {
+        self.lock_surfaces
+            .iter()
+            .find(|lock| self.output_contains_point(&lock.output, x, y))
+            .or_else(|| self.lock_surfaces.first())
     }
 
     /// Find the output currently hosting this exact surface tree.
