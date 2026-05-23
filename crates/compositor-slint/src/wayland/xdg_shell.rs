@@ -289,11 +289,10 @@ impl XdgShellHandler for SpikeState {
         // Mirror the acknowledged decoration mode into our ToplevelInfo so
         // the renderer's SSD/CSD decision is protocol-authoritative — not
         // a heuristic on the buffer. Anvil does the same (anvil/shell/xdg.rs).
-        // The other configure state (size, maximized, fullscreen…) is
-        // already cached by smithay; we don't have a resize-grab state
-        // machine to advance here (the renderer drives drag-resize and
-        // treats the next commit as confirmation), so this is the only
-        // thing we need to mirror.
+        // Resize release uses a compositor-side transaction: the renderer
+        // records the final configure serial when button-up clears Resizing,
+        // this handler advances only when that exact serial is acked, and the
+        // commit hook clears the transaction on the following commit.
         if let Configure::Toplevel(cfg) = configure {
             self.ack_xdg_resize_transaction(&surface, cfg.serial);
             if let Some(mode) = cfg.state.decoration_mode {
