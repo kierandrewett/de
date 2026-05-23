@@ -3026,6 +3026,7 @@ impl CompositorApp {
                 .unwrap_or((None, false));
             if let Some(surf) = surface {
                 self.send_configure(&surf, new_w, new_h, state);
+                state.update_reactive_popups_for_toplevel(&surf);
                 // Mirror to X11. We don't try to gate on "is this an X11
                 // window" — the helper does that and is a no-op otherwise.
                 self.sync_x11_window_state(&surf, state, Some(now_max), None, None);
@@ -3236,6 +3237,7 @@ impl CompositorApp {
                 .map(|w| (w.w, w.h))
                 .unwrap_or((800, 600));
             self.send_configure(&surface, new_w, new_h, state);
+            state.update_reactive_popups_for_toplevel(&surface);
         }
 
         // Minimize
@@ -4131,10 +4133,12 @@ impl CompositorApp {
                             }
                         }
 
+                        let mut reactive_popup_parent = None;
                         if let Some(tl) = state.toplevels.get_mut(*toplevel_idx) {
                             tl.x = nx;
                             tl.y = ny;
                             let surface = tl.surface.clone();
+                            reactive_popup_parent = Some(surface.clone());
                             // Honour the client's declared min/max size
                             // (xdg_toplevel.set_min_size / set_max_size).
                             // Without this, the user can force GTK clients
@@ -4213,6 +4217,9 @@ impl CompositorApp {
                                 self.wm.set_geometry_by_id(wm_id, nx, ny, cw, ch);
                             }
                         }
+                        if let Some(surface) = reactive_popup_parent {
+                            state.update_reactive_popups_for_toplevel(&surface);
+                        }
                     }
                     self.update_windows(state);
                     if let Some(gpu_window) = self.gpu_window.as_ref() {
@@ -4289,6 +4296,7 @@ impl CompositorApp {
                                         None,
                                         None,
                                     );
+                                    state.update_reactive_popups_for_toplevel(&surface);
                                     if let Some(ActiveDrag::Move {
                                         offset_x,
                                         offset_y,
@@ -4314,6 +4322,7 @@ impl CompositorApp {
                     }
 
                     let mut maybe_wm_id: Option<i32> = None;
+                    let mut reactive_popup_parent = None;
                     if let Some(tl) = state.toplevels.get_mut(*toplevel_idx) {
                         let nx = (x - ox) as i32;
                         // Clamp y so the window's titlebar can't slide under
@@ -4332,11 +4341,15 @@ impl CompositorApp {
                         tl.x = nx;
                         tl.y = ny;
                         let surface = tl.surface.clone();
+                        reactive_popup_parent = Some(surface.clone());
                         if let Some(wm_id) = self.wm.id_for_surface(&surface) {
                             self.wm.set_position_by_id(wm_id, nx, ny);
                             maybe_wm_id = Some(wm_id);
                         }
                         debug!("move: window #{} to ({},{})", toplevel_idx, nx, ny);
+                    }
+                    if let Some(surface) = reactive_popup_parent {
+                        state.update_reactive_popups_for_toplevel(&surface);
                     }
 
                     // Snap detection — show preview if cursor is in an edge band.
@@ -4824,6 +4837,7 @@ impl CompositorApp {
                 tl_mut.x = new_x;
                 tl_mut.y = new_y;
             }
+            state.update_reactive_popups_for_toplevel(&surface);
             let maybe_ts = state
                 .xdg_shell_state
                 .toplevel_surfaces()
@@ -4965,6 +4979,7 @@ impl CompositorApp {
                         tl.x = x;
                         tl.y = y;
                     }
+                    state.update_reactive_popups_for_toplevel(&surf);
                 }
                 if let Some(gw) = self.gpu_window.as_ref() {
                     gw.mark_dirty();
@@ -5001,6 +5016,7 @@ impl CompositorApp {
                         );
                         toplevel.send_configure();
                     }
+                    state.update_reactive_popups_for_toplevel(&surf);
                 }
                 if let Some(gw) = self.gpu_window.as_ref() {
                     gw.mark_dirty();
@@ -5242,6 +5258,7 @@ impl CompositorApp {
                 break;
             }
         }
+        state.update_reactive_popups_for_toplevel(&surface);
         if let Some(gpu_window) = self.gpu_window.as_ref() {
             gpu_window.mark_dirty();
         }

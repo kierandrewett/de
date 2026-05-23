@@ -867,6 +867,31 @@ impl SpikeState {
         });
     }
 
+    /// Reconfigure reactive xdg popups rooted under `toplevel` after the
+    /// parent toplevel's compositor geometry changes. Mirrors cosmic-comp's
+    /// update_reactive_popups pass: only popups whose last acknowledged
+    /// positioner is reactive are reconstrained and configured.
+    pub fn update_reactive_popups_for_toplevel(&self, toplevel: &WlSurface) {
+        use smithay::desktop::{PopupKind, PopupManager};
+
+        for (popup, _) in PopupManager::popups_for_surface(toplevel) {
+            let PopupKind::Xdg(surface) = popup else {
+                continue;
+            };
+            let reactive = surface.with_committed_state(|state| {
+                state.is_some_and(|state| state.positioner.reactive)
+            });
+            if !reactive {
+                continue;
+            }
+
+            self.unconstrain_popup(&surface);
+            if let Err(err) = surface.send_configure() {
+                warn!(?err, "failed to configure reactive popup after parent geometry change");
+            }
+        }
+    }
+
     pub fn begin_xdg_resize_transaction(&mut self, surface: WlSurface, final_serial: Serial) {
         self.xdg_resize_transactions
             .retain(|tx| tx.surface != surface);
