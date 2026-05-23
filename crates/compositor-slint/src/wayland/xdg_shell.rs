@@ -186,6 +186,8 @@ impl XdgShellHandler for SpikeState {
 
         // Push to destroyed_surfaces so the WM can start a close animation.
         self.destroyed_surfaces.push(wl.clone());
+        self.xdg_resize_transactions
+            .retain(|tx| tx.surface != *wl);
 
         // Keep the toplevel in `self.toplevels` until the WM close animation
         // finishes — update_windows will remove it via sweep_closed.
@@ -293,6 +295,7 @@ impl XdgShellHandler for SpikeState {
         // treats the next commit as confirmation), so this is the only
         // thing we need to mirror.
         if let Configure::Toplevel(cfg) = configure {
+            self.ack_xdg_resize_transaction(&surface, cfg.serial);
             if let Some(mode) = cfg.state.decoration_mode {
                 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
                 let csd = matches!(mode, Mode::ClientSide);

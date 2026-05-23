@@ -1918,6 +1918,7 @@ impl CompositorApp {
             // true; both papered over the real defect — decoration
             // negotiation wasn't authoritative — and could mis-classify
             // windows in either direction.)
+            let has_resize_transaction = state.has_pending_xdg_resize_transaction(&tl.surface);
             metas.push(ToplevelMeta {
                 surface: tl.surface.clone(),
                 gx,
@@ -1928,7 +1929,7 @@ impl CompositorApp {
                 bh,
                 csd_now: tl.csd,
                 csd_verdict: tl.csd,
-                is_resizing: Some(i) == resizing_idx,
+                is_resizing: Some(i) == resizing_idx || has_resize_transaction,
                 app_id,
             });
         }
@@ -2219,13 +2220,15 @@ impl CompositorApp {
                 corner_radius: win.anim.corner_radius.value() as f32,
                 // Resizing = geometry springs mid-flight (maximize /
                 // unmaximize) OR this window is being interactively
-                // drag-resized. Drives the stretched-texture render path.
+                // drag-resized / waiting for the final resize commit. Drives
+                // the stretched-texture render path.
                 resizing: !win.anim.geo_w.is_done()
                     || !win.anim.geo_h.is_done()
                     || resizing_idx
                         .and_then(|i| state.toplevels.get(i))
                         .map(|t| t.surface == win.surface)
-                        .unwrap_or(false),
+                        .unwrap_or(false)
+                    || state.has_pending_xdg_resize_transaction(&win.surface),
             });
         }
 
@@ -4759,7 +4762,8 @@ impl CompositorApp {
                                 s.states.unset(xdg_toplevel::State::Resizing);
                             },
                         );
-                        toplevel.send_configure();
+                        let serial = toplevel.send_configure();
+                        state.begin_xdg_resize_transaction(surface.clone(), serial);
                         debug!("resize-end configure: {}×{} (Resizing cleared)", cw, ch);
                     }
                 }

@@ -288,6 +288,19 @@ pub struct PopupInfo {
     pub geom_h: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdgResizeTransactionPhase {
+    WaitingForFinalAck,
+    WaitingForCommit,
+}
+
+#[derive(Debug, Clone)]
+pub struct XdgResizeTransaction {
+    pub surface: WlSurface,
+    pub final_serial: Serial,
+    pub phase: XdgResizeTransactionPhase,
+}
+
 /// Active drag-and-drop icon surface paired with the accumulated buffer
 /// offset (the hotspot, in logical pixels). Each commit on the icon
 /// surface adds the freshly-set `wl_surface.offset` (a.k.a. buffer_delta)
@@ -525,6 +538,12 @@ pub struct SpikeState {
     /// XwmHandler `unminimize_request`. xdg-shell has no client-driven
     /// unminimize so this queue is X11-only.
     pub pending_xdg_restore: Vec<WlSurface>,
+    /// Interactive xdg resize handshakes after pointer release. The final
+    /// non-Resizing configure must be acked, then committed, before ordinary
+    /// buffer commits are allowed to drive WM geometry again. This prevents
+    /// an older in-flight resize configure from snapping the window back after
+    /// button-up.
+    pub xdg_resize_transactions: Vec<XdgResizeTransaction>,
     /// Set by `xdg-system-bell-v1::ring` — the renderer's per-frame tick
     /// drains it and starts a brief flash animation on the targeted
     /// window's chrome. `None` between bells.
@@ -764,6 +783,7 @@ impl SpikeState {
             pending_xdg_fullscreen: Vec::new(),
             pending_xdg_minimize: Vec::new(),
             pending_xdg_restore: Vec::new(),
+            xdg_resize_transactions: Vec::new(),
             pending_bell: None,
             should_exit: false,
             pointer_pos: (0.0, 0.0),
@@ -845,6 +865,45 @@ impl SpikeState {
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+
+    pub fn begin_xdg_resize_transaction(&mut self, surface: WlSurface, final_serial: Serial) {
+        self.xdg_resize_transactions
+            .retain(|tx| tx.surface != surface);
+        self.xdg_resize_transactions.push(XdgResizeTransaction {
+            surface,
+            final_serial,
+            phase: XdgResizeTransactionPhase::WaitingForFinalAck,
+        });
+    }
+
+    pub fn ack_xdg_resize_transaction(&mut self, surface: &WlSurface, serial: Serial) {
+        let Some(tx) = self
+            .xdg_resize_transactions
+            .iter_mut()
+            .find(|tx| &tx.surface == surface)
+        else {
+            return;
+        };
+        if tx.phase == XdgResizeTransactionPhase::WaitingForFinalAck && tx.final_serial == serial {
+            tx.phase = XdgResizeTransactionPhase::WaitingForCommit;
+        }
+    }
+
+    pub fn finish_xdg_resize_transaction_commit(&mut self, surface: &WlSurface) -> bool {
+        let Some(index) = self.xdg_resize_transactions.iter().position(|tx| {
+            &tx.surface == surface && tx.phase == XdgResizeTransactionPhase::WaitingForCommit
+        }) else {
+            return false;
+        };
+        self.xdg_resize_transactions.remove(index);
+        true
+    }
+
+    pub fn has_pending_xdg_resize_transaction(&self, surface: &WlSurface) -> bool {
+        self.xdg_resize_transactions
+            .iter()
+            .any(|tx| &tx.surface == surface)
     }
 
     /// Validate that a client-supplied `serial` corresponds to a real

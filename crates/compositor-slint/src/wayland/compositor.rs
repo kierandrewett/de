@@ -477,6 +477,12 @@ impl CompositorHandler for SpikeState {
                     };
                 }
             }
+
+            if self.finish_xdg_resize_transaction_commit(surface) {
+                debug!(
+                    "resize transaction complete: final configure acked and committed"
+                );
+            }
         }
     }
 }
