@@ -145,15 +145,14 @@ impl WlrLayerShellHandler for SpikeState {
             return;
         }
 
-        let geom = popup.with_pending_state(|state| state.geometry);
+        // H19 made PopupInfo geometry derive from smithay's popup state
+        // every frame rather than snapshotting `rel_x/rel_y/w/h` at
+        // construction; the layer-shell new_popup path goes through the
+        // same model, so we no longer initialise those fields here.
         self.popups.push(crate::wayland_state::PopupInfo {
             surface: popup.wl_surface().clone(),
             popup,
             parent: parent.wl_surface().clone(),
-            rel_x: geom.loc.x,
-            rel_y: geom.loc.y,
-            w: geom.size.w,
-            h: geom.size.h,
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             geom_x: 0,
