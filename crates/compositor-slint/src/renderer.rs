@@ -351,13 +351,6 @@ struct CompositorApp {
     /// in the main loop on each iteration.
     pending_ipc: PendingIpc,
 
-    /// Monotonic timestamp captured immediately after `frame.present()`. Read
-    /// (and cleared) by the main loop body to fire wp_presentation_feedback
-    /// `presented` events. None until the first frame has been presented.
-    /// We can't fire `presented` from inside `render_frame` directly because
-    /// SpikeState isn't reachable there.
-    last_present_time: Option<smithay::utils::Time<smithay::utils::Monotonic>>,
-
     /// Snapshot of the active DnD icon's pixels + cursor pos. Refreshed each
     /// `update_windows` (where we have `state`); consumed by `render_frame`
     /// (which doesn't). `None` when no DnD is active or the icon hasn't yet
@@ -532,7 +525,6 @@ impl CompositorApp {
             frame_times_model: Rc::new(VecModel::default()),
             pending_snap: None,
             pending_ipc: Arc::new(Mutex::new(Vec::new())),
-            last_present_time: None,
             dnd_icon_snapshot: None,
             pending_output_scale: None,
             pending_output_mode: None,
@@ -6641,76 +6633,6 @@ pub fn run() -> Result<()> {
         app.update_layers(&mut state);
         // ── END layer-shell layout block ───────────────────────────────────
 
-        // Visibility gate: only frame-callback surfaces the renderer
-        // actually consumed this frame. Anvil derives this from the
-        // damage tracker's RenderOutputResult.states; without one we use
-        // "windows the WM considers mapped + non-minimised + non-closing
-        // AND with a non-zero client buffer", plus all layer surfaces
-        // (always visible if mapped). Without this gate every mapped
-        // client gets driven at full output framerate even when invisible.
-        let mut visible_surfaces: Vec<WlSurface> = Vec::with_capacity(
-            app.wm.windows.len() + state.layer_surfaces.len() + state.popups.len(),
-        );
-        for win in app.wm.windows_sorted() {
-            if win.minimized || win.closing {
-                continue;
-            }
-            if let Some(tl) = state.toplevels.iter().find(|t| t.surface == win.surface) {
-                let (bw, bh) = {
-                    let p = tl.pixels.lock().unwrap();
-                    (p.width, p.height)
-                };
-                if bw == 0 || bh == 0 {
-                    continue;
-                }
-                visible_surfaces.push(tl.surface.clone());
-            }
-        }
-        for li in &state.layer_surfaces {
-            visible_surfaces.push(li.surface.wl_surface().clone());
-        }
-        // Popups need wl_surface.frame callbacks too — without them the
-        // client never commits a buffer for the popup, which is why GTK
-        // context menus appeared to "not show". Include popups
-        // unconditionally; smithay's send_frame_callbacks skips surfaces
-        // with no pending callbacks so the cost is a free walk.
-        for popup in &state.popups {
-            visible_surfaces.push(popup.surface.clone());
-        }
-        // X11 override-redirect surfaces also need frame callbacks. They live
-        // in state.toplevels but aren't tracked by WindowManager (we treat
-        // them as popups in the render path), so the wm.windows loop above
-        // misses them.
-        for tl in &state.toplevels {
-            if tl
-                .x11_surface
-                .as_ref()
-                .and_then(|x| {
-                    x.user_data()
-                        .get::<crate::wayland::xwayland::X11OverrideRedirect>()
-                })
-                .is_some()
-            {
-                visible_surfaces.push(tl.surface.clone());
-            }
-        }
-
-        state.send_frame_callbacks_for(&output, &visible_surfaces);
-
-        // wp_presentation_feedback: fire `presented` with the timestamp
-        // captured immediately after `frame.present()`. Skip if no frame
-        // has presented yet this run (first iteration).
-        if let Some(present_time) = app.last_present_time.take() {
-            state.send_presentation_feedback_for(
-                &output,
-                &visible_surfaces,
-                present_time,
-                app.frame_count,
-            );
-        }
-
-        state.pre_render_drive_clients();
-
         state.display_handle.flush_clients().ok();
         slint::platform::update_timers_and_animations();
 
@@ -6721,11 +6643,6 @@ pub fn run() -> Result<()> {
         app.process_wm_actions(&mut state);
 
         app.update_client_texture(&mut state);
-        // Service ext-image-copy-capture-v1 frames the calloop dispatch above
-        // queued. Has to run AFTER render_frame (which already happened in
-        // pump_app_events) so the readback samples the just-presented
-        // final_tex, not the previous frame's contents.
-        app.process_capture_frames(&mut state);
         app.update_dock_running(&state);
         // Throttled CPU backdrop synth (samples wallpaper + window content).
         app.refresh_backdrop(&state);
@@ -6817,6 +6734,28 @@ pub fn run() -> Result<()> {
                         app.forward_pointer_axis(&mut state, dx, dy, discrete_v120, is_wheel);
                     }
                 }
+            }
+        }
+
+        state.pre_render_drive_clients();
+        let damage_report = app.prepare_frame_damage(&state, &output);
+        if damage_report.damaged {
+            if let Some(presented) = app.render_frame() {
+                state.send_frame_callbacks_for_render_state(
+                    &output,
+                    &damage_report.surfaces,
+                    &damage_report.states,
+                );
+                state.send_presentation_feedback_for_render_state(
+                    &output,
+                    &damage_report.surfaces,
+                    &damage_report.states,
+                    presented.time,
+                    presented.sequence,
+                );
+                // Service ext-image-copy-capture-v1 frames after the render so
+                // readback samples the frame that just reached final_tex.
+                app.process_capture_frames(&mut state);
             }
         }
 
