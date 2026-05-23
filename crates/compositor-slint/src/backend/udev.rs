@@ -369,6 +369,9 @@ impl UdevRuntime {
         }
 
         for device in &mut self.drm_devices {
+            // TODO(kms): If activation fails, close and reopen the device through
+            // libseat, then rebuild render resources. COSMIC's `reopen_device`
+            // path is the reference for that full recovery step.
             device.drm.activate(false).map_err(|err| {
                 anyhow::anyhow!(
                     "failed to reactivate DRM device {} after session resume: {err:?}",
@@ -391,6 +394,9 @@ impl UdevRuntime {
             "udev backend: Wayland event loop running; KMS rendering remains TODO"
         );
 
+        // TODO(kms): Replace this dispatch-only loop with persistent
+        // `DrmOutputManager`/`DrmOutput` rendering, page-flip completion, frame
+        // callbacks, and output-local presentation feedback.
         while !self.wayland.state.should_exit {
             self.drain_session_events()?;
             self.drain_hotplug_events()?;
@@ -463,6 +469,10 @@ impl UdevRuntime {
         };
 
         let output_offset = self.wayland.state.outputs.len();
+        // TODO(hotplug): Replace the lightweight connector rescan with
+        // `DrmScanner` plus atomic test/apply once the backend owns durable
+        // `DrmOutput` state. This path intentionally only reconciles probe-time
+        // Wayland output bookkeeping.
         let new_outputs = Self::select_kms_outputs(&self.drm_devices[index].drm, output_offset)?;
         let mut device = self.drm_devices.remove(index);
         self.reconcile_drm_outputs(&mut device, new_outputs);
