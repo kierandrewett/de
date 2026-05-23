@@ -403,7 +403,9 @@ impl UdevRuntime {
             self.wayland
                 .event_loop
                 .dispatch(Some(Duration::from_millis(16)), &mut self.wayland.state)
-                .map_err(|err| anyhow::anyhow!("udev backend event loop dispatch failed: {err:?}"))?;
+                .map_err(|err| {
+                    anyhow::anyhow!("udev backend event loop dispatch failed: {err:?}")
+                })?;
             self.drain_session_events()?;
             self.drain_hotplug_events()?;
             if let Err(err) = self.wayland.display_handle.flush_clients() {
@@ -424,7 +426,7 @@ impl UdevRuntime {
         if output.global.is_none() {
             output.global = Some(
                 output
-                .output
+                    .output
                     .create_global::<SpikeState>(&self.wayland.display_handle),
             );
         }
@@ -459,7 +461,10 @@ impl UdevRuntime {
             .iter()
             .position(|device| device.node.dev_id() == device_id)
         else {
-            warn!(?device_id, "udev backend: change event for unknown DRM device");
+            warn!(
+                ?device_id,
+                "udev backend: change event for unknown DRM device"
+            );
             return Ok(());
         };
 
@@ -518,7 +523,10 @@ impl UdevRuntime {
             .iter()
             .position(|device| device.node.dev_id() == device_id)
         else {
-            warn!(?device_id, "udev backend: remove event for unknown DRM device");
+            warn!(
+                ?device_id,
+                "udev backend: remove event for unknown DRM device"
+            );
             return;
         };
 
@@ -526,7 +534,10 @@ impl UdevRuntime {
         for output in &mut device.outputs {
             self.unregister_wayland_output(output);
         }
-        self.wayland.event_loop.handle().remove(device.registration_token);
+        self.wayland
+            .event_loop
+            .handle()
+            .remove(device.registration_token);
         info!(
             node = ?device.node,
             path = %device.path.display(),
@@ -743,7 +754,8 @@ impl UdevRuntime {
                 "udev backend: selected KMS output candidate"
             );
 
-            let output = Self::create_wayland_output(&connector, mode, output_offset + outputs.len());
+            let output =
+                Self::create_wayland_output(&connector, mode, output_offset + outputs.len());
 
             outputs.push(KmsProbeOutput {
                 connector: connector.handle(),

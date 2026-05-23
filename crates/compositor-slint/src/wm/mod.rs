@@ -900,10 +900,14 @@ impl WindowManager {
             // shadow padding) + our titlebar for SSD.
             let total_w = win.geom_w.max(1) as f64;
             let total_h = win.geom_h.max(1) as f64 + if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
-            if x >= wx && x < wx + total_w && y >= wy && y < wy + total_h
-                && best.is_none_or(|(_, z)| win.z_order > z) {
-                    best = Some((key, win.z_order));
-                }
+            if x >= wx
+                && x < wx + total_w
+                && y >= wy
+                && y < wy + total_h
+                && best.is_none_or(|(_, z)| win.z_order > z)
+            {
+                best = Some((key, win.z_order));
+            }
         }
         if let Some((key, _)) = best {
             let new_z = self.next_z;
@@ -1125,10 +1129,14 @@ impl WindowManager {
             let ww = win.geom_w.max(1) as f64;
             let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
             let wh = win.geom_h.max(1) as f64 + titlebar;
-            if x >= wx && x < wx + ww && y >= wy && y < wy + wh
-                && best.is_none_or(|(_, z)| win.z_order > z) {
-                    best = Some((key, win.z_order));
-                }
+            if x >= wx
+                && x < wx + ww
+                && y >= wy
+                && y < wy + wh
+                && best.is_none_or(|(_, z)| win.z_order > z)
+            {
+                best = Some((key, win.z_order));
+            }
         }
         let (key, _) = best?;
         let win = self.windows.get(&key)?;

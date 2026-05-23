@@ -16,9 +16,7 @@ use smithay::reexports::wayland_server::{
 };
 use wayland_server::backend::GlobalId;
 
-use crate::wayland::appmenu_protocol::org_kde_kwin_appmenu::{
-    self, OrgKdeKwinAppmenu,
-};
+use crate::wayland::appmenu_protocol::org_kde_kwin_appmenu::{self, OrgKdeKwinAppmenu};
 use crate::wayland::appmenu_protocol::org_kde_kwin_appmenu_manager::{
     self, OrgKdeKwinAppmenuManager,
 };

@@ -88,8 +88,7 @@ impl CompositorApp {
                 if lx < 0.0 || ly < 0.0 || lx >= li.w as f64 || ly >= li.h as f64 {
                     continue;
                 }
-                let origin =
-                    Point::<i32, smithay::utils::Logical>::from((li.x, li.y));
+                let origin = Point::<i32, smithay::utils::Logical>::from((li.x, li.y));
                 if let Some((surface, sub_origin)) = under_from_surface_tree(
                     li.surface.wl_surface(),
                     Point::from((x, y)),
@@ -98,11 +97,7 @@ impl CompositorApp {
                 ) {
                     return Some((surface, sub_origin.x as f64, sub_origin.y as f64));
                 }
-                return Some((
-                    li.surface.wl_surface().clone(),
-                    li.x as f64,
-                    li.y as f64,
-                ));
+                return Some((li.surface.wl_surface().clone(), li.x as f64, li.y as f64));
             }
         }
         None
@@ -130,9 +125,7 @@ impl CompositorApp {
         self.popup_surface_under(state, x, y)
             .or_else(|| self.layer_surface_under(state, x, y, &[Layer::Overlay, Layer::Top]))
             .or_else(|| self.wm.surface_under(x, y))
-            .or_else(|| {
-                self.layer_surface_under(state, x, y, &[Layer::Bottom, Layer::Background])
-            })
+            .or_else(|| self.layer_surface_under(state, x, y, &[Layer::Bottom, Layer::Background]))
     }
 
     pub(super) fn popup_surface_under(
