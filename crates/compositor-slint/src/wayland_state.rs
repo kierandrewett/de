@@ -1119,23 +1119,19 @@ impl SpikeState {
         self.output.as_ref().or_else(|| self.outputs.first())
     }
 
-    /// Find the Output most likely "hosting" a surface, by checking which
-    /// outputs the surface has entered (sent via `wl_surface.enter`).
-    /// Returns `None` if the surface hasn't entered any of our outputs yet.
-    /// Used by multi-output paths (fractional-scale, future per-output
-    /// frame callbacks) so we don't blindly use the primary output's scale
-    /// for surfaces living on a secondary monitor.
+    /// Find the output currently hosting this exact surface tree.
+    ///
+    /// This deliberately uses the per-surface output map populated by
+    /// `refresh_surface_outputs`, not `Output::client_outputs()`. A client can
+    /// have windows on multiple monitors, so client-level wl_output resources
+    /// are not enough to select the scale for a specific `wl_surface`.
     pub fn output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
-        use smithay::reexports::wayland_server::Resource;
-        let client = surface.client()?;
-        for out in &self.outputs {
-            let entered: Vec<_> = out.client_outputs(&client).collect();
-            if !entered.is_empty() {
-                // Heuristic: any client_output for this client on this
-                // Output means the client has wl_outputs bound — good
-                // enough until we have real per-surface enter tracking.
-                return Some(out);
+        let mut current = Some(surface.clone());
+        while let Some(candidate) = current {
+            if let Some(output) = self.surface_outputs.get(&candidate.id()) {
+                return Some(output);
             }
+            current = smithay::wayland::compositor::get_parent(&candidate);
         }
         None
     }
