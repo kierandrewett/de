@@ -551,10 +551,10 @@ pub struct SpikeState {
     /// `unset_maximized`. The renderer applies via `WindowManager::start_maximize`
     /// / `start_unmaximize` and replies with a configure carrying the new state.
     pub pending_xdg_maximize: Vec<(WlSurface, bool)>,
-    /// `(surface, want_fullscreen)` from `set_fullscreen` / `unset_fullscreen`.
-    /// We treat fullscreen identically to maximize for now (no per-output
-    /// targeting yet) but report the protocol state honestly.
-    pub pending_xdg_fullscreen: Vec<(WlSurface, bool)>,
+    /// `(surface, want_fullscreen, requested_output_name)` from
+    /// `set_fullscreen` / `unset_fullscreen`. The renderer applies this via
+    /// the WM fullscreen state, distinct from maximise.
+    pub pending_xdg_fullscreen: Vec<(WlSurface, bool, Option<String>)>,
     /// Toplevel surfaces whose client called `xdg_toplevel.set_minimized`.
     pub pending_xdg_minimize: Vec<WlSurface>,
     /// Symmetric to `pending_xdg_minimize` but for restore — pushed by the

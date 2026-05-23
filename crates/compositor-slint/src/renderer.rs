@@ -2255,8 +2255,8 @@ impl CompositorApp {
                 geom_y,
                 geom_w,
                 geom_h,
-                csd: toplevel.csd,
-                maximized: win.maximized,
+                csd: toplevel.csd || win.fullscreen,
+                maximized: win.maximized || win.fullscreen,
                 // Spring-animated outer corner radius (logical px) — eased
                 // between the themed radius and 0 across a maximize.
                 corner_radius: win.anim.corner_radius.value() as f32,
@@ -3212,7 +3212,7 @@ impl CompositorApp {
                 .wm
                 .id_for_surface(&surface)
                 .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                .is_some_and(|w| w.maximized);
+                .is_some_and(|w| w.maximized || w.fullscreen);
             let t = &state.toplevels[idx];
             self.active_drag = Some(ActiveDrag::Move {
                 toplevel_idx: idx,
@@ -3298,14 +3298,11 @@ impl CompositorApp {
             state.update_reactive_popups_for_toplevel(&surface);
         }
 
-        // Fullscreen requests carry an optional wl_output. Keep this as a
-        // separate path from maximize so a client targeting a secondary output
-        // gets that output's size instead of the primary work area. The WM
-        // still uses the maximize restore slot for now; a distinct fullscreen
-        // state remains a later H13 follow-up.
-        let fullscreen_actions: Vec<(WlSurface, bool)> =
+        // Fullscreen / unfullscreen is distinct from maximise: it owns the
+        // whole requested output and restores the previous maximise state on exit.
+        let fullscreen_actions: Vec<(WlSurface, bool, Option<String>)> =
             state.pending_xdg_fullscreen.drain(..).collect();
-        for (surface, want_fullscreen) in fullscreen_actions {
+        for (surface, want_fullscreen, output_name) in fullscreen_actions {
             let Some(id) = self.wm.id_for_surface(&surface) else {
                 continue;
             };
@@ -3319,19 +3316,25 @@ impl CompositorApp {
                 .resolve_wl_output(requested_output.as_ref())
                 .or_else(|| state.output_for_surface(&surface).cloned())
                 .or_else(|| state.primary_output().cloned());
-            let (target_w, target_h) = output
+            let (target_x, target_y, target_w, target_h) = output
                 .as_ref()
-                .and_then(|output| state.output_logical_size(output))
-                .unwrap_or((self.wm.output_w, self.wm.output_h));
+                .map(|output| {
+                    let loc = output.current_location();
+                    let (w, h) = state
+                        .output_logical_size(output)
+                        .unwrap_or((self.wm.output_w, self.wm.output_h));
+                    (loc.x, loc.y, w, h)
+                })
+                .unwrap_or((0, 0, self.wm.output_w, self.wm.output_h));
             {
                 let win = match self.wm.windows.values_mut().find(|w| w.id == id) {
                     Some(w) => w,
                     None => continue,
                 };
-                if want_fullscreen && !win.maximized {
-                    win.start_maximize_in(target_w, target_h, 0, 0, 0, 0);
-                } else if !want_fullscreen && win.maximized {
-                    win.start_unmaximize();
+                if want_fullscreen {
+                    win.start_fullscreen(target_x, target_y, target_w, target_h, output_name);
+                } else if win.fullscreen {
+                    win.start_unfullscreen();
                 }
             }
             let (new_w, new_h) = self
@@ -3342,6 +3345,7 @@ impl CompositorApp {
                 .map(|w| (w.w, w.h))
                 .unwrap_or((target_w, target_h));
             self.send_configure(&surface, new_w, new_h, state);
+            self.sync_x11_window_state(&surface, state, None, Some(want_fullscreen), None);
             state.update_reactive_popups_for_toplevel(&surface);
         }
 
@@ -3966,7 +3970,11 @@ impl CompositorApp {
             else {
                 continue;
             };
-            let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let titlebar = if win.csd || win.fullscreen {
+                0.0
+            } else {
+                TITLEBAR_HEIGHT
+            };
             rects.push(WindowRect {
                 id: idx as i32,
                 x: win.anim.current_x() as f64,
@@ -3996,7 +4004,11 @@ impl CompositorApp {
             let wx = win.anim.current_x() as f64;
             let wy = win.anim.current_y() as f64;
             let ww = win.geom_w.max(1) as f64;
-            let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let titlebar = if win.csd || win.fullscreen {
+                0.0
+            } else {
+                TITLEBAR_HEIGHT
+            };
             let wh = win.geom_h.max(1) as f64 + titlebar;
             if ptr_x >= wx - cursor::EDGE_ZONE
                 && ptr_x < wx + ww + cursor::EDGE_ZONE
@@ -4364,7 +4376,7 @@ impl CompositorApp {
                 .and_then(|idx| state.toplevels.get(idx))
                 .and_then(|tl| self.wm.id_for_surface(&tl.surface))
                 .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                .is_some_and(|w| w.maximized);
+                .is_some_and(|w| w.maximized || w.fullscreen);
             if maximized {
                 HitZone::None
             } else {
@@ -4397,7 +4409,7 @@ impl CompositorApp {
                                     self.wm.id_for_surface(&t.surface) == Some(w.id)
                                 })
                             })
-                            .is_some_and(|w| w.maximized);
+                            .is_some_and(|w| w.maximized || w.fullscreen);
                         let (ox, oy) = self.maybe_unsnap_for_move(state, idx, x, y);
                         self.active_drag = Some(ActiveDrag::Move {
                             toplevel_idx: idx,
@@ -4471,7 +4483,7 @@ impl CompositorApp {
                             .get(idx)
                             .and_then(|t| self.wm.id_for_surface(&t.surface))
                             .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                            .is_some_and(|w| w.maximized);
+                            .is_some_and(|w| w.maximized || w.fullscreen);
                         let (ox, oy) = self.maybe_unsnap_for_move(state, idx, x, y);
                         self.active_drag = Some(ActiveDrag::Move {
                             toplevel_idx: idx,
@@ -4521,8 +4533,8 @@ impl CompositorApp {
         wins.sort_by_key(|w| w.id);
         for w in &wins {
             out.push_str(&format!(
-                "  #{}  z={}  {}×{}+{}+{}  focus={}  min={}  max={}  closing={}\n",
-                w.id, w.z_order, w.w, w.h, w.x, w.y, w.focused, w.minimized, w.maximized, w.closing,
+                "  #{}  z={}  {}×{}+{}+{}  focus={}  min={}  max={}  full={}  closing={}\n",
+                w.id, w.z_order, w.w, w.h, w.x, w.y, w.focused, w.minimized, w.maximized, w.fullscreen, w.closing,
             ));
             out.push_str(&format!(
                 "        opacity={:.2}  scale={:.2}  awaiting_first={}\n",
@@ -5002,6 +5014,8 @@ impl CompositorApp {
                         "focused": win.focused,
                         "minimized": win.minimized,
                         "maximized": win.maximized,
+                        "fullscreen": win.fullscreen,
+                        "fullscreen_output": win.fullscreen_output,
                         "closing": win.closing,
                         "anim_opacity": win.anim.opacity.value_f32(),
                         "anim_scale":   win.anim.scale.value_f32(),

@@ -30,6 +30,21 @@ use crate::wayland_state::{ClientSurfaceData, SpikeState, ToplevelInfo};
 const CASCADE_STEP: i32 = 40;
 const CASCADE_BASE: i32 = 100;
 
+fn requested_output_name(
+    outputs: &[smithay::output::Output],
+    wl_output: &WlOutput,
+) -> Option<String> {
+    use smithay::reexports::wayland_server::Resource;
+    let client = wl_output.client()?;
+    outputs.iter().find_map(|output| {
+        output
+            .client_outputs(&client)
+            .into_iter()
+            .any(|resource| &resource == wl_output)
+            .then(|| output.name())
+    })
+}
+
 impl XdgShellHandler for SpikeState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
@@ -369,12 +384,15 @@ impl XdgShellHandler for SpikeState {
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        let output_name = output
+            .as_ref()
+            .and_then(|wl_output| requested_output_name(&self.outputs, wl_output));
         surface.with_pending_state(|s| {
             s.states.set(xdg_toplevel::State::Fullscreen);
             s.fullscreen_output = output;
         });
         self.pending_xdg_fullscreen
-            .push((surface.wl_surface().clone(), true));
+            .push((surface.wl_surface().clone(), true, output_name));
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }
@@ -387,7 +405,7 @@ impl XdgShellHandler for SpikeState {
             s.fullscreen_output = None;
         });
         self.pending_xdg_fullscreen
-            .push((surface.wl_surface().clone(), false));
+            .push((surface.wl_surface().clone(), false, None));
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }

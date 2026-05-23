@@ -324,6 +324,10 @@ pub struct WindowState {
     pub h: i32,
     /// Geometry before maximize (for restore).
     pub pre_maximize: Option<(i32, i32, i32, i32)>,
+    /// Geometry before fullscreen (for restore).
+    pub pre_fullscreen: Option<(i32, i32, i32, i32)>,
+    /// Maximise flag before fullscreen, restored independently on unfullscreen.
+    pub pre_fullscreen_maximized: bool,
     /// Geometry before minimize (for restore).
     pub pre_minimize: Option<(i32, i32, i32, i32)>,
     /// Geometry before the most recent snap (left/right half, quarter,
@@ -335,6 +339,9 @@ pub struct WindowState {
     pub focused: bool,
     pub minimized: bool,
     pub maximized: bool,
+    pub fullscreen: bool,
+    /// Output requested by the fullscreen client, if one was provided.
+    pub fullscreen_output: Option<String>,
     /// When true the window is playing its close animation; removed after settle.
     pub closing: bool,
     /// Z-order index (higher = on top).
@@ -417,11 +424,15 @@ impl WindowState {
             w,
             h,
             pre_maximize: None,
+            pre_fullscreen: None,
+            pre_fullscreen_maximized: false,
             pre_minimize: None,
             pre_snap: None,
             focused: false,
             minimized: false,
             maximized: false,
+            fullscreen: false,
+            fullscreen_output: None,
             closing: false,
             z_order,
             anim,
@@ -510,6 +521,48 @@ impl WindowState {
         self.h = max_h;
     }
 
+    /// Enter fullscreen using the full output geometry, not the work area.
+    /// This keeps fullscreen distinct from maximize: panels and exclusive
+    /// zones are ignored, and the previous maximized state is restored on exit.
+    pub fn start_fullscreen(
+        &mut self,
+        output_x: i32,
+        output_y: i32,
+        output_w: i32,
+        output_h: i32,
+        output_name: Option<String>,
+    ) {
+        if !self.fullscreen {
+            self.pre_fullscreen = Some((self.x, self.y, self.w, self.h));
+            self.pre_fullscreen_maximized = self.maximized;
+        }
+        self.fullscreen = true;
+        self.fullscreen_output = output_name;
+        self.anim
+            .set_geometry_target(output_x, output_y, output_w.max(1), output_h.max(1));
+        self.anim.opacity.set_target(1.0);
+        self.anim.scale.set_target(1.0);
+        self.x = output_x;
+        self.y = output_y;
+        self.w = output_w.max(1);
+        self.h = output_h.max(1);
+    }
+
+    /// Exit fullscreen and restore the geometry/maximize state that was active
+    /// immediately before fullscreen was entered.
+    pub fn start_unfullscreen(&mut self) {
+        if let Some((rx, ry, rw, rh)) = self.pre_fullscreen.take() {
+            self.anim.set_geometry_target(rx, ry, rw, rh);
+            self.x = rx;
+            self.y = ry;
+            self.w = rw;
+            self.h = rh;
+        }
+        self.fullscreen = false;
+        self.fullscreen_output = None;
+        self.maximized = self.pre_fullscreen_maximized;
+    }
+
     /// Back-compat shim that uses the built-in panel/dock constants only —
     /// callers that have access to the WM's reserved-zone state should
     /// prefer `start_maximize_in`.
@@ -534,7 +587,7 @@ impl WindowState {
         // Drive the corner-radius spring from the maximized state so the
         // corners round off / square up smoothly. `set_target` is
         // idempotent, so re-setting it every tick is free.
-        self.anim.corner_radius.set_target(if self.maximized {
+        self.anim.corner_radius.set_target(if self.maximized || self.fullscreen {
             0.0
         } else {
             WINDOW_CORNER_RADIUS
@@ -934,7 +987,8 @@ impl WindowManager {
             // Visual chrome footprint = client's geom rect (excludes CSD
             // shadow padding) + our titlebar for SSD.
             let total_w = win.geom_w.max(1) as f64;
-            let total_h = win.geom_h.max(1) as f64 + if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let total_h = win.geom_h.max(1) as f64
+                + if win.csd || win.fullscreen { 0.0 } else { TITLEBAR_HEIGHT };
             if x >= wx && x < wx + total_w && y >= wy && y < wy + total_h
                 && best.is_none_or(|(_, z)| win.z_order > z) {
                     best = Some((key, win.z_order));
@@ -1060,7 +1114,7 @@ impl WindowManager {
     pub fn update_geometry(&mut self, surface: &WlSurface, w: i32, h: i32) {
         let key = Self::key(surface);
         if let Some(win) = self.windows.get_mut(&key) {
-            if win.maximized {
+            if win.maximized || win.fullscreen {
                 return;
             }
             win.w = w;
@@ -1143,7 +1197,11 @@ impl WindowManager {
             let wx = win.anim.current_x() as f64;
             let wy = win.anim.current_y() as f64;
             let ww = win.geom_w.max(1) as f64;
-            let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let titlebar = if win.csd || win.fullscreen {
+                0.0
+            } else {
+                TITLEBAR_HEIGHT
+            };
             let wh = win.geom_h.max(1) as f64 + titlebar;
             if x >= wx && x < wx + ww && y >= wy && y < wy + wh
                 && best.is_none_or(|(_, z)| win.z_order > z) {
@@ -1152,7 +1210,11 @@ impl WindowManager {
         }
         let (key, _) = best?;
         let win = self.windows.get(&key)?;
-        let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+        let titlebar = if win.csd || win.fullscreen {
+            0.0
+        } else {
+            TITLEBAR_HEIGHT
+        };
         let wy = win.anim.current_y() as f64 + titlebar;
         let chrome_local_y = y - wy;
         // SSD titlebar — handled by Slint chrome, not forwarded to client.

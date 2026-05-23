@@ -992,14 +992,14 @@ impl XwmHandler for SpikeState {
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_fullscreen(true);
         if let Some(wl_surface) = window.wl_surface() {
-            self.pending_xdg_fullscreen.push((wl_surface, true));
+            self.pending_xdg_fullscreen.push((wl_surface, true, None));
         }
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_fullscreen(false);
         if let Some(wl_surface) = window.wl_surface() {
-            self.pending_xdg_fullscreen.push((wl_surface, false));
+            self.pending_xdg_fullscreen.push((wl_surface, false, None));
         }
     }
 
