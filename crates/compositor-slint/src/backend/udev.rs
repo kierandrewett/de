@@ -45,7 +45,7 @@ use smithay::reexports::{
     rustix::fs::OFlags,
 };
 use smithay::utils::{DeviceFd, Point, SERIAL_COUNTER};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{wayland_runtime::WaylandRuntime, wayland_state::SpikeState};
 
@@ -77,6 +77,8 @@ struct UdevRuntime {
     wayland: WaylandRuntime,
     session: LibSeatSession,
     seat_name: String,
+    libinput_context: Arc<Mutex<Libinput>>,
+    session_events: Arc<Mutex<VecDeque<UdevSessionEvent>>>,
     device_snapshot: Vec<DrmDeviceSnapshot>,
     hotplug_events: Arc<Mutex<VecDeque<UdevHotplugEvent>>>,
     drm_devices: Vec<DrmProbeDevice>,
@@ -122,6 +124,11 @@ enum UdevHotplugEvent {
     },
 }
 
+enum UdevSessionEvent {
+    Pause,
+    Activate,
+}
+
 impl UdevRuntime {
     fn new() -> Result<Self> {
         let (session, notifier) =
@@ -134,6 +141,7 @@ impl UdevRuntime {
         let udev_backend =
             UdevBackend::new(&seat_name).context("failed to create Smithay udev backend")?;
         let hotplug_events = Arc::new(Mutex::new(VecDeque::new()));
+        let session_events = Arc::new(Mutex::new(VecDeque::new()));
         let device_snapshot: Vec<_> = udev_backend
             .device_list()
             .map(|(device_id, path)| DrmDeviceSnapshot {
@@ -151,17 +159,33 @@ impl UdevRuntime {
         if libinput_context.udev_assign_seat(&seat_name).is_err() {
             bail!("failed to assign libinput context to session seat {seat_name:?}");
         }
-        let libinput_backend = LibinputInputBackend::new(libinput_context);
+        let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
+        let libinput_context = Arc::new(Mutex::new(libinput_context));
         info!(seat = %seat_name, "udev backend: libinput seat assigned");
 
+        let session_events_for_libseat = session_events.clone();
         wayland
             .event_loop
             .handle()
             .insert_source(
                 notifier,
-                |event, &mut (), _state: &mut SpikeState| match event {
-                    SessionEvent::PauseSession => info!("udev backend: session paused"),
-                    SessionEvent::ActivateSession => info!("udev backend: session activated"),
+                move |event, &mut (), _state: &mut SpikeState| match event {
+                    SessionEvent::PauseSession => {
+                        info!("udev backend: session pause requested");
+                        if let Ok(mut events) = session_events_for_libseat.lock() {
+                            events.push_back(UdevSessionEvent::Pause);
+                        } else {
+                            error!("udev backend: session event queue lock poisoned on pause");
+                        }
+                    }
+                    SessionEvent::ActivateSession => {
+                        info!("udev backend: session activation requested");
+                        if let Ok(mut events) = session_events_for_libseat.lock() {
+                            events.push_back(UdevSessionEvent::Activate);
+                        } else {
+                            error!("udev backend: session event queue lock poisoned on activate");
+                        }
+                    }
                 },
             )
             .map_err(|err| {
@@ -216,6 +240,8 @@ impl UdevRuntime {
             wayland,
             session,
             seat_name,
+            libinput_context,
+            session_events,
             device_snapshot,
             hotplug_events,
             drm_devices: Vec::new(),
@@ -308,6 +334,65 @@ impl UdevRuntime {
         Ok(())
     }
 
+    fn drain_session_events(&mut self) -> Result<()> {
+        loop {
+            let event = self.session_events.lock().unwrap().pop_front();
+            let Some(event) = event else { break };
+
+            match event {
+                UdevSessionEvent::Pause => self.pause_session(),
+                UdevSessionEvent::Activate => self.resume_session()?,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pause_session(&mut self) {
+        info!("udev backend: pausing session devices");
+        if let Ok(libinput) = self.libinput_context.lock() {
+            libinput.suspend();
+        } else {
+            error!("udev backend: libinput lock poisoned during session pause");
+        }
+
+        for device in &mut self.drm_devices {
+            device.drm.pause();
+            info!(
+                node = ?device.node,
+                path = %device.path.display(),
+                "udev backend: DRM device paused and master released"
+            );
+        }
+    }
+
+    fn resume_session(&mut self) -> Result<()> {
+        info!("udev backend: resuming session devices");
+        if let Ok(mut libinput) = self.libinput_context.lock() {
+            if let Err(err) = libinput.resume() {
+                warn!(?err, "udev backend: failed to resume libinput context");
+            }
+        } else {
+            error!("udev backend: libinput lock poisoned during session resume");
+        }
+
+        for device in &mut self.drm_devices {
+            device.drm.activate(false).map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to reactivate DRM device {} after session resume: {err:?}",
+                    device.path.display()
+                )
+            })?;
+            info!(
+                node = ?device.node,
+                path = %device.path.display(),
+                "udev backend: DRM device reactivated and master reacquired"
+            );
+        }
+
+        Ok(())
+    }
+
     fn run_event_loop(&mut self) -> Result<()> {
         info!(
             socket = ?self.wayland.socket_name,
@@ -315,11 +400,13 @@ impl UdevRuntime {
         );
 
         while !self.wayland.state.should_exit {
+            self.drain_session_events()?;
             self.drain_hotplug_events()?;
             self.wayland
                 .event_loop
                 .dispatch(Some(Duration::from_millis(16)), &mut self.wayland.state)
                 .map_err(|err| anyhow::anyhow!("udev backend event loop dispatch failed: {err:?}"))?;
+            self.drain_session_events()?;
             self.drain_hotplug_events()?;
             if let Err(err) = self.wayland.display_handle.flush_clients() {
                 error!(?err, "udev backend: failed to flush Wayland clients");
