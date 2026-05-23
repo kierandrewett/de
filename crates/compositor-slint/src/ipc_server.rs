@@ -9,9 +9,12 @@
 //! loop drains each iteration. We never call into the WM / Slint state
 //! directly from the IPC thread — all mutations happen on the main thread.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,6 +78,14 @@ pub fn spawn(socket_path: Option<&Path>, queue: PendingIpc) {
         }
     };
 
+    // Restrict the socket file to the owner. Even with the per-connection
+    // peer_cred check in accept_loop, the filesystem mode is a cheaper
+    // first line of defence — anyone running under a different uid on
+    // this machine cannot even open(2) the socket.
+    if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+        warn!("ipc: chmod 0600 failed on {:?}: {}", path, e);
+    }
+
     info!("ipc: listening on {:?}", path);
 
     thread::Builder::new()
@@ -83,10 +94,51 @@ pub fn spawn(socket_path: Option<&Path>, queue: PendingIpc) {
         .expect("failed to spawn ipc server thread");
 }
 
+/// `SO_PEERCRED` lookup — returns the connecting peer's effective uid.
+/// Linux-only (Wayland compositor is Linux-only anyway). Stable-Rust
+/// path; `UnixStream::peer_cred()` is still unstable.
+fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(ucred.uid)
+    }
+}
+
 fn accept_loop(listener: UnixListener, queue: PendingIpc) {
+    // The IPC accepts every command we have: synthetic input injection,
+    // window control, screenshots to disk. Any local process running as
+    // a different uid should not be able to drive that. Gate at the
+    // socket peer's credentials.
+    let euid = unsafe { libc::geteuid() };
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                match peer_uid(&stream) {
+                    Ok(uid) if uid == euid => {}
+                    Ok(uid) => {
+                        warn!(
+                            "ipc: rejecting connection from uid {} (own euid {})",
+                            uid, euid
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("ipc: peer_uid lookup failed ({}); dropping connection", e);
+                        continue;
+                    }
+                }
                 let q = queue.clone();
                 thread::Builder::new()
                     .name("ipc-conn".into())
@@ -96,6 +148,39 @@ fn accept_loop(listener: UnixListener, queue: PendingIpc) {
             Err(e) => warn!("ipc: accept failed: {}", e),
         }
     }
+}
+
+/// True if `p` is a sane target for a client-requested file write
+/// (screenshot save_path). Required to stop the IPC from being an
+/// arbitrary-path file-write primitive: any local process that the
+/// peer_cred gate had let through could otherwise dump a PNG over
+/// (say) `~/.ssh/authorized_keys` or `/etc/cron.d/x`.
+///
+/// Conservative allowlist of prefixes — HOME, XDG_RUNTIME_DIR, /tmp —
+/// plus a flat ban on `..` components (no traversal). The path also
+/// has to be absolute so a relative path can't bypass the prefix check
+/// by interpreting it against the compositor's cwd.
+fn save_path_ok(p: &str) -> bool {
+    let path = Path::new(p);
+    if !path.is_absolute() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let prefixes: Vec<PathBuf> = [
+        std::env::var("HOME").ok(),
+        std::env::var("XDG_RUNTIME_DIR").ok(),
+        Some("/tmp".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    .collect();
+    prefixes.iter().any(|pre| path.starts_with(pre))
 }
 
 fn handle_conn(stream: UnixStream, queue: PendingIpc) {
@@ -179,10 +264,16 @@ fn translate(req: ShellRequest) -> Option<IpcCommand> {
         }
         ShellRequest::KeyPress { scancode, pressed } => IpcCommand::KeyEvent { scancode, pressed },
         ShellRequest::TypeText { text } => IpcCommand::TypeText { text },
-        ShellRequest::Screenshot { save_path } => IpcCommand::Screenshot {
-            save_path,
-            response: None,
-        },
+        ShellRequest::Screenshot { save_path } => {
+            if !save_path_ok(&save_path) {
+                warn!("ipc: rejecting screenshot to unsafe path {:?}", save_path);
+                return None;
+            }
+            IpcCommand::Screenshot {
+                save_path,
+                response: None,
+            }
+        }
         ShellRequest::ActivateWindow { window_id } => IpcCommand::ActivateWindow {
             wm_id: window_id as i32,
         },
