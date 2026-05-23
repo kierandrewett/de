@@ -75,6 +75,24 @@ pub const MINIMIZE_SCALE_TO: f64 = 0.40;
 /// Close animation settle threshold: when opacity falls below this, remove the window.
 pub const CLOSE_OPACITY_THRESHOLD: f32 = 0.01;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkArea {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl WorkArea {
+    pub fn right(self) -> i32 {
+        self.x + self.w
+    }
+
+    pub fn bottom(self) -> i32 {
+        self.y + self.h
+    }
+}
+
 // ── Animation phases ──────────────────────────────────────────────────────────
 
 /// Lifecycle animation phase for a window.
@@ -324,6 +342,10 @@ pub struct WindowState {
     pub h: i32,
     /// Geometry before maximize (for restore).
     pub pre_maximize: Option<(i32, i32, i32, i32)>,
+    /// Geometry before fullscreen (for restore).
+    pub pre_fullscreen: Option<(i32, i32, i32, i32)>,
+    /// Maximise flag before fullscreen, restored independently on unfullscreen.
+    pub pre_fullscreen_maximized: bool,
     /// Geometry before minimize (for restore).
     pub pre_minimize: Option<(i32, i32, i32, i32)>,
     /// Geometry before the most recent snap (left/right half, quarter,
@@ -335,6 +357,9 @@ pub struct WindowState {
     pub focused: bool,
     pub minimized: bool,
     pub maximized: bool,
+    pub fullscreen: bool,
+    /// Output requested by the fullscreen client, if one was provided.
+    pub fullscreen_output: Option<String>,
     /// When true the window is playing its close animation; removed after settle.
     pub closing: bool,
     /// Z-order index (higher = on top).
@@ -417,11 +442,15 @@ impl WindowState {
             w,
             h,
             pre_maximize: None,
+            pre_fullscreen: None,
+            pre_fullscreen_maximized: false,
             pre_minimize: None,
             pre_snap: None,
             focused: false,
             minimized: false,
             maximized: false,
+            fullscreen: false,
+            fullscreen_output: None,
             closing: false,
             z_order,
             anim,
@@ -494,20 +523,67 @@ impl WindowState {
         left: i32,
         right: i32,
     ) {
+        self.start_maximize_to(WorkArea {
+            x: left,
+            y: top,
+            w: (output_w - left - right).max(1),
+            h: (output_h - top - bottom).max(1),
+        });
+    }
+
+    pub fn start_maximize_to(&mut self, area: WorkArea) {
         self.pre_maximize = Some((self.x, self.y, self.w, self.h));
-        let max_x = left;
-        let max_y = top;
-        let max_w = (output_w - left - right).max(0);
-        let max_h = (output_h - top - bottom).max(0);
-        self.anim.set_geometry_target(max_x, max_y, max_w, max_h);
+        self.anim.set_geometry_target(area.x, area.y, area.w, area.h);
         self.anim.opacity.set_target(1.0);
         self.anim.scale.set_target(1.0);
         self.maximized = true;
         // Update committed geometry immediately so configure is correct.
-        self.x = max_x;
-        self.y = max_y;
-        self.w = max_w;
-        self.h = max_h;
+        self.x = area.x;
+        self.y = area.y;
+        self.w = area.w;
+        self.h = area.h;
+    }
+
+    /// Enter fullscreen using the full output geometry, not the work area.
+    /// This keeps fullscreen distinct from maximize: panels and exclusive
+    /// zones are ignored, and the previous maximized state is restored on exit.
+    pub fn start_fullscreen(
+        &mut self,
+        output_x: i32,
+        output_y: i32,
+        output_w: i32,
+        output_h: i32,
+        output_name: Option<String>,
+    ) {
+        if !self.fullscreen {
+            self.pre_fullscreen = Some((self.x, self.y, self.w, self.h));
+            self.pre_fullscreen_maximized = self.maximized;
+        }
+        self.fullscreen = true;
+        self.fullscreen_output = output_name;
+        self.anim
+            .set_geometry_target(output_x, output_y, output_w.max(1), output_h.max(1));
+        self.anim.opacity.set_target(1.0);
+        self.anim.scale.set_target(1.0);
+        self.x = output_x;
+        self.y = output_y;
+        self.w = output_w.max(1);
+        self.h = output_h.max(1);
+    }
+
+    /// Exit fullscreen and restore the geometry/maximize state that was active
+    /// immediately before fullscreen was entered.
+    pub fn start_unfullscreen(&mut self) {
+        if let Some((rx, ry, rw, rh)) = self.pre_fullscreen.take() {
+            self.anim.set_geometry_target(rx, ry, rw, rh);
+            self.x = rx;
+            self.y = ry;
+            self.w = rw;
+            self.h = rh;
+        }
+        self.fullscreen = false;
+        self.fullscreen_output = None;
+        self.maximized = self.pre_fullscreen_maximized;
     }
 
     /// Back-compat shim that uses the built-in panel/dock constants only —
@@ -534,7 +610,7 @@ impl WindowState {
         // Drive the corner-radius spring from the maximized state so the
         // corners round off / square up smoothly. `set_target` is
         // idempotent, so re-setting it every tick is free.
-        self.anim.corner_radius.set_target(if self.maximized {
+        self.anim.corner_radius.set_target(if self.maximized || self.fullscreen {
             0.0
         } else {
             WINDOW_CORNER_RADIUS
@@ -647,10 +723,45 @@ impl WindowManager {
         self.reserved_right
     }
 
+    pub fn work_area(&self) -> WorkArea {
+        let left = self.effective_left();
+        let top = self.effective_top();
+        let right = self.effective_right();
+        let bottom = self.effective_bottom();
+        WorkArea {
+            x: left,
+            y: top,
+            w: (self.output_w - left - right).max(1),
+            h: (self.output_h - top - bottom).max(1),
+        }
+    }
+
     /// Surface key: raw pointer cast to usize (stable for the lifetime of the surface).
     fn key(surface: &WlSurface) -> usize {
         use smithay::reexports::wayland_server::Resource;
         surface.id().protocol_id() as usize
+    }
+
+    fn is_focusable(win: &WindowState) -> bool {
+        !win.closing && !win.minimized
+    }
+
+    fn focus_key(&mut self, key: usize) -> bool {
+        if !self.windows.get(&key).is_some_and(Self::is_focusable) {
+            return false;
+        }
+
+        let new_z = self.next_z;
+        self.next_z += 1;
+        for (&k, win) in &mut self.windows {
+            win.focused = k == key;
+            if k == key {
+                win.z_order = new_z;
+            }
+        }
+        self.focus_stack.retain(|&k| k != key);
+        self.focus_stack.push(key);
+        true
     }
 
     /// Register a newly-mapped toplevel. Returns the assigned stable ID.
@@ -783,28 +894,24 @@ impl WindowManager {
     /// Focus a window by surface, raise it to the top of z-order.
     pub fn focus_surface(&mut self, surface: &WlSurface) {
         let key = Self::key(surface);
-        if !self.windows.contains_key(&key) {
+        let Some((id, minimized, closing)) = self
+            .windows
+            .get(&key)
+            .map(|win| (win.id, win.minimized, win.closing))
+        else {
+            return;
+        };
+        if closing {
+            return;
+        }
+        if minimized {
+            self.restore_by_id(id);
             return;
         }
 
-        // Raise z-order.
-        let new_z = self.next_z;
-        self.next_z += 1;
-        if let Some(win) = self.windows.get_mut(&key) {
-            win.z_order = new_z;
-            win.focused = true;
+        if self.focus_key(key) {
+            debug!("WM: focus surface key={}", key);
         }
-
-        // Update focus state on all windows.
-        for (&k, win) in &mut self.windows {
-            win.focused = k == key;
-        }
-
-        // Update focus stack (remove and re-push to make it MRU-last).
-        self.focus_stack.retain(|&k| k != key);
-        self.focus_stack.push(key);
-
-        debug!("WM: focus surface key={}", key);
     }
 
     /// Focus a window by its stable ID.
@@ -815,35 +922,34 @@ impl WindowManager {
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
-            // Raise z.
-            let new_z = self.next_z;
-            self.next_z += 1;
-            for (&k, win) in &mut self.windows {
-                win.focused = k == key;
-                if k == key {
-                    win.z_order = new_z;
-                }
+            let Some((minimized, closing)) = self
+                .windows
+                .get(&key)
+                .map(|win| (win.minimized, win.closing))
+            else {
+                return;
+            };
+            if closing {
+                return;
             }
-            self.focus_stack.retain(|&k| k != key);
-            self.focus_stack.push(key);
+            if minimized {
+                self.restore_by_id(id);
+                return;
+            }
+            self.focus_key(key);
         }
     }
 
     /// Focus the topmost (last focus_stack entry) window.
     fn focus_top(&mut self) {
-        if let Some(&key) = self.focus_stack.last() {
-            let new_z = self.next_z;
-            self.next_z += 1;
-            for (&k, win) in &mut self.windows {
-                win.focused = k == key;
-                if k == key {
-                    win.z_order = new_z;
-                }
+        while let Some(&key) = self.focus_stack.last() {
+            if self.focus_key(key) {
+                return;
             }
-        } else {
-            for win in self.windows.values_mut() {
-                win.focused = false;
-            }
+            self.focus_stack.pop();
+        }
+        for win in self.windows.values_mut() {
+            win.focused = false;
         }
     }
 
@@ -852,23 +958,41 @@ impl WindowManager {
         self.focus_stack
             .last()
             .and_then(|k| self.windows.get(k))
+            .filter(|w| Self::is_focusable(w) && w.focused)
             .map(|w| w.surface.clone())
     }
 
     /// Look up the currently focused window's stable ID.
     pub fn focused_id(&self) -> Option<i32> {
-        self.windows.values().find(|w| w.focused).map(|w| w.id)
+        self.windows
+            .values()
+            .find(|w| w.focused && Self::is_focusable(w))
+            .map(|w| w.id)
     }
 
     /// Return the stable ids of every mapped (non-closing) window whose
     /// `app_id` matches `target` exactly. Used by the dock context menu's
     /// "Show All Windows" / "Quit" actions.
     pub fn ids_for_app(&self, target: &str) -> Vec<i32> {
-        self.windows
-            .values()
-            .filter(|w| !w.closing && w.app_id == target)
-            .map(|w| w.id)
-            .collect()
+        let mut out = Vec::new();
+        for key in &self.focus_stack {
+            if let Some(win) = self.windows.get(key) {
+                if !win.closing && win.app_id == target {
+                    out.push(win.id);
+                }
+            }
+        }
+        let mut rest: Vec<i32> = self
+            .windows
+            .iter()
+            .filter(|(key, win)| {
+                !self.focus_stack.contains(key) && !win.closing && win.app_id == target
+            })
+            .map(|(_, win)| win.id)
+            .collect();
+        rest.sort_unstable();
+        out.extend(rest);
+        out
     }
 
     /// Drop focus from every window (e.g. after a click on the desktop).
@@ -899,24 +1023,17 @@ impl WindowManager {
             // Visual chrome footprint = client's geom rect (excludes CSD
             // shadow padding) + our titlebar for SSD.
             let total_w = win.geom_w.max(1) as f64;
-            let total_h = win.geom_h.max(1) as f64 + if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let total_h = win.geom_h.max(1) as f64
+                + if win.csd || win.fullscreen { 0.0 } else { TITLEBAR_HEIGHT };
             if x >= wx && x < wx + total_w && y >= wy && y < wy + total_h
                 && best.is_none_or(|(_, z)| win.z_order > z) {
                     best = Some((key, win.z_order));
                 }
         }
         if let Some((key, _)) = best {
-            let new_z = self.next_z;
-            self.next_z += 1;
-            for (&k, win) in &mut self.windows {
-                win.focused = k == key;
-                if k == key {
-                    win.z_order = new_z;
-                }
-            }
-            self.focus_stack.retain(|&k| k != key);
-            self.focus_stack.push(key);
-            self.windows.get(&key).map(|w| w.surface.clone())
+            self.focus_key(key)
+                .then(|| self.windows.get(&key).map(|w| w.surface.clone()))
+                .flatten()
         } else {
             None
         }
@@ -947,23 +1064,16 @@ impl WindowManager {
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
+            let Some(closing) = self.windows.get(&key).map(|win| win.closing) else {
+                return;
+            };
+            if closing {
+                return;
+            }
             if let Some(win) = self.windows.get_mut(&key) {
                 win.start_restore();
             }
-            // Raise and focus.
-            let new_z = self.next_z;
-            self.next_z += 1;
-            if let Some(win) = self.windows.get_mut(&key) {
-                win.z_order = new_z;
-                win.focused = true;
-            }
-            for (&k, win) in &mut self.windows {
-                if k != key {
-                    win.focused = false;
-                }
-            }
-            self.focus_stack.retain(|&k| k != key);
-            self.focus_stack.push(key);
+            self.focus_key(key);
         }
     }
 
@@ -975,18 +1085,12 @@ impl WindowManager {
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
-            let (ow, oh) = (self.output_w, self.output_h);
-            let (t, b, l, r) = (
-                self.effective_top(),
-                self.effective_bottom(),
-                self.effective_left(),
-                self.effective_right(),
-            );
+            let area = self.work_area();
             if let Some(win) = self.windows.get_mut(&key) {
                 if win.maximized {
                     win.start_unmaximize();
                 } else {
-                    win.start_maximize_in(ow, oh, t, b, l, r);
+                    win.start_maximize_to(area);
                 }
             }
         }
@@ -1040,7 +1144,7 @@ impl WindowManager {
     pub fn update_geometry(&mut self, surface: &WlSurface, w: i32, h: i32) {
         let key = Self::key(surface);
         if let Some(win) = self.windows.get_mut(&key) {
-            if win.maximized {
+            if win.maximized || win.fullscreen {
                 return;
             }
             win.w = w;
@@ -1123,7 +1227,11 @@ impl WindowManager {
             let wx = win.anim.current_x() as f64;
             let wy = win.anim.current_y() as f64;
             let ww = win.geom_w.max(1) as f64;
-            let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let titlebar = if win.csd || win.fullscreen {
+                0.0
+            } else {
+                TITLEBAR_HEIGHT
+            };
             let wh = win.geom_h.max(1) as f64 + titlebar;
             if x >= wx && x < wx + ww && y >= wy && y < wy + wh
                 && best.is_none_or(|(_, z)| win.z_order > z) {
@@ -1132,7 +1240,11 @@ impl WindowManager {
         }
         let (key, _) = best?;
         let win = self.windows.get(&key)?;
-        let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+        let titlebar = if win.csd || win.fullscreen {
+            0.0
+        } else {
+            TITLEBAR_HEIGHT
+        };
         let wy = win.anim.current_y() as f64 + titlebar;
         let chrome_local_y = y - wy;
         // SSD titlebar — handled by Slint chrome, not forwarded to client.

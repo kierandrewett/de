@@ -4,7 +4,7 @@
 //! edge band, we return the rect the window will snap to on release. The
 //! renderer pushes that rect into Slint as a preview overlay.
 
-use crate::wm::{DOCK_HEIGHT, PANEL_HEIGHT};
+use crate::wm::WorkArea;
 
 /// Width of the snap band at each screen edge (logical pixels).
 const SNAP_BAND_PX: f64 = 12.0;
@@ -34,26 +34,32 @@ pub struct SnapRect {
 pub fn detect(
     cursor_x: f64,
     cursor_y: f64,
-    output_w: i32,
-    output_h: i32,
+    work_area: WorkArea,
 ) -> Option<(SnapZone, SnapRect)> {
-    let usable_y = PANEL_HEIGHT;
-    let usable_h = (output_h - PANEL_HEIGHT - DOCK_HEIGHT).max(100);
-    let usable_w = output_w.max(100);
+    let usable_x = work_area.x;
+    let usable_y = work_area.y;
+    let usable_w = work_area.w.max(100);
+    let usable_h = work_area.h.max(100);
+    let right_edge = work_area.right();
+    let bottom_edge = work_area.bottom();
+    let left_w = usable_w / 2;
+    let right_w = usable_w - left_w;
+    let top_h = usable_h / 2;
+    let bottom_h = usable_h - top_h;
 
-    let top = cursor_y <= PANEL_HEIGHT as f64 + SNAP_BAND_PX;
-    let left = cursor_x <= SNAP_BAND_PX;
-    let right = cursor_x >= output_w as f64 - SNAP_BAND_PX;
-    let bottom = cursor_y >= output_h as f64 - DOCK_HEIGHT as f64 - SNAP_BAND_PX;
+    let top = cursor_y <= work_area.y as f64 + SNAP_BAND_PX;
+    let left = cursor_x <= work_area.x as f64 + SNAP_BAND_PX;
+    let right = cursor_x >= right_edge as f64 - SNAP_BAND_PX;
+    let bottom = cursor_y >= bottom_edge as f64 - SNAP_BAND_PX;
 
     if top && left {
         return Some((
             SnapZone::TopLeftQuarter,
             SnapRect {
-                x: 0,
+                x: usable_x,
                 y: usable_y,
-                w: usable_w / 2,
-                h: usable_h / 2,
+                w: left_w,
+                h: top_h,
             },
         ));
     }
@@ -61,10 +67,10 @@ pub fn detect(
         return Some((
             SnapZone::TopRightQuarter,
             SnapRect {
-                x: usable_w / 2,
+                x: usable_x + left_w,
                 y: usable_y,
-                w: usable_w / 2,
-                h: usable_h / 2,
+                w: right_w,
+                h: top_h,
             },
         ));
     }
@@ -72,10 +78,10 @@ pub fn detect(
         return Some((
             SnapZone::BottomLeftQuarter,
             SnapRect {
-                x: 0,
-                y: usable_y + usable_h / 2,
-                w: usable_w / 2,
-                h: usable_h / 2,
+                x: usable_x,
+                y: usable_y + top_h,
+                w: left_w,
+                h: bottom_h,
             },
         ));
     }
@@ -83,10 +89,10 @@ pub fn detect(
         return Some((
             SnapZone::BottomRightQuarter,
             SnapRect {
-                x: usable_w / 2,
-                y: usable_y + usable_h / 2,
-                w: usable_w / 2,
-                h: usable_h / 2,
+                x: usable_x + left_w,
+                y: usable_y + top_h,
+                w: right_w,
+                h: bottom_h,
             },
         ));
     }
@@ -94,7 +100,7 @@ pub fn detect(
         return Some((
             SnapZone::Maximize,
             SnapRect {
-                x: 0,
+                x: usable_x,
                 y: usable_y,
                 w: usable_w,
                 h: usable_h,
@@ -105,9 +111,9 @@ pub fn detect(
         return Some((
             SnapZone::LeftHalf,
             SnapRect {
-                x: 0,
+                x: usable_x,
                 y: usable_y,
-                w: usable_w / 2,
+                w: left_w,
                 h: usable_h,
             },
         ));
@@ -116,9 +122,9 @@ pub fn detect(
         return Some((
             SnapZone::RightHalf,
             SnapRect {
-                x: usable_w / 2,
+                x: usable_x + left_w,
                 y: usable_y,
-                w: usable_w / 2,
+                w: right_w,
                 h: usable_h,
             },
         ));

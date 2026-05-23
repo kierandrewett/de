@@ -16,7 +16,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge as XdgResizeEdge},
         wayland_server::protocol::{wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface},
     },
-    utils::{Serial, SERIAL_COUNTER},
+    utils::Serial,
     wayland::shell::xdg::{
         Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     },
@@ -29,6 +29,21 @@ use crate::wayland_state::{ClientSurfaceData, SpikeState, ToplevelInfo};
 /// Cascading window offset: each new window is placed 40px further right/down.
 const CASCADE_STEP: i32 = 40;
 const CASCADE_BASE: i32 = 100;
+
+fn requested_output_name(
+    outputs: &[smithay::output::Output],
+    wl_output: &WlOutput,
+) -> Option<String> {
+    use smithay::reexports::wayland_server::Resource;
+    let client = wl_output.client()?;
+    outputs.iter().find_map(|output| {
+        output
+            .client_outputs(&client)
+            .into_iter()
+            .any(|resource| &resource == wl_output)
+            .then(|| output.name())
+    })
+}
 
 impl XdgShellHandler for SpikeState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -99,16 +114,7 @@ impl XdgShellHandler for SpikeState {
             appmenu,
         });
 
-        // Focus the new toplevel (most recently mapped = focused).
-        self.active_surface = Some(wl_surface.clone());
-
-        if let Some(kb) = self.seat.get_keyboard() {
-            kb.set_focus(
-                self,
-                Some(crate::wayland::xwayland::KeyboardFocusTarget::Wayland(wl_surface)),
-                SERIAL_COUNTER.next_serial(),
-            );
-        }
+        self.focus_new_surface_if_allowed(&wl_surface, "xdg new_toplevel");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -182,8 +188,7 @@ impl XdgShellHandler for SpikeState {
 
         // Push to destroyed_surfaces so the WM can start a close animation.
         self.destroyed_surfaces.push(wl.clone());
-        self.xdg_resize_transactions
-            .retain(|tx| tx.surface != *wl);
+        self.xdg_resize_transactions.retain(|tx| tx.surface != *wl);
 
         // Keep the toplevel in `self.toplevels` until the WM close animation
         // finishes — update_windows will remove it via sweep_closed.
@@ -245,11 +250,7 @@ impl XdgShellHandler for SpikeState {
                 grab.ungrab(PopupUngrabStrategy::All);
                 return;
             }
-            keyboard.set_focus(
-                self,
-                grab.current_grab(),
-                serial,
-            );
+            keyboard.set_focus(self, grab.current_grab(), serial);
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         if let Some(pointer) = seat.get_pointer() {
@@ -369,12 +370,15 @@ impl XdgShellHandler for SpikeState {
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        let output_name = output
+            .as_ref()
+            .and_then(|wl_output| requested_output_name(&self.outputs, wl_output));
         surface.with_pending_state(|s| {
             s.states.set(xdg_toplevel::State::Fullscreen);
             s.fullscreen_output = output;
         });
         self.pending_xdg_fullscreen
-            .push((surface.wl_surface().clone(), true));
+            .push((surface.wl_surface().clone(), true, output_name));
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }
@@ -387,7 +391,7 @@ impl XdgShellHandler for SpikeState {
             s.fullscreen_output = None;
         });
         self.pending_xdg_fullscreen
-            .push((surface.wl_surface().clone(), false));
+            .push((surface.wl_surface().clone(), false, None));
         if surface.is_initial_configure_sent() {
             surface.send_configure();
         }

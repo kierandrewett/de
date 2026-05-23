@@ -41,7 +41,7 @@ use smithay::{
         Seat,
     },
     reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
-    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
+    utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER},
     wayland::{
         seat::WaylandFocus,
         selection::{
@@ -177,7 +177,8 @@ impl KeyboardFocusTarget {
     }
 
     pub fn matches_wl_surface(&self, surface: &WlSurface) -> bool {
-        self.wl_surface().is_some_and(|focus| focus.as_ref() == surface)
+        self.wl_surface()
+            .is_some_and(|focus| focus.as_ref() == surface)
     }
 }
 
@@ -236,8 +237,12 @@ impl KeyboardTarget<SpikeState> for KeyboardFocusTarget {
         time: u32,
     ) {
         match self {
-            Self::Wayland(surface) => KeyboardTarget::key(surface, seat, data, key, state, serial, time),
-            Self::X11(surface) => KeyboardTarget::key(surface, seat, data, key, state, serial, time),
+            Self::Wayland(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
+            Self::X11(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
         }
     }
 
@@ -249,7 +254,9 @@ impl KeyboardTarget<SpikeState> for KeyboardFocusTarget {
         serial: Serial,
     ) {
         match self {
-            Self::Wayland(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
+            Self::Wayland(surface) => {
+                KeyboardTarget::modifiers(surface, seat, data, modifiers, serial)
+            }
             Self::X11(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
         }
     }
@@ -570,16 +577,7 @@ impl XWaylandShellHandler for SpikeState {
         });
         // OR windows aren't focusable / managed — they piggyback on the
         // parent's keyboard focus (xterm popup menu, GTK dropdown).
-        if !is_or {
-            self.active_surface = Some(wl_surface.clone());
-            if let Some(kb) = self.seat.get_keyboard() {
-                kb.set_focus(
-                    self,
-                    Some(KeyboardFocusTarget::X11(x11_surface.clone())),
-                    SERIAL_COUNTER.next_serial(),
-                );
-            }
-            let _ = x11_surface.set_activated(true);
+        if !is_or && self.focus_new_surface_if_allowed(&wl_surface, "X11 surface_associated") {
             self.raise_x11_window(&x11_surface);
         }
         // After the toplevel list contains both parent and child,
@@ -689,16 +687,9 @@ impl XwmHandler for SpikeState {
                     description: None,
                     appmenu: None,
                 });
-                self.active_surface = Some(wl_surface.clone());
-                if let Some(kb) = self.seat.get_keyboard() {
-                    kb.set_focus(
-                        self,
-                        Some(KeyboardFocusTarget::X11(window.clone())),
-                        SERIAL_COUNTER.next_serial(),
-                    );
+                if self.focus_new_surface_if_allowed(&wl_surface, "X11 map_window_request") {
+                    self.raise_x11_window(&window);
                 }
-                let _ = window.set_activated(true);
-                self.raise_x11_window(&window);
                 // Resolve TRANSIENT_FOR now that both parent and child are in
                 // the toplevel list (parent must have mapped earlier; if not,
                 // a later property_notify will retry).
@@ -992,14 +983,14 @@ impl XwmHandler for SpikeState {
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_fullscreen(true);
         if let Some(wl_surface) = window.wl_surface() {
-            self.pending_xdg_fullscreen.push((wl_surface, true));
+            self.pending_xdg_fullscreen.push((wl_surface, true, None));
         }
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let _ = window.set_fullscreen(false);
         if let Some(wl_surface) = window.wl_surface() {
-            self.pending_xdg_fullscreen.push((wl_surface, false));
+            self.pending_xdg_fullscreen.push((wl_surface, false, None));
         }
     }
 

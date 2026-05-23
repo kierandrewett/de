@@ -2255,8 +2255,8 @@ impl CompositorApp {
                 geom_y,
                 geom_w,
                 geom_h,
-                csd: toplevel.csd,
-                maximized: win.maximized,
+                csd: toplevel.csd || win.fullscreen,
+                maximized: win.maximized || win.fullscreen,
                 // Spring-animated outer corner radius (logical px) — eased
                 // between the themed radius and 0 across a maximize.
                 corner_radius: win.anim.corner_radius.value() as f32,
@@ -3116,11 +3116,13 @@ impl CompositorApp {
             );
             match action {
                 2 => {
-                    // Show All Windows — raise + focus the most-recent one
-                    // belonging to this app. Future polish: open a window
-                    // overview / mission-control style picker.
-                    if let Some(&id) = ids.last() {
-                        self.wm.focus_by_id(id);
+                    // Show All Windows — restore each minimised window for
+                    // the app, then leave focus on the MRU entry. `ids_for_app`
+                    // returns focus-stack order, with stable-ID fallback for
+                    // windows that are not in the stack, so this is no longer
+                    // HashMap iteration order.
+                    for id in ids {
+                        self.wm.restore_by_id(id);
                         self.update_focused_surface(state);
                         self.sync_x11_stacking_order(state);
                     }
@@ -3210,7 +3212,7 @@ impl CompositorApp {
                 .wm
                 .id_for_surface(&surface)
                 .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                .is_some_and(|w| w.maximized);
+                .is_some_and(|w| w.maximized || w.fullscreen);
             let t = &state.toplevels[idx];
             self.active_drag = Some(ActiveDrag::Move {
                 toplevel_idx: idx,
@@ -3273,13 +3275,14 @@ impl CompositorApp {
             let Some(id) = self.wm.id_for_surface(&surface) else {
                 continue;
             };
+            let area = self.wm.work_area();
             {
                 let win = match self.wm.windows.values_mut().find(|w| w.id == id) {
                     Some(w) => w,
                     None => continue,
                 };
                 if want_max && !win.maximized {
-                    win.start_maximize(self.wm.output_w, self.wm.output_h);
+                    win.start_maximize_to(area);
                 } else if !want_max && win.maximized {
                     win.start_unmaximize();
                 }
@@ -3296,14 +3299,11 @@ impl CompositorApp {
             state.update_reactive_popups_for_toplevel(&surface);
         }
 
-        // Fullscreen requests carry an optional wl_output. Keep this as a
-        // separate path from maximize so a client targeting a secondary output
-        // gets that output's size instead of the primary work area. The WM
-        // still uses the maximize restore slot for now; a distinct fullscreen
-        // state remains a later H13 follow-up.
-        let fullscreen_actions: Vec<(WlSurface, bool)> =
+        // Fullscreen / unfullscreen is distinct from maximise: it owns the
+        // whole requested output and restores the previous maximise state on exit.
+        let fullscreen_actions: Vec<(WlSurface, bool, Option<String>)> =
             state.pending_xdg_fullscreen.drain(..).collect();
-        for (surface, want_fullscreen) in fullscreen_actions {
+        for (surface, want_fullscreen, output_name) in fullscreen_actions {
             let Some(id) = self.wm.id_for_surface(&surface) else {
                 continue;
             };
@@ -3317,19 +3317,25 @@ impl CompositorApp {
                 .resolve_wl_output(requested_output.as_ref())
                 .or_else(|| state.output_for_surface(&surface).cloned())
                 .or_else(|| state.primary_output().cloned());
-            let (target_w, target_h) = output
+            let (target_x, target_y, target_w, target_h) = output
                 .as_ref()
-                .and_then(|output| state.output_logical_size(output))
-                .unwrap_or((self.wm.output_w, self.wm.output_h));
+                .map(|output| {
+                    let loc = output.current_location();
+                    let (w, h) = state
+                        .output_logical_size(output)
+                        .unwrap_or((self.wm.output_w, self.wm.output_h));
+                    (loc.x, loc.y, w, h)
+                })
+                .unwrap_or((0, 0, self.wm.output_w, self.wm.output_h));
             {
                 let win = match self.wm.windows.values_mut().find(|w| w.id == id) {
                     Some(w) => w,
                     None => continue,
                 };
-                if want_fullscreen && !win.maximized {
-                    win.start_maximize_in(target_w, target_h, 0, 0, 0, 0);
-                } else if !want_fullscreen && win.maximized {
-                    win.start_unmaximize();
+                if want_fullscreen {
+                    win.start_fullscreen(target_x, target_y, target_w, target_h, output_name);
+                } else if win.fullscreen {
+                    win.start_unfullscreen();
                 }
             }
             let (new_w, new_h) = self
@@ -3340,6 +3346,7 @@ impl CompositorApp {
                 .map(|w| (w.w, w.h))
                 .unwrap_or((target_w, target_h));
             self.send_configure(&surface, new_w, new_h, state);
+            self.sync_x11_window_state(&surface, state, None, Some(want_fullscreen), None);
             state.update_reactive_popups_for_toplevel(&surface);
         }
 
@@ -3367,11 +3374,69 @@ impl CompositorApp {
     /// Update `state.active_surface` and keyboard focus from the WM focused window.
     fn update_focused_surface(&self, state: &mut SpikeState) {
         state.active_surface = self.wm.focused_surface();
-        if let Some(surface) = &state.active_surface {
-            if let Some(kb) = state.seat.get_keyboard() {
-                let focus =
-                    crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(state, surface);
-                kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
+        if let Some(surface) = state.active_surface.clone() {
+            Self::set_keyboard_focus_to_surface(state, &surface);
+        } else if let Some(kb) = state.seat.get_keyboard() {
+            kb.set_focus(state, None, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    fn seat_has_active_input_grab(state: &SpikeState) -> bool {
+        state
+            .seat
+            .get_pointer()
+            .is_some_and(|pointer| pointer.is_grabbed())
+            || state
+                .seat
+                .get_keyboard()
+                .is_some_and(|keyboard| keyboard.is_grabbed())
+            || state.seat.get_touch().is_some_and(|touch| touch.is_grabbed())
+    }
+
+    fn set_keyboard_focus_to_surface(state: &mut SpikeState, surface: &WlSurface) {
+        if let Some(kb) = state.seat.get_keyboard() {
+            let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                state, surface,
+            );
+            kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    fn update_focus_from_button_press(&mut self, state: &mut SpikeState, x: f64, y: f64) {
+        if Self::seat_has_active_input_grab(state) {
+            debug!("focus: ignoring button focus change while a seat grab is active");
+            return;
+        }
+
+        let panel_h = crate::wm::PANEL_HEIGHT as f64;
+        let in_panel = y < panel_h;
+        let in_dock = self.point_in_dock_pill(x, y);
+        if let Some(focused_surface) = self.wm.pointer_click_focus(x, y) {
+            state.active_surface = Some(focused_surface.clone());
+            Self::set_keyboard_focus_to_surface(state, &focused_surface);
+            if let Some(gpu_window) = self.gpu_window.as_ref() {
+                gpu_window.mark_dirty();
+            }
+        } else if !in_panel && !in_dock {
+            // Click on desktop / wallpaper.
+            if self.wm.unfocus_all() {
+                state.active_surface = None;
+                if let Some(kb) = state.seat.get_keyboard() {
+                    kb.set_focus(state, None, SERIAL_COUNTER.next_serial());
+                }
+                // Push the new (un)focus state into the Slint model so
+                // the WindowChrome's `focused` property flips and its
+                // titlebar bg animates from active → inactive. Without
+                // this the model still carries the old focused=true
+                // and the titlebar stays at the active colour.
+                self.update_windows(state);
+                if let Some(gpu_window) = self.gpu_window.as_ref() {
+                    gpu_window.mark_dirty();
+                }
+            }
+            // Left-click on the desktop also closes any open menu.
+            if let Some(ui) = self.ui.as_ref() {
+                ui.set_desktop_menu_open(false);
             }
         }
     }
@@ -3594,44 +3659,8 @@ impl CompositorApp {
         //   text clears and keyboard focus is dropped.
         // - Click on panel/dock → leave focus alone (those are shell areas).
         if button == 0x110 && pressed && !over_client_popup {
-            let panel_h = crate::wm::PANEL_HEIGHT as f64;
-            let in_panel = y < panel_h;
-            let in_dock = self.point_in_dock_pill(x, y);
-            if let Some(focused_surface) = self.wm.pointer_click_focus(x, y) {
-                state.active_surface = Some(focused_surface.clone());
-                if let Some(kb) = state.seat.get_keyboard() {
-                    let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
-                        state,
-                        &focused_surface,
-                    );
-                    kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
-                }
-                if let Some(gpu_window) = self.gpu_window.as_ref() {
-                    gpu_window.mark_dirty();
-                }
-                self.sync_x11_stacking_order(state);
-            } else if !in_panel && !in_dock {
-                // Click on desktop / wallpaper.
-                if self.wm.unfocus_all() {
-                    state.active_surface = None;
-                    if let Some(kb) = state.seat.get_keyboard() {
-                        kb.set_focus(state, None, SERIAL_COUNTER.next_serial());
-                    }
-                    // Push the new (un)focus state into the Slint model so
-                    // the WindowChrome's `focused` property flips and its
-                    // titlebar bg animates from active → inactive. Without
-                    // this the model still carries the old focused=true
-                    // and the titlebar stays at the active colour.
-                    self.update_windows(state);
-                    if let Some(gpu_window) = self.gpu_window.as_ref() {
-                        gpu_window.mark_dirty();
-                    }
-                }
-                // Left-click on the desktop also closes any open menu.
-                if let Some(ui) = self.ui.as_ref() {
-                    ui.set_desktop_menu_open(false);
-                }
-            }
+            self.update_focus_from_button_press(state, x, y);
+            self.sync_x11_stacking_order(state);
         }
 
         // (Right-click dismiss is handled in the winit MouseInput
@@ -3659,15 +3688,7 @@ impl CompositorApp {
             let oh = self.wm.output_h as f64;
             let ow = self.wm.output_w as f64;
             let dock_h = crate::wm::DOCK_HEIGHT as f64;
-            let on_window_surface = if over_client_popup {
-                None
-            } else {
-                self.wm.pointer_click_focus(x, y)
-            };
-            if on_window_surface.is_some() {
-                self.sync_x11_stacking_order(state);
-            }
-            let on_window = on_window_surface.is_some();
+            let on_window = !over_client_popup && self.find_toplevel_idx(state, x, y).is_some();
             let in_panel = y < panel_h;
             let in_dock = self.point_in_dock_pill(x, y);
             if !over_client_popup && !on_window && !in_panel && !in_dock {
@@ -3962,7 +3983,11 @@ impl CompositorApp {
             else {
                 continue;
             };
-            let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let titlebar = if win.csd || win.fullscreen {
+                0.0
+            } else {
+                TITLEBAR_HEIGHT
+            };
             rects.push(WindowRect {
                 id: idx as i32,
                 x: win.anim.current_x() as f64,
@@ -3992,7 +4017,11 @@ impl CompositorApp {
             let wx = win.anim.current_x() as f64;
             let wy = win.anim.current_y() as f64;
             let ww = win.geom_w.max(1) as f64;
-            let titlebar = if win.csd { 0.0 } else { TITLEBAR_HEIGHT };
+            let titlebar = if win.csd || win.fullscreen {
+                0.0
+            } else {
+                TITLEBAR_HEIGHT
+            };
             let wh = win.geom_h.max(1) as f64 + titlebar;
             if ptr_x >= wx - cursor::EDGE_ZONE
                 && ptr_x < wx + ww + cursor::EDGE_ZONE
@@ -4026,22 +4055,45 @@ impl CompositorApp {
                     start_geom,
                     ..
                 } => {
-                    if let Some((nx, mut ny, nw, mut nh)) = resize::compute_resize(&drag, x, y) {
-                        // ── Top-edge constraint ───────────────────────────
-                        // Block the top edge from sliding under the panel.
-                        // Adjust height so the bottom edge stays where the
-                        // resize math wanted it.
-                        let panel = crate::wm::PANEL_HEIGHT;
+                    if let Some((mut nx, mut ny, mut nw, mut nh)) = resize::compute_resize(&drag, x, y) {
+                        // ── Work-area constraints ─────────────────────────
+                        // Keep interactive resize inside the same effective
+                        // work area used for maximise and snap. The rectangle
+                        // comes from real layer-shell exclusive zones with the
+                        // built-in shell chrome as a floor.
+                        let work_area = self.wm.work_area();
+                        let work_right = work_area.right();
+                        let work_bottom = work_area.bottom();
                         if matches!(
                             *edge,
                             resize::ResizeEdge::North
                                 | resize::ResizeEdge::NorthWest
                                 | resize::ResizeEdge::NorthEast
-                        ) && ny < panel
+                        ) && ny < work_area.y
                         {
                             let desired_bottom = start_geom.y + start_geom.h;
-                            ny = panel;
+                            ny = work_area.y;
                             nh = (desired_bottom - ny).max(resize::MIN_WINDOW_SIZE);
+                        }
+                        if matches!(
+                            *edge,
+                            resize::ResizeEdge::West
+                                | resize::ResizeEdge::NorthWest
+                                | resize::ResizeEdge::SouthWest
+                        ) && nx < work_area.x
+                        {
+                            let desired_right = start_geom.x + start_geom.w;
+                            nx = work_area.x;
+                            nw = (desired_right - nx).max(resize::MIN_WINDOW_SIZE);
+                        }
+                        if matches!(
+                            *edge,
+                            resize::ResizeEdge::East
+                                | resize::ResizeEdge::NorthEast
+                                | resize::ResizeEdge::SouthEast
+                        ) && nx + nw > work_right
+                        {
+                            nw = (work_right - nx).max(resize::MIN_WINDOW_SIZE);
                         }
 
                         // ── Bottom-edge dock-snap ─────────────────────────
@@ -4049,7 +4101,7 @@ impl CompositorApp {
                         // engage a sticky snap. To break out (down OR up)
                         // the user must travel further than the threshold
                         // from the snap-engagement pointer position.
-                        let dock_top = self.wm.output_h - crate::wm::DOCK_HEIGHT;
+                        let dock_top = work_bottom;
                         let edge_is_south = matches!(
                             *edge,
                             resize::ResizeEdge::South
@@ -4278,20 +4330,16 @@ impl CompositorApp {
                     let mut maybe_wm_id: Option<i32> = None;
                     let mut reactive_popup_parent = None;
                     if let Some(tl) = state.toplevels.get_mut(*toplevel_idx) {
-                        let nx = (x - ox) as i32;
-                        // Clamp y so the window's titlebar can't slide under
-                        // the panel (the top bar is sacred), but the bottom
-                        // is unconstrained — the user explicitly wants to be
-                        // able to drag windows down behind the dock; the
-                        // dock's post-chrome re-blit makes them visually
-                        // disappear behind it without us cutting them off.
-                        let panel = crate::wm::PANEL_HEIGHT;
-                        let oh = self.wm.output_h;
                         let raw_ny = (y - oy) as i32;
-                        // Allow the window to push down so just its titlebar
-                        // remains visible on screen.
-                        let max_ny = (oh - 24).max(panel);
-                        let ny = raw_ny.clamp(panel, max_ny);
+                        let raw_nx = (x - ox) as i32;
+                        // Keep the drag anchor inside the same work area used
+                        // by maximise/snap so layer-shell sidebars and docks
+                        // reserve real movement bounds too.
+                        let work_area = self.wm.work_area();
+                        let max_nx = (work_area.right() - 24).max(work_area.x);
+                        let max_ny = (work_area.bottom() - 24).max(work_area.y);
+                        let nx = raw_nx.clamp(work_area.x, max_nx);
+                        let ny = raw_ny.clamp(work_area.y, max_ny);
                         tl.x = nx;
                         tl.y = ny;
                         let surface = tl.surface.clone();
@@ -4308,9 +4356,7 @@ impl CompositorApp {
 
                     // Snap detection — show preview if cursor is in an edge band.
                     if let Some(ui) = self.ui.as_ref() {
-                        let ow = self.wm.output_w;
-                        let oh = self.wm.output_h;
-                        match crate::snap::detect(x, y, ow, oh) {
+                        match crate::snap::detect(x, y, self.wm.work_area()) {
                             Some((zone, rect)) => {
                                 ui.set_snap_preview_visible(true);
                                 ui.set_snap_preview_x(rect.x);
@@ -4360,7 +4406,7 @@ impl CompositorApp {
                 .and_then(|idx| state.toplevels.get(idx))
                 .and_then(|tl| self.wm.id_for_surface(&tl.surface))
                 .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                .is_some_and(|w| w.maximized);
+                .is_some_and(|w| w.maximized || w.fullscreen);
             if maximized {
                 HitZone::None
             } else {
@@ -4393,7 +4439,7 @@ impl CompositorApp {
                                     self.wm.id_for_surface(&t.surface) == Some(w.id)
                                 })
                             })
-                            .is_some_and(|w| w.maximized);
+                            .is_some_and(|w| w.maximized || w.fullscreen);
                         let (ox, oy) = self.maybe_unsnap_for_move(state, idx, x, y);
                         self.active_drag = Some(ActiveDrag::Move {
                             toplevel_idx: idx,
@@ -4467,7 +4513,7 @@ impl CompositorApp {
                             .get(idx)
                             .and_then(|t| self.wm.id_for_surface(&t.surface))
                             .and_then(|id| self.wm.windows.values().find(|w| w.id == id))
-                            .is_some_and(|w| w.maximized);
+                            .is_some_and(|w| w.maximized || w.fullscreen);
                         let (ox, oy) = self.maybe_unsnap_for_move(state, idx, x, y);
                         self.active_drag = Some(ActiveDrag::Move {
                             toplevel_idx: idx,
@@ -4517,8 +4563,8 @@ impl CompositorApp {
         wins.sort_by_key(|w| w.id);
         for w in &wins {
             out.push_str(&format!(
-                "  #{}  z={}  {}×{}+{}+{}  focus={}  min={}  max={}  closing={}\n",
-                w.id, w.z_order, w.w, w.h, w.x, w.y, w.focused, w.minimized, w.maximized, w.closing,
+                "  #{}  z={}  {}×{}+{}+{}  focus={}  min={}  max={}  full={}  closing={}\n",
+                w.id, w.z_order, w.w, w.h, w.x, w.y, w.focused, w.minimized, w.maximized, w.fullscreen, w.closing,
             ));
             out.push_str(&format!(
                 "        opacity={:.2}  scale={:.2}  awaiting_first={}\n",
@@ -4848,7 +4894,9 @@ impl CompositorApp {
                 self.pointer_pos = (x, y);
                 self.update_cursor_position(x, y);
                 self.handle_pointer_update(state, x, y);
-                self.forward_pointer_motion(state, x, y);
+                if self.active_drag.is_none() {
+                    self.forward_pointer_motion(state, x, y);
+                }
                 if let Some(gw) = self.gpu_window.as_ref() {
                     gw.mark_dirty();
                 }
@@ -4857,6 +4905,7 @@ impl CompositorApp {
                 button_evdev,
                 pressed,
             } => {
+                let had_drag = self.active_drag.is_some();
                 if button_evdev == 0x110 {
                     self.left_button_down = pressed;
                     if !pressed {
@@ -4867,7 +4916,9 @@ impl CompositorApp {
                         self.handle_pointer_update(state, x, y);
                     }
                 }
-                self.forward_pointer_button(state, button_evdev, pressed);
+                if !had_drag && self.active_drag.is_none() {
+                    self.forward_pointer_button(state, button_evdev, pressed);
+                }
             }
             IpcCommand::KeyEvent { scancode, pressed } => {
                 self.pending_keys
@@ -4993,6 +5044,8 @@ impl CompositorApp {
                         "focused": win.focused,
                         "minimized": win.minimized,
                         "maximized": win.maximized,
+                        "fullscreen": win.fullscreen,
+                        "fullscreen_output": win.fullscreen_output,
                         "closing": win.closing,
                         "anim_opacity": win.anim.opacity.value_f32(),
                         "anim_scale":   win.anim.scale.value_f32(),
@@ -6344,10 +6397,16 @@ pub fn run() -> Result<()> {
                     PendingPointerEvent::Motion { x, y } => {
                         // Run cursor hit-test + drag update.
                         app.handle_pointer_update(&mut state, x, y);
-                        // Forward to wayland client (only if not in a drag over chrome).
-                        app.forward_pointer_motion(&mut state, x, y);
+                        // While the compositor owns a move/resize drag, no client
+                        // gets pointer focus. This mirrors anvil/cosmic pointer
+                        // grabs using Focus::Clear, but keeps the current
+                        // renderer-side ActiveDrag model intact for this pass.
+                        if app.active_drag.is_none() {
+                            app.forward_pointer_motion(&mut state, x, y);
+                        }
                     }
                     PendingPointerEvent::Button { button, pressed } => {
+                        let had_drag = app.active_drag.is_some();
                         if button == 0x110 && pressed {
                             let (x, y) = app.pointer_pos;
                             app.handle_pointer_update(&mut state, x, y);
@@ -6361,7 +6420,9 @@ pub fn run() -> Result<()> {
                             app.apply_pending_snap(&mut state);
                             app.release_drag(&mut state);
                         }
-                        app.forward_pointer_button(&mut state, button, pressed);
+                        if !had_drag && app.active_drag.is_none() {
+                            app.forward_pointer_button(&mut state, button, pressed);
+                        }
                     }
                     PendingPointerEvent::Axis {
                         dx,
