@@ -1807,7 +1807,10 @@ impl CompositorApp {
             state.active_surface = self.wm.focused_surface();
             if let Some(surface) = &state.active_surface {
                 if let Some(kb) = state.seat.get_keyboard() {
-                    kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+                    let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                        state, surface,
+                    );
+                    kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
                 }
             }
         }
@@ -3246,7 +3249,10 @@ impl CompositorApp {
         state.active_surface = self.wm.focused_surface();
         if let Some(surface) = &state.active_surface {
             if let Some(kb) = state.seat.get_keyboard() {
-                kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+                let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                    state, surface,
+                );
+                kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
             }
         }
     }
@@ -3632,7 +3638,11 @@ impl CompositorApp {
             if let Some(focused_surface) = self.wm.pointer_click_focus(x, y) {
                 state.active_surface = Some(focused_surface.clone());
                 if let Some(kb) = state.seat.get_keyboard() {
-                    kb.set_focus(state, Some(focused_surface), SERIAL_COUNTER.next_serial());
+                    let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                        state,
+                        &focused_surface,
+                    );
+                    kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
                 }
                 if let Some(gpu_window) = self.gpu_window.as_ref() {
                     gpu_window.mark_dirty();

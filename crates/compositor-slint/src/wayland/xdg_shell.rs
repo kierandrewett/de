@@ -103,7 +103,11 @@ impl XdgShellHandler for SpikeState {
         self.active_surface = Some(wl_surface.clone());
 
         if let Some(kb) = self.seat.get_keyboard() {
-            kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+            kb.set_focus(
+                self,
+                Some(crate::wayland::xwayland::KeyboardFocusTarget::Wayland(wl_surface)),
+                SERIAL_COUNTER.next_serial(),
+            );
         }
     }
 
@@ -224,6 +228,7 @@ impl XdgShellHandler for SpikeState {
         let Ok(root) = find_popup_root_surface(&kind) else {
             return;
         };
+        let root = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(self, &root);
         let ret = self.popup_manager.grab_popup(root, kind, &seat, serial);
         let mut grab = match ret {
             Ok(g) => g,
@@ -242,7 +247,11 @@ impl XdgShellHandler for SpikeState {
                 grab.ungrab(PopupUngrabStrategy::All);
                 return;
             }
-            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_focus(
+                self,
+                grab.current_grab(),
+                serial,
+            );
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         if let Some(pointer) = seat.get_pointer() {

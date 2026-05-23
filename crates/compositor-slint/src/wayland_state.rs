@@ -1753,7 +1753,7 @@ delegate_dmabuf!(SpikeState);
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl SeatHandler for SpikeState {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = crate::wayland::xwayland::KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -1768,7 +1768,9 @@ impl SeatHandler for SpikeState {
         // Without this, copy-paste between apps "works" only by accident
         // (the previous focus's offer leaks until something else clears it).
         let dh = &self.display_handle;
-        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        let client = focused
+            .and_then(|focus| focus.wl_surface())
+            .and_then(|surface| dh.get_client(surface.id()).ok());
         set_data_device_focus(dh, seat, client.clone());
         set_primary_focus(dh, seat, client);
 
@@ -1780,7 +1782,9 @@ impl SeatHandler for SpikeState {
         // which we wire here too so XWayland apps respond to focus.
         use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
         for tl in &self.toplevels {
-            let is_focused = focused.map(|f| f == &tl.surface).unwrap_or(false);
+            let is_focused = focused
+                .map(|focus| focus.matches_wl_surface(&tl.surface))
+                .unwrap_or(false);
             if let Some(top) = &tl.toplevel {
                 let changed = top.with_pending_state(|s| {
                     let was = s.states.contains(xdg_toplevel::State::Activated);
