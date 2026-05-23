@@ -1755,6 +1755,7 @@ impl CompositorApp {
                     None,
                 );
             }
+            state.sync_xwayland_settings();
         }
 
         // Propagate window size changes to the wl_output mode. Without this,

@@ -53,7 +53,7 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, ObjectId},
             protocol::{wl_buffer::WlBuffer, wl_shm, wl_surface::WlSurface},
-            DisplayHandle, Resource,
+            Client, DisplayHandle, Resource,
         },
     },
     utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial},
@@ -454,6 +454,13 @@ pub struct SpikeState {
     /// The X11 window manager attached to the running Xwayland instance.
     /// `None` until `XWaylandEvent::Ready` fires (or after Xwayland exits).
     pub xwm: Option<X11Wm>,
+    /// Wayland client object for the spawned Xwayland server. Kept so X11-side
+    /// scale changes can update smithay's XWayland client-scale override.
+    pub xwayland_client: Option<Client>,
+    /// Last client-scale value pushed into the XWayland client data.
+    pub xwayland_scale: Option<f64>,
+    /// RandR primary-output name requested by X11 clients, if any.
+    pub xwayland_primary_output_name: Option<String>,
     /// X11 display number Xwayland is listening on (for `DISPLAY=:N`).
     pub xdisplay: Option<u32>,
 
@@ -763,6 +770,9 @@ impl SpikeState {
             pending_capture_frames: Vec::new(),
             xwayland_shell_state,
             xwm: None,
+            xwayland_client: None,
+            xwayland_scale: None,
+            xwayland_primary_output_name: None,
             xdisplay: None,
             pending_session_lock: None,
             session_locked: false,
