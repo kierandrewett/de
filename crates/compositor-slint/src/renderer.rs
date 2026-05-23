@@ -1634,6 +1634,34 @@ impl CompositorApp {
             // for a security feature; a future refactor can short-
             // circuit the chrome pipeline when locked.
             if let Some(snap) = self.lock_surface_snapshot.as_ref() {
+                // SECURITY: clear the WHOLE final_tex to opaque black
+                // first, so any area not covered by the lock surface
+                // (e.g. an undersized buffer, the lock client hasn't
+                // resized yet, only a partial commit landed) does NOT
+                // show the unlocked desktop the chrome passes above
+                // just rendered. Without this the locker only painted
+                // copy_w × copy_h of the final_tex and the rest leaked
+                // — a lock-screen confidentiality bug.
+                {
+                    let lock_clear_view =
+                        final_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                    let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("session-lock-clear"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &lock_clear_view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
                 let copy_w = snap.width.min(w);
                 let copy_h = snap.height.min(h);
                 if copy_w > 0 && copy_h > 0 {
