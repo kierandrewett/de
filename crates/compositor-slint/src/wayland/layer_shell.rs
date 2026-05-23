@@ -105,13 +105,6 @@ impl WlrLayerShellHandler for SpikeState {
     ) {
         info!(ns = %namespace, layer = ?layer, "layer_shell: new surface");
 
-        // Send the initial configure so the client knows output geometry.
-        // (0, 0) size hint → client chooses its own size.
-        // The cached state (anchor / margin / exclusive_zone / size) is
-        // populated by the client in subsequent commits and re-read each
-        // frame in `refresh_layer_layout`.
-        surface.send_configure();
-
         self.layer_surfaces.push(LayerInfo {
             surface,
             layer,
@@ -180,6 +173,23 @@ pub fn layer_initial_configure_sent(surface: &WlrLayerSurface) -> bool {
 }
 
 impl SpikeState {
+    pub fn primary_output_logical_size(&self) -> Option<(i32, i32)> {
+        let output = self.primary_output()?;
+        let mode = output.current_mode()?;
+        let scale = output.current_scale().fractional_scale();
+        Some((
+            (mode.size.w as f64 / scale).max(1.0) as i32,
+            (mode.size.h as f64 / scale).max(1.0) as i32,
+        ))
+    }
+
+    pub fn refresh_layer_layout_for_primary_output(&mut self) {
+        let Some((output_w, output_h)) = self.primary_output_logical_size() else {
+            return;
+        };
+        self.refresh_layer_layout(output_w, output_h);
+    }
+
     /// Per-edge sum of exclusive zones across all currently mapped Top +
     /// Bottom layer surfaces. Background / Overlay layers are not subtracted
     /// from the toplevel work area (Background sits beneath windows, and
