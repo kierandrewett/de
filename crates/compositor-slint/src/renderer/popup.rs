@@ -55,8 +55,9 @@ impl CompositorApp {
                 .iter()
                 .find(|layer| layer.surface.wl_surface() == &cur_parent)
             {
-                abs_x += layer.x;
-                abs_y += layer.y;
+                let loc = layer.output.current_location();
+                abs_x += loc.x + layer.x;
+                abs_y += loc.y + layer.y;
                 anchored = true;
             }
             break;
@@ -94,13 +95,16 @@ impl CompositorApp {
                 if li.w <= 0 || li.h <= 0 {
                     continue;
                 }
-                let lx = x - li.x as f64;
-                let ly = y - li.y as f64;
+                let loc = li.output.current_location();
+                let origin_x = loc.x + li.x;
+                let origin_y = loc.y + li.y;
+                let lx = x - origin_x as f64;
+                let ly = y - origin_y as f64;
                 if lx < 0.0 || ly < 0.0 || lx >= li.w as f64 || ly >= li.h as f64 {
                     continue;
                 }
                 let origin =
-                    Point::<i32, smithay::utils::Logical>::from((li.x, li.y));
+                    Point::<i32, smithay::utils::Logical>::from((origin_x, origin_y));
                 if let Some((surface, sub_origin)) = under_from_surface_tree(
                     li.surface.wl_surface(),
                     Point::from((x, y)),
@@ -111,8 +115,8 @@ impl CompositorApp {
                 }
                 return Some((
                     li.surface.wl_surface().clone(),
-                    li.x as f64,
-                    li.y as f64,
+                    origin_x as f64,
+                    origin_y as f64,
                 ));
             }
         }
@@ -135,8 +139,7 @@ impl CompositorApp {
         use smithay::wayland::shell::wlr_layer::Layer;
         if state.session_locked {
             return state
-                .lock_surfaces
-                .first()
+                .lock_surface_for_point(x, y)
                 .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0));
         }
         self.popup_surface_under(state, x, y)

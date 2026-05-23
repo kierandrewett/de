@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use smithay::{
     delegate_layer_shell,
+    output::Output,
     reexports::wayland_server::protocol::{wl_output, wl_surface::WlSurface},
     utils::{Logical, Size},
     wayland::shell::{
@@ -48,6 +49,21 @@ pub struct ReservedZones {
     pub right: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct OutputScopedState {
+    pub output: Output,
+    pub reserved_zones: ReservedZones,
+}
+
+impl OutputScopedState {
+    pub fn new(output: Output) -> Self {
+        Self {
+            output,
+            reserved_zones: ReservedZones::default(),
+        }
+    }
+}
+
 /// Metadata the render side needs to position and z-order layer surfaces.
 ///
 /// `anchor`, `exclusive_zone`, `margin`, `keyboard_interactivity` and
@@ -57,6 +73,7 @@ pub struct ReservedZones {
 #[derive(Debug, Clone)]
 pub struct LayerInfo {
     pub surface: WlrLayerSurface,
+    pub output: Output,
     pub layer: Layer,
     pub namespace: String,
 
@@ -102,14 +119,19 @@ impl WlrLayerShellHandler for SpikeState {
     fn new_layer_surface(
         &mut self,
         surface: WlrLayerSurface,
-        _wl_output: Option<wl_output::WlOutput>,
+        wl_output: Option<wl_output::WlOutput>,
         layer: Layer,
         namespace: String,
     ) {
-        info!(ns = %namespace, layer = ?layer, "layer_shell: new surface");
+        let Some(output) = self.resolve_wl_output(wl_output.as_ref()) else {
+            tracing::warn!(ns = %namespace, layer = ?layer, "layer_shell: no output available for new surface");
+            return;
+        };
+        info!(ns = %namespace, layer = ?layer, output = %output.name(), "layer_shell: new surface");
 
         self.layer_surfaces.push(LayerInfo {
             surface,
+            output,
             layer,
             namespace,
             anchor: Anchor::empty(),
@@ -209,19 +231,11 @@ pub fn layer_initial_configure_sent(surface: &WlrLayerSurface) -> bool {
 impl SpikeState {
     pub fn primary_output_logical_size(&self) -> Option<(i32, i32)> {
         let output = self.primary_output()?;
-        let mode = output.current_mode()?;
-        let scale = output.current_scale().fractional_scale();
-        Some((
-            (mode.size.w as f64 / scale).max(1.0) as i32,
-            (mode.size.h as f64 / scale).max(1.0) as i32,
-        ))
+        self.output_logical_size(output)
     }
 
     pub fn refresh_layer_layout_for_primary_output(&mut self) {
-        let Some((output_w, output_h)) = self.primary_output_logical_size() else {
-            return;
-        };
-        self.refresh_layer_layout(output_w, output_h);
+        self.refresh_layer_layout_for_outputs(None);
     }
 
     pub fn unconstrain_layer_popup(&self, parent: &WlrLayerSurface, popup: &PopupSurface) {
@@ -232,7 +246,7 @@ impl SpikeState {
         else {
             return;
         };
-        let Some((output_w, output_h)) = self.primary_output_logical_size() else {
+        let Some((output_w, output_h)) = self.output_logical_size(&layer.output) else {
             return;
         };
 
@@ -252,9 +266,23 @@ impl SpikeState {
     /// Bottom layer surfaces. Background / Overlay layers are not subtracted
     /// from the toplevel work area (Background sits beneath windows, and
     /// Overlay-with-exclusive-zone is rare and tends to be modal anyway).
+    pub fn reserved_zones_for_output(&self, output: &Output) -> ReservedZones {
+        self.output_scopes
+            .iter()
+            .find(|scope| &scope.output == output)
+            .map(|scope| scope.reserved_zones)
+            .unwrap_or_default()
+    }
+
     pub fn reserved_zones(&self) -> ReservedZones {
+        self.primary_output()
+            .map(|output| self.reserved_zones_for_output(output))
+            .unwrap_or_default()
+    }
+
+    fn compute_reserved_zones_for_output(&self, output: &Output) -> ReservedZones {
         let mut z = ReservedZones::default();
-        for li in &self.layer_surfaces {
+        for li in self.layer_surfaces.iter().filter(|li| li.output == *output) {
             if !matches!(li.layer, Layer::Top | Layer::Bottom) {
                 continue;
             }
@@ -303,11 +331,32 @@ impl SpikeState {
     /// `LayerInfo` rects rather than going through a `Space`). The math is
     /// the same.
     pub fn refresh_layer_layout(&mut self, output_w: i32, output_h: i32) {
+        self.refresh_layer_layout_for_outputs(Some((output_w, output_h)));
+    }
+
+    pub fn refresh_layer_layout_for_outputs(&mut self, primary_fallback: Option<(i32, i32)>) {
+        let outputs = self.outputs.clone();
+        for output in outputs {
+            let size = self
+                .output_logical_size(&output)
+                .or_else(|| {
+                    self.primary_output()
+                        .filter(|primary| *primary == &output)
+                        .and(primary_fallback)
+                });
+            let Some((output_w, output_h)) = size else {
+                continue;
+            };
+            self.refresh_layer_layout_for_output(&output, output_w, output_h);
+        }
+    }
+
+    fn refresh_layer_layout_for_output(&mut self, output: &Output, output_w: i32, output_h: i32) {
         // Snapshot cached state for every layer surface before doing layout.
         // We only mutate `self.layer_surfaces` here — the arrange algorithm
         // walks the same vec twice (exclusive then non-exclusive) so we
         // collect indices into a working list to avoid double-borrows.
-        for li in self.layer_surfaces.iter_mut() {
+        for li in self.layer_surfaces.iter_mut().filter(|li| li.output == *output) {
             let cached: LayerSurfaceCachedState = li.surface.with_cached_state(|s| *s);
             li.anchor = cached.anchor;
             li.exclusive_zone = cached.exclusive_zone;
@@ -326,7 +375,12 @@ impl SpikeState {
 
         // Order: all exclusive-zone surfaces first, then the rest. Indexing
         // by usize so the second pass can re-borrow `&mut self.layer_surfaces`.
-        let mut order: Vec<usize> = (0..self.layer_surfaces.len()).collect();
+        let mut order: Vec<usize> = self
+            .layer_surfaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| (layer.output == *output).then_some(index))
+            .collect();
         order.sort_by_key(|&i| match self.layer_surfaces[i].exclusive_zone {
             ExclusiveZone::Exclusive(_) => 0,
             _ => 1,
@@ -377,6 +431,16 @@ impl SpikeState {
                     _ => {}
                 }
             }
+        }
+
+        let reserved_zones = self.compute_reserved_zones_for_output(output);
+        if let Some(scope) = self.output_scopes.iter_mut().find(|scope| scope.output == *output) {
+            scope.reserved_zones = reserved_zones;
+        } else {
+            self.output_scopes.push(OutputScopedState {
+                output: output.clone(),
+                reserved_zones,
+            });
         }
     }
 }

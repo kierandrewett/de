@@ -81,8 +81,7 @@ pub fn forward_keyboard_keycode(
     // behind the lock — a textbook lock-screen bypass.
     let surface: Option<WlSurface> = if state.session_locked {
         state
-            .lock_surfaces
-            .first()
+            .lock_surface_for_point(state.pointer_pos.0, state.pointer_pos.1)
             .map(|li| li.surface.wl_surface().clone())
     } else {
         // A mapped Top/Overlay layer surface with
@@ -347,9 +346,10 @@ pub fn state_surface_under(state: &SpikeState, x: f64, y: f64) -> SurfaceHit {
     use smithay::wayland::shell::wlr_layer::Layer;
 
     if state.session_locked {
+        // H23: lock surface is per-output, so look it up under the cursor
+        // (lock_surface_for_point) instead of always using the first.
         return state
-            .lock_surfaces
-            .first()
+            .lock_surface_for_point(x, y)
             .map(|lock| (lock.surface.wl_surface().clone(), 0.0, 0.0));
     }
 

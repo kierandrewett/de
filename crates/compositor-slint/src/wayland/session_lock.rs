@@ -22,7 +22,6 @@
 
 use smithay::{
     delegate_session_lock,
-    output::Output,
     reexports::wayland_server::protocol::wl_output,
     utils::Size,
     wayland::session_lock::{
@@ -64,7 +63,11 @@ impl SessionLockHandler for SpikeState {
         // use THAT output's mode — not primary's. Fixes the multi-output
         // session-lock bug from the audit where every output's lock
         // surface was configured at the primary's resolution.
-        let (w, h) = output_size(&self.outputs, &output);
+        let Some(output) = self.resolve_wl_output(Some(&output)) else {
+            warn!("new lock surface requested before any compositor output exists");
+            return;
+        };
+        let (w, h) = self.output_logical_size(&output).unwrap_or((1280, 960));
         surface.with_pending_state(|state| {
             state.size = Some(Size::from((w as u32, h as u32)));
         });
@@ -77,27 +80,6 @@ impl SessionLockHandler for SpikeState {
             pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
         });
     }
-}
-
-/// Resolve a `wl_output` resource to an actual logical-pixel size by walking
-/// our `Output` list and matching client_outputs. Falls back to primary, then
-/// to a sensible default if we have no outputs at all.
-fn output_size(outputs: &[Output], wl: &wl_output::WlOutput) -> (i32, i32) {
-    use smithay::reexports::wayland_server::Resource;
-    let client = wl.client();
-    if let Some(client) = client {
-        for out in outputs {
-            if out.client_outputs(&client).into_iter().any(|c| &c == wl) {
-                if let Some(mode) = out.current_mode() {
-                    return (mode.size.w.max(1), mode.size.h.max(1));
-                }
-            }
-        }
-    }
-    if let Some(mode) = outputs.first().and_then(Output::current_mode) {
-        return (mode.size.w.max(1), mode.size.h.max(1));
-    }
-    (1280, 960)
 }
 
 delegate_session_lock!(SpikeState);
