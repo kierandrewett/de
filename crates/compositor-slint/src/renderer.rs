@@ -2362,10 +2362,7 @@ impl CompositorApp {
                 .and_then(|w| state.toplevels.iter().find(|t| t.surface == w.surface))
                 .and_then(|t| t.appmenu.clone());
             if *self.appmenu_addr.borrow() != focused_appmenu {
-                tracing::debug!(
-                    "appmenu: focused window menu changed → {:?}",
-                    focused_appmenu
-                );
+                tracing::debug!("appmenu: focused window menu changed → {:?}", focused_appmenu);
                 *self.appmenu_addr.borrow_mut() = focused_appmenu.clone();
                 // Focus moved — any open submenu belongs to the old window.
                 ui.set_global_menu_open(false);
@@ -3673,15 +3670,16 @@ impl CompositorApp {
         // context menu (Minimize / Maximize / Close). We test the hit
         // zone before the desktop check below; only fall through if
         // the cursor wasn't on a titlebar.
-        if button == 0x111 && pressed && !over_client_popup {
-            let win_rects = self.window_rects(state);
-            if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
-                if hit.zone == cursor::HitZone::TitleBar {
-                    self.open_window_menu(hit.window_id, x, y);
-                    return;
+        if button == 0x111 && pressed
+            && !over_client_popup {
+                let win_rects = self.window_rects(state);
+                if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
+                    if hit.zone == cursor::HitZone::TitleBar {
+                        self.open_window_menu(hit.window_id, x, y);
+                        return;
+                    }
                 }
             }
-        }
 
         // Right-click on the desktop opens our generic context menu.
         if button == 0x111 && pressed {
@@ -3837,7 +3835,8 @@ impl CompositorApp {
             })
         };
 
-        let focused_app_id: Option<String> = state.active_surface.as_ref().and_then(&app_id_for);
+        let focused_app_id: Option<String> =
+            state.active_surface.as_ref().and_then(&app_id_for);
 
         // Collect every running app_id from the toplevel list.
         let mut running_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5782,15 +5781,12 @@ pub fn run() -> Result<()> {
             let y = ((cy as f64) + 6.0).max(pad) as i32;
             let results = results.clone();
             crate::dbusmenu::fetch_layout(service, object_path, move |items| {
-                results
-                    .lock()
-                    .unwrap()
-                    .push_back(MenuFetchResult::TrayMenu {
-                        items,
-                        x,
-                        y,
-                        sni_id: id,
-                    });
+                results.lock().unwrap().push_back(MenuFetchResult::TrayMenu {
+                    items,
+                    x,
+                    y,
+                    sni_id: id,
+                });
             });
         });
     }

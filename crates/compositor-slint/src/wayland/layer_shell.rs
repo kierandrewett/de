@@ -199,15 +199,13 @@ impl SpikeState {
         // Overlay outranks Top.
         let overlay = self
             .layer_surfaces
-            .iter()
-            .rfind(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Overlay));
+            .iter().rfind(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Overlay));
         if let Some(l) = overlay {
             return Some(l.surface.wl_surface());
         }
         let top = self
             .layer_surfaces
-            .iter()
-            .rfind(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Top));
+            .iter().rfind(|li| li.wants_exclusive_keyboard() && matches!(li.layer, Layer::Top));
         top.map(|l| l.surface.wl_surface())
     }
 

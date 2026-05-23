@@ -129,6 +129,7 @@ struct AutoConfig {
     explicit_mode: Option<ThemeMode>,
 }
 
+
 fn load_theme_config() -> AutoConfig {
     // Look for theme.json in XDG_CONFIG_HOME/compositor-slint/ or ~/.config/compositor-slint/
     let config_dir = std::env::var("XDG_CONFIG_HOME")

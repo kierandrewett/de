@@ -15,6 +15,8 @@ use zbus::{
     Connection, Proxy,
 };
 
+
+
 /// Read the `Menu` object-path property from a StatusNotifierItem. Some
 /// SNI clients don't ship a menu — return None and the caller falls back
 /// to the legacy `ContextMenu(x, y)` interaction.
@@ -179,9 +181,7 @@ where
             }
         };
         let nodes =
-            rt.block_on(
-                async move { fetch_dbusmenu_children(&service, &menu_path, parent_id).await },
-            );
+            rt.block_on(async move { fetch_dbusmenu_children(&service, &menu_path, parent_id).await });
         done(nodes);
     });
 }
@@ -233,10 +233,7 @@ async fn fetch_dbusmenu_children(
         "dbusmenu fetch: GetLayout({parent_id}) ok — {} raw children",
         children.len()
     );
-    children
-        .iter()
-        .filter_map(|c| parse_menu_child(c))
-        .collect()
+    children.iter().filter_map(|c| parse_menu_child(c)).collect()
 }
 
 /// Send `Event(item_id, kind, null, now)` to a `com.canonical.dbusmenu`
