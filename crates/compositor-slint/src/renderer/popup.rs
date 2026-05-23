@@ -1,8 +1,8 @@
 //! Popup positioning + hit-testing utilities for the compositor render path.
 //!
-//! Extracted from renderer.rs. `popup_rect` walks the popup hierarchy and
-//! anchors each popup against its parent (which may itself be a popup or a
-//! toplevel WindowState). `popup_surface_under` is the hit-test that
+//! Extracted from renderer.rs. `popup_rect` walks the popup hierarchy, reads
+//! each popup's committed Smithay geometry, and anchors it against its parent
+//! (which may itself be a popup or a toplevel WindowState). `popup_surface_under` is the hit-test that
 //! `forward_pointer_motion` / `forward_pointer_button` consult to route
 //! pointer events to popups when the cursor is over one.
 
@@ -21,20 +21,22 @@ impl CompositorApp {
             let p = popup.pixels.lock().unwrap();
             (p.width as i32, p.height as i32)
         };
-        let w = if popup.w > 0 { popup.w } else { bw };
-        let h = if popup.h > 0 { popup.h } else { bh };
+        let geometry = popup.configured_geometry()?;
+        let w = if geometry.size.w > 0 { geometry.size.w } else { bw };
+        let h = if geometry.size.h > 0 { geometry.size.h } else { bh };
         if w <= 0 || h <= 0 {
             return None;
         }
 
-        let mut abs_x = popup.rel_x;
-        let mut abs_y = popup.rel_y;
+        let mut abs_x = geometry.loc.x;
+        let mut abs_y = geometry.loc.y;
         let mut cur_parent = popup.parent.clone();
         let mut anchored = false;
         for _ in 0..16 {
             if let Some(parent_popup) = state.popups.iter().find(|p| p.surface == cur_parent) {
-                abs_x += parent_popup.rel_x;
-                abs_y += parent_popup.rel_y;
+                let parent_geometry = parent_popup.configured_geometry()?;
+                abs_x += parent_geometry.loc.x;
+                abs_y += parent_geometry.loc.y;
                 cur_parent = parent_popup.parent.clone();
                 continue;
             }
