@@ -12,6 +12,7 @@
 use smithay::{
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
+    wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
 };
 use winit::event::MouseButton;
 
@@ -31,6 +32,23 @@ pub fn winit_button_to_evdev(button: MouseButton) -> u32 {
 }
 
 pub type SurfaceHit = Option<(WlSurface, f64, f64)>;
+
+pub fn keyboard_shortcuts_inhibited(state: &SpikeState) -> bool {
+    let focused_surface = state
+        .seat
+        .get_keyboard()
+        .and_then(|keyboard| keyboard.current_focus())
+        .and_then(|focus| focus.wl_surface().map(|surface| surface.into_owned()))
+        .or_else(|| state.active_surface.clone());
+
+    focused_surface.is_some_and(|surface| {
+        state
+            .seat
+            .keyboard_shortcuts_inhibitor_for_surface(&surface)
+            .map(|inhibitor| inhibitor.is_active())
+            .unwrap_or(false)
+    })
+}
 
 pub fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent) {
     use smithay::input::keyboard::Keycode;

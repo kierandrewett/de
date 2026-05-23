@@ -194,6 +194,7 @@ struct CompositorApp {
 
     // Hotkey state — Super key held tracking for Super+T theme toggle.
     super_held: bool,
+    shortcuts_inhibited: bool,
 
     // Dock state.
     dock_entries: Vec<ResolvedDockEntry>,
@@ -407,6 +408,7 @@ impl CompositorApp {
             dnd_icon_pass: None,
             theme: ThemeState::new(),
             super_held: false,
+            shortcuts_inhibited: false,
             pointer_pos: (0.0, 0.0),
             last_clock_update: Instant::now(),
             calendar_month_offset: 0,
@@ -823,147 +825,136 @@ impl ApplicationHandler for CompositorApp {
                 // selection and never reach wayland clients. Escape is
                 // already handled below in the catch-all overlay-close
                 // branch.
-                let menu_consumed = if pressed {
-                    self.handle_menu_nav_key(scancode)
+                let shortcuts_inhibited = self.shortcuts_inhibited;
+                let menu_consumed = if !shortcuts_inhibited {
+                    if pressed {
+                        self.handle_menu_nav_key(scancode)
+                    } else {
+                        // Swallow the matching release so clients don't see a
+                        // stray key-up for a press they never received.
+                        matches!(scancode, 103 | 108 | 28 | 96) && self.menu_nav_active()
+                    }
                 } else {
-                    // Swallow the matching release so clients don't see a
-                    // stray key-up for a press they never received.
-                    matches!(scancode, 103 | 108 | 28 | 96) && self.menu_nav_active()
+                    false
                 };
                 let mut compositor_consumed = release_consumed || menu_consumed;
 
-                // ── Super+T → toggle light/dark theme ─────────────────────
-                // Scancode 125 = KEY_LEFTMETA (Super/Win key)
-                // Scancode 126 = KEY_RIGHTMETA
-                // Scancode 20  = KEY_T
-                match scancode {
-                    125 | 126 => {
-                        self.super_held = pressed;
-                    }
-                    20 if pressed && self.super_held => {
-                        // Super+T → toggle light/dark theme + per-mode wallpaper.
-                        self.theme.toggle_mode();
-                        self.apply_theme_to_slint();
-                        self.swap_wallpaper_for_current_mode();
-                        debug!("Super+T: toggled theme to {:?}", self.theme.current_mode);
-                        compositor_consumed = true;
-                    }
-                    23 if pressed && self.super_held => {
-                        // Super+I → toggle debug overlay.
-                        if let Some(ui) = self.ui.as_ref() {
-                            let now = ui.get_debug_overlay_visible();
-                            ui.set_debug_overlay_visible(!now);
+                if !shortcuts_inhibited {
+                    // Scancode 125 = KEY_LEFTMETA (Super/Win key), 126 = KEY_RIGHTMETA.
+                    match scancode {
+                        125 | 126 => {
+                            self.super_held = pressed;
                         }
-                        compositor_consumed = true;
-                    }
-                    53 if pressed && self.super_held => {
-                        // Super+/ → keyboard shortcuts help.
-                        if let Some(ui) = self.ui.as_ref() {
-                            let now = ui.get_help_overlay_visible();
-                            ui.set_help_overlay_visible(!now);
+                        20 if pressed && self.super_held => {
+                            self.theme.toggle_mode();
+                            self.apply_theme_to_slint();
+                            self.swap_wallpaper_for_current_mode();
+                            debug!("Super+T: toggled theme to {:?}", self.theme.current_mode);
+                            compositor_consumed = true;
                         }
-                        compositor_consumed = true;
-                    }
-                    // Super+W (scancode 17) → close focused window.
-                    17 if pressed && self.super_held => {
-                        if let Some(id) = self.wm.focused_id() {
-                            self.pending_close.lock().unwrap().push_back(id);
-                            debug!("Super+W: queued close for focused id={}", id);
-                        }
-                        compositor_consumed = true;
-                    }
-                    // Super+M (scancode 50) → minimize focused window.
-                    50 if pressed && self.super_held => {
-                        if let Some(id) = self.wm.focused_id() {
-                            self.pending_minimize.lock().unwrap().push_back(id);
-                            debug!("Super+M: queued minimize for focused id={}", id);
-                        }
-                        compositor_consumed = true;
-                    }
-                    // Super+D (scancode 32) → show desktop / minimize all.
-                    32 if pressed && self.super_held => {
-                        let ids: Vec<i32> = self
-                            .wm
-                            .windows
-                            .values()
-                            .filter(|w| !w.minimized && !w.closing)
-                            .map(|w| w.id)
-                            .collect();
-                        let mut q = self.pending_minimize.lock().unwrap();
-                        for id in ids {
-                            q.push_back(id);
-                        }
-                        debug!("Super+D: minimized all visible windows");
-                        compositor_consumed = true;
-                    }
-                    // Super+Space (scancode 57) → toggle the app launcher.
-                    57 if pressed && self.super_held => {
-                        if let Some(ui) = self.ui.as_ref() {
-                            let now = ui.get_launcher_open();
-                            ui.set_launcher_open(!now);
-                            if !now {
-                                ui.set_launcher_query(SharedString::default());
+                        23 if pressed && self.super_held => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let now = ui.get_debug_overlay_visible();
+                                ui.set_debug_overlay_visible(!now);
                             }
+                            compositor_consumed = true;
                         }
-                        compositor_consumed = true;
-                    }
-                    // Escape → close any open compositor overlay (menus,
-                    // popouts, debug overlay, launcher) without forwarding
-                    // to clients.
-                    1 if pressed => {
-                        if let Some(ui) = self.ui.as_ref() {
-                            let any_open = ui.get_desktop_menu_open()
-                                || ui.get_datetime_popout_open()
-                                || ui.get_control_centre_open()
-                                || ui.get_help_overlay_visible()
-                                || ui.get_launcher_open()
-                                || ui.get_dock_menu_open()
-                                || ui.get_window_menu_open();
-                            if any_open {
-                                ui.set_desktop_menu_open(false);
-                                ui.set_datetime_popout_open(false);
-                                ui.set_control_centre_open(false);
-                                ui.set_help_overlay_visible(false);
-                                ui.set_launcher_open(false);
-                                ui.set_dock_menu_open(false);
-                                ui.set_window_menu_open(false);
-                                if let Some(gpu) = self.gpu_window.as_ref() {
-                                    gpu.mark_dirty();
+                        53 if pressed && self.super_held => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let now = ui.get_help_overlay_visible();
+                                ui.set_help_overlay_visible(!now);
+                            }
+                            compositor_consumed = true;
+                        }
+                        17 if pressed && self.super_held => {
+                            if let Some(id) = self.wm.focused_id() {
+                                self.pending_close.lock().unwrap().push_back(id);
+                                debug!("Super+W: queued close for focused id={}", id);
+                            }
+                            compositor_consumed = true;
+                        }
+                        50 if pressed && self.super_held => {
+                            if let Some(id) = self.wm.focused_id() {
+                                self.pending_minimize.lock().unwrap().push_back(id);
+                                debug!("Super+M: queued minimize for focused id={}", id);
+                            }
+                            compositor_consumed = true;
+                        }
+                        32 if pressed && self.super_held => {
+                            let ids: Vec<i32> = self
+                                .wm
+                                .windows
+                                .values()
+                                .filter(|w| !w.minimized && !w.closing)
+                                .map(|w| w.id)
+                                .collect();
+                            let mut q = self.pending_minimize.lock().unwrap();
+                            for id in ids {
+                                q.push_back(id);
+                            }
+                            debug!("Super+D: minimized all visible windows");
+                            compositor_consumed = true;
+                        }
+                        57 if pressed && self.super_held => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let now = ui.get_launcher_open();
+                                ui.set_launcher_open(!now);
+                                if !now {
+                                    ui.set_launcher_query(SharedString::default());
                                 }
-                                compositor_consumed = true;
+                            }
+                            compositor_consumed = true;
+                        }
+                        1 if pressed => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let any_open = ui.get_desktop_menu_open()
+                                    || ui.get_datetime_popout_open()
+                                    || ui.get_control_centre_open()
+                                    || ui.get_help_overlay_visible()
+                                    || ui.get_launcher_open()
+                                    || ui.get_dock_menu_open()
+                                    || ui.get_window_menu_open();
+                                if any_open {
+                                    ui.set_desktop_menu_open(false);
+                                    ui.set_datetime_popout_open(false);
+                                    ui.set_control_centre_open(false);
+                                    ui.set_help_overlay_visible(false);
+                                    ui.set_launcher_open(false);
+                                    ui.set_dock_menu_open(false);
+                                    ui.set_window_menu_open(false);
+                                    if let Some(gpu) = self.gpu_window.as_ref() {
+                                        gpu.mark_dirty();
+                                    }
+                                    compositor_consumed = true;
+                                }
                             }
                         }
-                    }
-                    // Menu key (KEY_MENU = 127 on Linux input) → open
-                    // the window context menu for the focused window
-                    // at its titlebar centre.
-                    127 if pressed => {
-                        if let Some(focused_id) = self.wm.focused_id() {
-                            if let Some(win) = self.wm.windows.values().find(|w| w.id == focused_id)
-                            {
-                                let (wx, wy, ww) = (
-                                    win.anim.current_x() as f64,
-                                    win.anim.current_y() as f64,
-                                    win.anim.current_w() as f64,
-                                );
-                                // Anchor at titlebar centre, just below
-                                // its bottom edge so the menu drops
-                                // out of the chrome.
-                                let titlebar_h = crate::wm::TITLEBAR_HEIGHT;
-                                let cx = wx + ww / 2.0;
-                                let cy = wy + titlebar_h;
-                                self.open_window_menu(focused_id, cx, cy);
-                                compositor_consumed = true;
+                        127 if pressed => {
+                            if let Some(focused_id) = self.wm.focused_id() {
+                                if let Some(win) = self.wm.windows.values().find(|w| w.id == focused_id) {
+                                    let (wx, wy, ww) = (
+                                        win.anim.current_x() as f64,
+                                        win.anim.current_y() as f64,
+                                        win.anim.current_w() as f64,
+                                    );
+                                    let titlebar_h = crate::wm::TITLEBAR_HEIGHT;
+                                    let cx = wx + ww / 2.0;
+                                    let cy = wy + titlebar_h;
+                                    self.open_window_menu(focused_id, cx, cy);
+                                    compositor_consumed = true;
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                }
 
-                // Handle Alt-Tab cycling in the winit handler so we get
-                // immediate key state without waiting for the calloop round-trip.
-                if self.handle_alt_tab_key(&key_event) {
-                    compositor_consumed = true;
+                    // Handle Alt-Tab cycling in the winit handler so we get
+                    // immediate key state without waiting for the calloop round-trip.
+                    if self.handle_alt_tab_key(&key_event) {
+                        compositor_consumed = true;
+                    }
+                } else if matches!(scancode, 125 | 126) {
+                    self.super_held = false;
                 }
 
                 if pressed && compositor_consumed && scancode > 0 {
@@ -5992,6 +5983,8 @@ pub fn run() -> Result<()> {
     // 7. Main loop.
     info!("Entering GPU compositor main loop");
     loop {
+        app.shortcuts_inhibited = input_util::keyboard_shortcuts_inhibited(&state);
+
         match winit_event_loop.pump_app_events(Some(Duration::from_millis(1)), &mut app) {
             PumpStatus::Exit(_) => {
                 info!("winit exited");
