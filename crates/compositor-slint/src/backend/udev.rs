@@ -1,16 +1,17 @@
-//! Production udev/DRM backend skeleton.
+//! Production udev/DRM backend bootstrap.
 //!
-//! This path verifies the first production prerequisites: libseat session
+//! This path owns the first hardware-backend lifecycle stages: libseat session
 //! creation, udev device discovery, libinput seat assignment, calloop event
-//! source registration, and DRM/KMS probing. It intentionally stops before
-//! modesetting so the current winit backend remains the only runnable compositor
-//! path until the DRM render loop lands.
+//! source registration, and DRM/KMS probing. The KMS render loop is still a
+//! follow-up, but the backend now keeps the compositor event loop alive instead
+//! of exiting after probe.
 
 use anyhow::{bail, Context, Result};
 use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use smithay::backend::{
@@ -44,7 +45,7 @@ use smithay::reexports::{
     rustix::fs::OFlags,
 };
 use smithay::utils::{DeviceFd, Point, SERIAL_COUNTER};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{wayland_runtime::WaylandRuntime, wayland_state::SpikeState};
 
@@ -65,10 +66,11 @@ pub fn run() -> Result<()> {
         info!("udev backend: clear-screen pageflip disabled; set DE_COMPOSITOR_UDEV_CLEAR=1 to try it");
     }
 
-    bail!(
-        "udev/DRM backend probe succeeded ({count} DRM device(s)); DRM/KMS modesetting is not implemented yet, run with --backend=winit",
+    info!(
         count = device_count,
-    )
+        "udev backend: DRM probe succeeded; entering compositor event loop"
+    );
+    runtime.run_event_loop()
 }
 
 struct UdevRuntime {
@@ -300,6 +302,27 @@ impl UdevRuntime {
                         "udev backend: DRM device removed from probe list"
                     );
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run_event_loop(&mut self) -> Result<()> {
+        info!(
+            socket = ?self.wayland.socket_name,
+            "udev backend: Wayland event loop running; KMS rendering remains TODO"
+        );
+
+        while !self.wayland.state.should_exit {
+            self.drain_hotplug_events()?;
+            self.wayland
+                .event_loop
+                .dispatch(Some(Duration::from_millis(16)), &mut self.wayland.state)
+                .map_err(|err| anyhow::anyhow!("udev backend event loop dispatch failed: {err:?}"))?;
+            self.drain_hotplug_events()?;
+            if let Err(err) = self.wayland.display_handle.flush_clients() {
+                error!(?err, "udev backend: failed to flush Wayland clients");
             }
         }
 
