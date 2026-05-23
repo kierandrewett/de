@@ -11,6 +11,7 @@ use smithay::{
     delegate_commit_timing, delegate_fifo, delegate_presentation,
     output::Output,
     reexports::wayland_server::{backend::ObjectId, protocol::wl_surface::WlSurface, Resource},
+    wayland::compositor::{with_surface_tree_downward, TraversalAction},
 };
 use tracing::debug;
 

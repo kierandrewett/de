@@ -30,7 +30,9 @@ use smithay::{
 use smithay::reexports::calloop::Interest;
 use tracing::debug;
 
-use crate::wayland_state::{import_shm_buffer, import_shm_per_surface};
+use crate::wayland_state::{
+    consume_pending_dmabuf_per_surface, import_shm_buffer, import_shm_per_surface,
+};
 use crate::wayland_state::{ClientState, ClientSurfaceData, SpikeState};
 
 impl CompositorHandler for SpikeState {
@@ -265,6 +267,14 @@ impl CompositorHandler for SpikeState {
                 });
                 let pixels = self.cursor_surface_pixels.clone();
                 let _ = import_shm_buffer(cursor_surf, &pixels);
+                if let Some(data) = self
+                    .dmabuf_pending
+                    .remove(&cursor_surf.id())
+                    .or_else(|| self.dmabuf_pending.remove(&surface.id()))
+                    .or_else(|| self.dmabuf_pending.remove(&root.id()))
+                {
+                    *pixels.lock().unwrap() = data;
+                }
                 return;
             }
         }
@@ -294,6 +304,14 @@ impl CompositorHandler for SpikeState {
                 }
                 let pixels = self.dnd_icon_pixels.clone();
                 let _ = import_shm_buffer(&icon_surf, &pixels);
+                if let Some(data) = self
+                    .dmabuf_pending
+                    .remove(&icon_surf.id())
+                    .or_else(|| self.dmabuf_pending.remove(&surface.id()))
+                    .or_else(|| self.dmabuf_pending.remove(&root.id()))
+                {
+                    *pixels.lock().unwrap() = data;
+                }
                 return;
             }
         }
@@ -339,13 +357,14 @@ impl CompositorHandler for SpikeState {
             let surface_pixels_arc = self.popups[pidx].surface_pixels.clone();
             let _ = import_shm_buffer(&popup_surf, &pixels_arc);
             let _ = import_shm_per_surface(&popup_surf, &surface_pixels_arc);
-            // Consume DMA-BUF pending pixels populated by import_dmabuf_for_surface
-            // earlier in this commit. Layer surfaces + toplevels already do this;
-            // popups were left out, which is why GTK context menus (which use
-            // DMA-BUF via libwayland-cursor / GL) appeared to "not show" —
-            // popup.pixels stayed at width=0 and the renderer skipped them.
+            let _ = consume_pending_dmabuf_per_surface(
+                &popup_surf,
+                &mut self.dmabuf_pending,
+                &surface_pixels_arc,
+            );
             if pixels_arc.lock().unwrap().width == 0 {
-                if let Some(data) = self.dmabuf_pending.remove(&popup_surf.id()) {
+                let key = popup_surf.id().protocol_id();
+                if let Some(data) = surface_pixels_arc.lock().unwrap().get(&key).cloned() {
                     debug!(
                         "DMA-BUF: consuming pending {}x{} pixels for popup",
                         data.width, data.height
@@ -387,13 +406,23 @@ impl CompositorHandler for SpikeState {
             .position(|li| li.surface.wl_surface() == &root);
         if let Some(idx) = layer_idx {
             let pixels_arc = self.layer_surfaces[idx].pixels.clone();
+            let surface_pixels_arc = self.layer_surfaces[idx].surface_pixels.clone();
             let _ = import_shm_buffer(&root, &pixels_arc);
-            if let Some(data) = self.dmabuf_pending.remove(&root.id()) {
-                debug!(
-                    "DMA-BUF: consuming pending {}x{} pixels for layer surface",
-                    data.width, data.height
-                );
-                *pixels_arc.lock().unwrap() = data;
+            let _ = import_shm_per_surface(&root, &surface_pixels_arc);
+            let consumed_dmabuf = consume_pending_dmabuf_per_surface(
+                &root,
+                &mut self.dmabuf_pending,
+                &surface_pixels_arc,
+            );
+            let key = root.id().protocol_id();
+            if consumed_dmabuf > 0 {
+                if let Some(data) = surface_pixels_arc.lock().unwrap().get(&key).cloned() {
+                    debug!(
+                        "DMA-BUF: consuming pending {}x{} pixels for layer surface",
+                        data.width, data.height
+                    );
+                    *pixels_arc.lock().unwrap() = data;
+                }
             }
             return;
         }
@@ -429,39 +458,23 @@ impl CompositorHandler for SpikeState {
             // buffer_transform.
             let surface_pixels_arc = self.toplevels[idx].surface_pixels.clone();
             let _ = import_shm_per_surface(surface, &surface_pixels_arc);
+            let _ = consume_pending_dmabuf_per_surface(
+                surface,
+                &mut self.dmabuf_pending,
+                &surface_pixels_arc,
+            );
 
             // If SHM import produced nothing (width == 0), pull the
             // surface-keyed DMA-BUF pixels populated earlier in this commit.
             // Keying by surface id (rather than "WxH") prevents two surfaces
             // at the same resolution from swapping each other's frames.
             if pixels_arc.lock().unwrap().width == 0 {
-                if let Some(data) = self.dmabuf_pending.remove(&surface.id()) {
+                let key = surface.id().protocol_id();
+                if let Some(data) = surface_pixels_arc.lock().unwrap().get(&key).cloned() {
                     debug!(
                         "DMA-BUF: consuming pending {}x{} pixels for toplevel",
                         data.width, data.height
                     );
-                    // Mirror into the per-surface map; legacy pixels_arc
-                    // gets the owned buffer. Cloning is unavoidable while
-                    // both code paths coexist (~25 readers depend on
-                    // pixels_arc.pixels). Future Phase 5 work will
-                    // eliminate one of them.
-                    use smithay::reexports::wayland_server::Resource;
-                    let key = surface.id().protocol_id();
-                    {
-                        let mut sp = surface_pixels_arc.lock().unwrap();
-                        let prev_version = sp.get(&key).map(|d| d.version).unwrap_or(0);
-                        sp.insert(
-                            key,
-                            crate::wayland_state::ClientSurfaceData {
-                                pixels: data.pixels.clone(),
-                                width: data.width,
-                                height: data.height,
-                                dirty: true,
-                                version: prev_version.wrapping_add(1),
-                                last_commit: None,
-                            },
-                        );
-                    }
                     *pixels_arc.lock().unwrap() = data;
                 }
             }

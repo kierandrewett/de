@@ -64,7 +64,10 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState},
         content_type::ContentTypeState,
         cursor_shape::CursorShapeManagerState,
-        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        dmabuf::{
+            DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
+            ImportNotifier,
+        },
         fifo::FifoManagerState,
         foreign_toplevel_list::{ForeignToplevelHandle, ForeignToplevelListState},
         fractional_scale::FractionalScaleManagerState,
@@ -352,6 +355,7 @@ pub struct SpikeState {
     pub xdg_shell_state: XdgShellState,
     pub output_manager_state: OutputManagerState,
     pub dmabuf_state: DmabufState,
+    pub dmabuf_default_feedback: Option<DmabufFeedback>,
     pub presentation_state: PresentationState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
 
@@ -724,6 +728,7 @@ impl SpikeState {
             xdg_shell_state,
             output_manager_state,
             dmabuf_state,
+            dmabuf_default_feedback: None,
             presentation_state,
             single_pixel_buffer_state,
             layer_shell_state,
@@ -1070,6 +1075,7 @@ impl SpikeState {
         if let Some(node) = render_node {
             match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone()).build() {
                 Ok(feedback) => {
+                    self.dmabuf_default_feedback = Some(feedback.clone());
                     let _ = self
                         .dmabuf_state
                         .create_global_with_default_feedback::<Self>(&dh, &feedback);
@@ -1086,6 +1092,7 @@ impl SpikeState {
             warn!("DMA-BUF: no EGL render node — falling back to v3");
         }
 
+        self.dmabuf_default_feedback = None;
         let _ = self.dmabuf_state.create_global::<Self>(&dh, dmabuf_formats);
         info!(formats = n_formats, "DMA-BUF v3 global advertised");
     }
@@ -1792,6 +1799,50 @@ pub fn import_shm_per_surface(
     imported
 }
 
+/// Consume pending DMA-BUF imports into the same per-surface model as SHM.
+///
+/// `import_dmabuf_for_surface` stores readback pixels under the committing
+/// `wl_surface` id. This helper walks the whole tree rooted at `root`, drains
+/// any matching pending entries, and mirrors them into `surface_pixels_out` so
+/// subsurfaces, popups, cursor-like trees, and normal SHM trees share one render
+/// model.
+pub fn consume_pending_dmabuf_per_surface(
+    root: &WlSurface,
+    pending: &mut std::collections::HashMap<ObjectId, ClientSurfaceData>,
+    surface_pixels_out: &Arc<Mutex<std::collections::HashMap<u32, ClientSurfaceData>>>,
+) -> usize {
+    use smithay::reexports::wayland_server::Resource;
+    use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+
+    let mut surfaces: Vec<WlSurface> = Vec::new();
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |surface, _, _| surfaces.push(surface.clone()),
+        |_, _, _| true,
+    );
+
+    let mut consumed = 0usize;
+    let mut out_map = surface_pixels_out.lock().unwrap();
+    for surface in surfaces {
+        let Some(mut data) = pending.remove(&surface.id()) else {
+            continue;
+        };
+        let key = surface.id().protocol_id();
+        let next_version = out_map
+            .get(&key)
+            .map(|existing| existing.version.wrapping_add(1))
+            .unwrap_or(data.version.max(1));
+        data.version = next_version;
+        data.dirty = true;
+        out_map.insert(key, data);
+        consumed += 1;
+    }
+
+    consumed
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // BufferHandler + ShmHandler
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1850,6 +1901,23 @@ impl DmabufHandler for SpikeState {
                 drop(notifier);
             }
         }
+    }
+
+    fn new_surface_feedback(
+        &mut self,
+        surface: &WlSurface,
+        _global: &DmabufGlobal,
+    ) -> Option<DmabufFeedback> {
+        use smithay::reexports::wayland_server::Resource;
+
+        let feedback = self.dmabuf_default_feedback.clone();
+        if feedback.is_some() {
+            debug!(
+                surface_id = surface.id().protocol_id(),
+                "DMA-BUF: sending per-surface feedback from import renderer"
+            );
+        }
+        feedback
     }
 }
 

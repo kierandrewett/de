@@ -700,8 +700,8 @@ impl CompositorApp {
                     let commit = data
                         .last_commit
                         .unwrap_or_else(|| CommitCounter::from(data.version as usize));
-                    let screen_x = win.anim.current_x() as i32 + offset.0 - geom_x;
-                    let screen_y = win.anim.current_y() as i32 + titlebar_y + offset.1 - geom_y;
+                    let screen_x = win.anim.current_x() + offset.0 - geom_x;
+                    let screen_y = win.anim.current_y() + titlebar_y + offset.1 - geom_y;
                     elements.push(DamageTrackedElement::surface(
                         sub.clone(),
                         commit,
@@ -820,8 +820,8 @@ impl CompositorApp {
                     .find(|toplevel| toplevel.surface == parent)
                     .map(|toplevel| if toplevel.csd { 0 } else { crate::wm::TITLEBAR_HEIGHT as i32 })
                     .unwrap_or(0);
-                x += window.anim.current_x() as i32;
-                y += window.anim.current_y() as i32 + titlebar;
+                x += window.anim.current_x();
+                y += window.anim.current_y() + titlebar;
                 return Some((x, y));
             }
 
@@ -1632,11 +1632,8 @@ impl CompositorApp {
 
     /// GPU render: damage-tracked Slint render + swapchain blit.
     fn render_frame(&mut self) -> Option<PresentedFrame> {
-        let gpu_window = match self.gpu_window.clone() {
-            Some(w) => w,
-            None => return None,
-        };
-        let Some(ui) = self.ui.as_ref() else { return None };
+        let gpu_window = self.gpu_window.clone()?;
+        let ui = self.ui.as_ref()?;
 
         let frame_start = Instant::now();
         let now = frame_start;
@@ -1687,9 +1684,7 @@ impl CompositorApp {
             }
         }
 
-        let Some(surface) = self.wgpu_surface.as_ref() else {
-            return None;
-        };
+        let surface = self.wgpu_surface.as_ref()?;
         let device = &gpu_window.wgpu_device;
         let queue = &gpu_window.wgpu_queue;
 
@@ -6420,40 +6415,6 @@ pub fn run() -> Result<()> {
     // 5. Compositor state + virtual output.
     let mut calloop = wayland.event_loop;
     let mut state = wayland.state;
-
-    // Advertise DMA-BUF support to clients.  We advertise common 8-bit formats
-    // with the LINEAR modifier; the GLES renderer (surfaceless EGL) will accept
-    // any format that EGL/Mesa supports at runtime.  Clients that want
-    // non-linear (tiled/compressed) formats will fall back to SHM.
-    {
-        use smithay::backend::allocator::{Format, Fourcc, Modifier};
-
-        // DrmModifier::Linear == 0
-        let linear = Modifier::Linear;
-        let formats: Vec<Format> = vec![
-            Format {
-                code: Fourcc::Argb8888,
-                modifier: linear,
-            },
-            Format {
-                code: Fourcc::Xrgb8888,
-                modifier: linear,
-            },
-            Format {
-                code: Fourcc::Abgr8888,
-                modifier: linear,
-            },
-            Format {
-                code: Fourcc::Xbgr8888,
-                modifier: linear,
-            },
-        ];
-
-        let _dmabuf_global = state
-            .dmabuf_state
-            .create_global::<SpikeState>(&display_handle, formats);
-        info!("DMA-BUF global advertised (Option B: EGL/GLES two-stage import)");
-    }
 
     // wl_output.physical_size is MILLIMETRES, not pixels. Anvil computes
     // this from the real monitor's EDID; on our virtual swapchain we
