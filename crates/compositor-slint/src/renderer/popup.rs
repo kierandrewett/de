@@ -112,7 +112,8 @@ impl CompositorApp {
     /// Used by both motion routing and the press-time focus refresh so
     /// the two cannot disagree. While the session is locked, the only
     /// valid focus is the lock surface for this output. Otherwise:
-    /// xdg popups (top) → layer-shell Overlay/Top → xdg toplevels →
+    /// xdg popups (top) → layer-shell Overlay/Top → X11 override-redirect →
+    /// xdg toplevels →
     /// layer-shell Bottom/Background. (Audit C11.)
     pub(super) fn surface_under_full(
         &self,
@@ -129,10 +130,69 @@ impl CompositorApp {
         }
         self.popup_surface_under(state, x, y)
             .or_else(|| self.layer_surface_under(state, x, y, &[Layer::Overlay, Layer::Top]))
+            .or_else(|| self.x11_override_redirect_surface_under(state, x, y))
             .or_else(|| self.wm.surface_under(x, y))
             .or_else(|| {
                 self.layer_surface_under(state, x, y, &[Layer::Bottom, Layer::Background])
             })
+    }
+
+    pub(super) fn client_popup_surface_under(
+        &self,
+        state: &SpikeState,
+        x: f64,
+        y: f64,
+    ) -> Option<(WlSurface, f64, f64)> {
+        self.popup_surface_under(state, x, y)
+            .or_else(|| self.x11_override_redirect_surface_under(state, x, y))
+    }
+
+    pub(super) fn x11_override_redirect_surface_under(
+        &self,
+        state: &SpikeState,
+        x: f64,
+        y: f64,
+    ) -> Option<(WlSurface, f64, f64)> {
+        use smithay::desktop::utils::under_from_surface_tree;
+        use smithay::desktop::WindowSurfaceType;
+        use smithay::utils::Point;
+
+        for toplevel in state.toplevels.iter().rev() {
+            let Some(x11) = toplevel.x11_surface.as_ref() else {
+                continue;
+            };
+            if x11
+                .user_data()
+                .get::<crate::wayland::xwayland::X11OverrideRedirect>()
+                .is_none()
+            {
+                continue;
+            }
+
+            let geo = x11.geometry();
+            let width = geo.size.w.max(1) as f64;
+            let height = geo.size.h.max(1) as f64;
+            let origin_x = geo.loc.x as f64;
+            let origin_y = geo.loc.y as f64;
+            if x < origin_x || x >= origin_x + width || y < origin_y || y >= origin_y + height {
+                continue;
+            }
+
+            let surface_origin =
+                Point::<i32, smithay::utils::Logical>::from((geo.loc.x, geo.loc.y));
+            if let Some((surface, origin)) = under_from_surface_tree(
+                &toplevel.surface,
+                Point::from((x, y)),
+                surface_origin,
+                WindowSurfaceType::ALL,
+            ) {
+                return Some((surface, origin.x as f64, origin.y as f64));
+            }
+
+            return Some((toplevel.surface.clone(), origin_x, origin_y));
+        }
+
+        None
     }
 
     pub(super) fn popup_surface_under(

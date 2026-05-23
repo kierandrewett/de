@@ -26,15 +26,23 @@
 //! "ack at the geometry the client asked for" behaviour, which is enough
 //! for `xterm`, `xclock`, and most XInput-only X11 apps to display.
 
+use std::borrow::Cow;
 use std::os::unix::io::OwnedFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use smithay::{
+    backend::input::KeyState,
     delegate_xwayland_keyboard_grab, delegate_xwayland_shell,
+    desktop::PopupKind,
+    input::{
+        keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
+        Seat,
+    },
     reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
-    utils::{Logical, Rectangle, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
+        seat::WaylandFocus,
         selection::{
             data_device::{
                 clear_data_device_selection, current_data_device_selection_userdata,
@@ -133,6 +141,121 @@ fn refresh_transient_for(state: &SpikeState, child: &X11Surface) {
 /// their composited pixels through the popup pipeline instead.
 #[derive(Debug, Clone, Copy)]
 pub struct X11OverrideRedirect;
+
+/// Keyboard focus target that preserves smithay's X11-specific focus path.
+///
+/// Native Wayland surfaces still receive focus as raw `WlSurface`s. XWayland
+/// toplevels receive focus through `X11Surface`, whose `KeyboardTarget` impl
+/// drives ICCCM input-model handling, `SetInputFocus`, and `WM_TAKE_FOCUS`.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum KeyboardFocusTarget {
+    Wayland(WlSurface),
+    X11(X11Surface),
+}
+
+impl KeyboardFocusTarget {
+    pub fn for_wl_surface(state: &SpikeState, surface: &WlSurface) -> Self {
+        state
+            .toplevels
+            .iter()
+            .find(|toplevel| &toplevel.surface == surface)
+            .and_then(|toplevel| toplevel.x11_surface.clone())
+            .map(Self::X11)
+            .unwrap_or_else(|| Self::Wayland(surface.clone()))
+    }
+
+    pub fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        match self {
+            Self::Wayland(surface) => Some(Cow::Borrowed(surface)),
+            Self::X11(surface) => surface.wl_surface().map(Cow::Owned),
+        }
+    }
+
+    pub fn matches_wl_surface(&self, surface: &WlSurface) -> bool {
+        self.wl_surface().is_some_and(|focus| focus.as_ref() == surface)
+    }
+}
+
+impl From<PopupKind> for KeyboardFocusTarget {
+    fn from(popup: PopupKind) -> Self {
+        Self::Wayland(popup.wl_surface().clone())
+    }
+}
+
+impl From<KeyboardFocusTarget> for WlSurface {
+    fn from(target: KeyboardFocusTarget) -> Self {
+        target
+            .wl_surface()
+            .expect("keyboard focus target missing wl_surface")
+            .into_owned()
+    }
+}
+
+impl IsAlive for KeyboardFocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Wayland(surface) => surface.alive(),
+            Self::X11(surface) => surface.alive(),
+        }
+    }
+}
+
+impl KeyboardTarget<SpikeState> for KeyboardFocusTarget {
+    fn enter(
+        &self,
+        seat: &Seat<SpikeState>,
+        data: &mut SpikeState,
+        keys: Vec<KeysymHandle<'_>>,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+            Self::X11(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+        }
+    }
+
+    fn leave(&self, seat: &Seat<SpikeState>, data: &mut SpikeState, serial: Serial) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+            Self::X11(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+        }
+    }
+
+    fn key(
+        &self,
+        seat: &Seat<SpikeState>,
+        data: &mut SpikeState,
+        key: KeysymHandle<'_>,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::key(surface, seat, data, key, state, serial, time),
+            Self::X11(surface) => KeyboardTarget::key(surface, seat, data, key, state, serial, time),
+        }
+    }
+
+    fn modifiers(
+        &self,
+        seat: &Seat<SpikeState>,
+        data: &mut SpikeState,
+        modifiers: ModifiersState,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
+            Self::X11(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
+        }
+    }
+}
+
+impl WaylandFocus for KeyboardFocusTarget {
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        KeyboardFocusTarget::wl_surface(self)
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Process lifecycle
@@ -269,7 +392,11 @@ impl XWaylandShellHandler for SpikeState {
         if !is_or {
             self.active_surface = Some(wl_surface.clone());
             if let Some(kb) = self.seat.get_keyboard() {
-                kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+                kb.set_focus(
+                    self,
+                    Some(KeyboardFocusTarget::X11(x11_surface.clone())),
+                    SERIAL_COUNTER.next_serial(),
+                );
             }
             let _ = x11_surface.set_activated(true);
         }
@@ -293,10 +420,12 @@ delegate_xwayland_shell!(SpikeState);
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl XWaylandKeyboardGrabHandler for SpikeState {
-    fn keyboard_focus_for_xsurface(&self, surface: &WlSurface) -> Option<WlSurface> {
-        // Our SeatHandler::KeyboardFocus is `WlSurface` so the focus target
-        // for an X11 window is just the wl_surface backing it.
-        Some(surface.clone())
+    fn keyboard_focus_for_xsurface(&self, surface: &WlSurface) -> Option<KeyboardFocusTarget> {
+        self.toplevels
+            .iter()
+            .find(|toplevel| &toplevel.surface == surface)
+            .and_then(|toplevel| toplevel.x11_surface.clone())
+            .map(KeyboardFocusTarget::X11)
     }
 }
 
@@ -380,7 +509,11 @@ impl XwmHandler for SpikeState {
                 });
                 self.active_surface = Some(wl_surface.clone());
                 if let Some(kb) = self.seat.get_keyboard() {
-                    kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+                    kb.set_focus(
+                        self,
+                        Some(KeyboardFocusTarget::X11(window.clone())),
+                        SERIAL_COUNTER.next_serial(),
+                    );
                 }
                 let _ = window.set_activated(true);
                 // Resolve TRANSIENT_FOR now that both parent and child are in
@@ -560,7 +693,11 @@ impl XwmHandler for SpikeState {
         };
         self.active_surface = Some(wl_surface.clone());
         if let Some(kb) = self.seat.get_keyboard() {
-            kb.set_focus(self, Some(wl_surface), SERIAL_COUNTER.next_serial());
+            kb.set_focus(
+                self,
+                Some(KeyboardFocusTarget::X11(window.clone())),
+                SERIAL_COUNTER.next_serial(),
+            );
         }
         let _ = window.set_activated(true);
     }
@@ -761,7 +898,7 @@ impl XwmHandler for SpikeState {
             return false;
         };
         self.toplevels.iter().any(|t| {
-            t.surface == focus
+            focus.matches_wl_surface(&t.surface)
                 && t.x11_surface
                     .as_ref()
                     .and_then(|x| x.xwm_id())

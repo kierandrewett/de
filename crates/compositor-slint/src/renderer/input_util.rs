@@ -59,8 +59,13 @@ pub fn forward_keyboard_event(state: &mut SpikeState, key_event: PendingKeyEvent
         return;
     };
     // Only re-issue set_focus when the target actually changed (input audit P0.7).
-    if keyboard.current_focus().as_ref() != Some(&surface) {
-        keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+    let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(state, &surface);
+    if !keyboard
+        .current_focus()
+        .as_ref()
+        .is_some_and(|current| current.matches_wl_surface(&surface))
+    {
+        keyboard.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
     }
     let serial = SERIAL_COUNTER.next_serial();
     let time = state.clock.now().as_millis();

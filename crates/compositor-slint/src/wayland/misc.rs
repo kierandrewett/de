@@ -74,7 +74,13 @@ impl XdgActivationHandler for SpikeState {
         self.active_surface = Some(surface.clone());
         if let Some(kb) = self.seat.get_keyboard() {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            kb.set_focus(self, Some(surface), serial);
+            kb.set_focus(
+                self,
+                Some(crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                    self, &surface,
+                )),
+                serial,
+            );
         }
     }
 }

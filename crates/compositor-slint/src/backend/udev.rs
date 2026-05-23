@@ -954,8 +954,15 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
             // Per-keystroke set_focus calls re-send wl_keyboard.enter/leave
             // and bump modifier serials (input audit P0.7) — clients see a
             // serial storm that interacts badly with grabs.
-            if keyboard.current_focus().as_ref() != Some(&surface) {
-                keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+            let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                state, &surface,
+            );
+            if !keyboard
+                .current_focus()
+                .as_ref()
+                .is_some_and(|current| current.matches_wl_surface(&surface))
+            {
+                keyboard.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
             }
             keyboard.input_forward(
                 state,
@@ -1150,7 +1157,10 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
             let surface_at = surface_under_for_touch(state, loc.x, loc.y);
             if let Some((surface, _, _)) = surface_at.as_ref() {
                 if let Some(kb) = state.seat.get_keyboard() {
-                    kb.set_focus(state, Some(surface.clone()), SERIAL_COUNTER.next_serial());
+                    let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                        state, surface,
+                    );
+                    kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
                 }
             }
             let under = surface_at.map(|(s, ox, oy)| (s, Point::from((ox, oy))));
