@@ -2986,6 +2986,7 @@ impl CompositorApp {
                 self.wm.begin_close_by_id(id);
             }
             self.update_focused_surface(state);
+            self.sync_x11_stacking_order(state);
         }
 
         // Minimize
@@ -3007,6 +3008,7 @@ impl CompositorApp {
                 self.sync_x11_window_state(&surf, state, None, None, Some(true));
             }
             self.update_focused_surface(state);
+            self.sync_x11_stacking_order(state);
         }
 
         // Maximize
@@ -3051,6 +3053,7 @@ impl CompositorApp {
             info!("WM: activate-window({})", id);
             self.wm.focus_by_id(id);
             self.update_focused_surface(state);
+            self.sync_x11_stacking_order(state);
         }
 
         // Dock-menu deferred actions: Show All Windows / Quit.
@@ -3074,6 +3077,7 @@ impl CompositorApp {
                     if let Some(&id) = ids.last() {
                         self.wm.focus_by_id(id);
                         self.update_focused_surface(state);
+                        self.sync_x11_stacking_order(state);
                     }
                 }
                 5 => {
@@ -3092,6 +3096,7 @@ impl CompositorApp {
                         }
                     }
                     self.update_focused_surface(state);
+                    self.sync_x11_stacking_order(state);
                 }
                 _ => {}
             }
@@ -3128,6 +3133,7 @@ impl CompositorApp {
         if commit {
             self.wm.alt_tab_commit();
             self.update_focused_surface(state);
+            self.sync_x11_stacking_order(state);
         }
 
         // ── xdg-shell client requests ─────────────────────────────────────
@@ -3255,6 +3261,7 @@ impl CompositorApp {
             if let Some(id) = self.wm.id_for_surface(&surface) {
                 self.wm.minimize_by_id(id);
                 self.update_focused_surface(state);
+                self.sync_x11_stacking_order(state);
             }
         }
 
@@ -3264,6 +3271,7 @@ impl CompositorApp {
             if let Some(id) = self.wm.id_for_surface(&surface) {
                 self.wm.restore_by_id(id);
                 self.update_focused_surface(state);
+                self.sync_x11_stacking_order(state);
             }
         }
     }
@@ -3279,6 +3287,20 @@ impl CompositorApp {
                 kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
             }
         }
+    }
+
+    fn sync_x11_stacking_order(&self, state: &mut SpikeState) {
+        if let Some(focused_surface) = self.wm.focused_surface() {
+            state.raise_x11_window_for_wl_surface(&focused_surface);
+        }
+        let top_to_bottom = self
+            .wm
+            .windows_sorted()
+            .into_iter()
+            .rev()
+            .map(|window| window.surface.clone())
+            .collect::<Vec<_>>();
+        state.sync_x11_stacking_order_top_to_bottom(&top_to_bottom);
     }
 
     /// Mirror a WM-driven maximize/fullscreen/minimize toggle back to the
@@ -3671,6 +3693,7 @@ impl CompositorApp {
                 if let Some(gpu_window) = self.gpu_window.as_ref() {
                     gpu_window.mark_dirty();
                 }
+                self.sync_x11_stacking_order(state);
             } else if !in_panel && !in_dock {
                 // Click on desktop / wallpaper.
                 if self.wm.unfocus_all() {
@@ -3721,7 +3744,15 @@ impl CompositorApp {
             let oh = self.wm.output_h as f64;
             let ow = self.wm.output_w as f64;
             let dock_h = crate::wm::DOCK_HEIGHT as f64;
-            let on_window = !over_client_popup && self.wm.pointer_click_focus(x, y).is_some();
+            let on_window_surface = if over_client_popup {
+                None
+            } else {
+                self.wm.pointer_click_focus(x, y)
+            };
+            if on_window_surface.is_some() {
+                self.sync_x11_stacking_order(state);
+            }
+            let on_window = on_window_surface.is_some();
             let in_panel = y < panel_h;
             let in_dock = self.point_in_dock_pill(x, y);
             if !over_client_popup && !on_window && !in_panel && !in_dock {
@@ -6317,7 +6348,9 @@ pub fn run() -> Result<()> {
         slint::platform::update_timers_and_animations();
 
         // Sync WM with SpikeState toplevels: register new toplevels + handle destroyed ones.
-        sync_new_toplevels(&mut app.wm, &mut state);
+        if sync_new_toplevels(&mut app.wm, &mut state) {
+            app.sync_x11_stacking_order(&mut state);
+        }
 
         // Process WM actions from Slint callbacks.
         app.process_wm_actions(&mut state);
@@ -6443,8 +6476,10 @@ pub fn run() -> Result<()> {
 
 /// Sync new and destroyed toplevels from `SpikeState` into the `WindowManager`.
 /// Called each main-loop iteration.
-fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
+fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) -> bool {
     use smithay::reexports::wayland_server::Resource;
+
+    let mut x11_stack_dirty = false;
 
     // Handle destroyed surfaces first: begin close animation.
     let destroyed: Vec<WlSurface> = state.destroyed_surfaces.drain(..).collect();
@@ -6453,6 +6488,7 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
         if wm.windows.contains_key(&key) {
             debug!("WM: toplevel destroyed → begin close animation key={}", key);
             wm.begin_close(surf);
+            x11_stack_dirty = true;
         }
     }
 
@@ -6476,6 +6512,7 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
             // Register the toplevel with the WM (starts open animation).
             let id = wm.add_window(toplevel.surface.clone());
             debug!("WM: synced new toplevel id={} key={}", id, key);
+            x11_stack_dirty = true;
         }
     }
 
@@ -6501,7 +6538,10 @@ fn sync_new_toplevels(wm: &mut WindowManager, state: &mut SpikeState) {
             let focused = wm.windows.get(&key).map(|w| w.focused).unwrap_or(false);
             if !focused {
                 wm.focus_surface(active);
+                x11_stack_dirty = true;
             }
         }
     }
+
+    x11_stack_dirty
 }
