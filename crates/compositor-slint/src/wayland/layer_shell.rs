@@ -19,9 +19,11 @@ use std::sync::{Arc, Mutex};
 use smithay::{
     delegate_layer_shell,
     reexports::wayland_server::protocol::{wl_output, wl_surface::WlSurface},
+    utils::{Logical, Size},
     wayland::shell::wlr_layer::{
         Anchor, ExclusiveZone, KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface,
-        LayerSurfaceCachedState, Margins, WlrLayerShellHandler, WlrLayerShellState,
+        LayerSurfaceCachedState, LayerSurfaceData, Margins, WlrLayerShellHandler,
+        WlrLayerShellState,
     },
 };
 use tracing::{info, trace};
@@ -167,6 +169,16 @@ fn effective_exclusive_edge(anchor: Anchor, explicit: Option<Anchor>) -> Option<
     }
 }
 
+pub fn layer_initial_configure_sent(surface: &WlrLayerSurface) -> bool {
+    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<LayerSurfaceData>()
+            .map(|data| data.lock().unwrap().initial_configure_sent)
+            .unwrap_or(false)
+    })
+}
+
 impl SpikeState {
     /// Per-edge sum of exclusive zones across all currently mapped Top +
     /// Bottom layer surfaces. Background / Overlay layers are not subtracted
@@ -259,6 +271,17 @@ impl SpikeState {
             li.y = rect.1;
             li.w = rect.2;
             li.h = rect.3;
+            let computed_size = Size::<i32, Logical>::from((li.w, li.h));
+            let size_changed = li.surface.with_pending_state(|state| {
+                state
+                    .size
+                    .replace(computed_size)
+                    .map(|old| old != computed_size)
+                    .unwrap_or(true)
+            });
+            if size_changed && layer_initial_configure_sent(&li.surface) {
+                li.surface.send_pending_configure();
+            }
             trace!(
                 ns = %li.namespace, layer = ?li.layer, anchor = ?li.anchor,
                 ez = ?li.exclusive_zone,
