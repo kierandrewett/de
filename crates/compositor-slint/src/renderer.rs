@@ -2573,6 +2573,14 @@ impl CompositorApp {
                     };
                     abs_y += tl_win.anim.current_y() + titlebar;
                 }
+                if let Some(layer) = state
+                    .layer_surfaces
+                    .iter()
+                    .find(|layer| layer.surface.wl_surface() == &cur_parent)
+                {
+                    abs_x += layer.x;
+                    abs_y += layer.y;
+                }
                 break;
             }
 

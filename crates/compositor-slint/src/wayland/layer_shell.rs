@@ -20,10 +20,13 @@ use smithay::{
     delegate_layer_shell,
     reexports::wayland_server::protocol::{wl_output, wl_surface::WlSurface},
     utils::{Logical, Size},
-    wayland::shell::wlr_layer::{
-        Anchor, ExclusiveZone, KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface,
-        LayerSurfaceCachedState, LayerSurfaceData, Margins, WlrLayerShellHandler,
-        WlrLayerShellState,
+    wayland::shell::{
+        wlr_layer::{
+            Anchor, ExclusiveZone, KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface,
+            LayerSurfaceCachedState, LayerSurfaceData, Margins, WlrLayerShellHandler,
+            WlrLayerShellState,
+        },
+        xdg::PopupSurface,
     },
 };
 use tracing::{info, trace};
@@ -127,6 +130,38 @@ impl WlrLayerShellHandler for SpikeState {
         info!("layer_shell: surface destroyed");
         self.layer_surfaces.retain(|li| li.surface != surface);
     }
+
+    fn new_popup(&mut self, parent: WlrLayerSurface, popup: PopupSurface) {
+        self.unconstrain_layer_popup(&parent, &popup);
+        if let Err(err) = popup.send_configure() {
+            tracing::warn!("layer-shell popup initial configure failed: {err:?}");
+            return;
+        }
+        if let Err(err) = self
+            .popup_manager
+            .track_popup(smithay::desktop::PopupKind::Xdg(popup.clone()))
+        {
+            tracing::warn!("failed to track layer-shell popup: {err}");
+            return;
+        }
+
+        let geom = popup.with_pending_state(|state| state.geometry);
+        self.popups.push(crate::wayland_state::PopupInfo {
+            surface: popup.wl_surface().clone(),
+            popup,
+            parent: parent.wl_surface().clone(),
+            rel_x: geom.loc.x,
+            rel_y: geom.loc.y,
+            w: geom.size.w,
+            h: geom.size.h,
+            pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            geom_x: 0,
+            geom_y: 0,
+            geom_w: 0,
+            geom_h: 0,
+        });
+    }
 }
 
 delegate_layer_shell!(SpikeState);
@@ -188,6 +223,30 @@ impl SpikeState {
             return;
         };
         self.refresh_layer_layout(output_w, output_h);
+    }
+
+    pub fn unconstrain_layer_popup(&self, parent: &WlrLayerSurface, popup: &PopupSurface) {
+        let Some(layer) = self
+            .layer_surfaces
+            .iter()
+            .find(|layer| layer.surface == *parent)
+        else {
+            return;
+        };
+        let Some((output_w, output_h)) = self.primary_output_logical_size() else {
+            return;
+        };
+
+        let kind = smithay::desktop::PopupKind::Xdg(popup.clone());
+        let mut target = smithay::utils::Rectangle::new(
+            smithay::utils::Point::from((0, 0)),
+            smithay::utils::Size::from((output_w, output_h)),
+        );
+        target.loc -= smithay::desktop::get_popup_toplevel_coords(&kind);
+        target.loc -= smithay::utils::Point::from((layer.x, layer.y));
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
     }
 
     /// Per-edge sum of exclusive zones across all currently mapped Top +
