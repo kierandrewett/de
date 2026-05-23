@@ -580,7 +580,7 @@ impl UdevRuntime {
         &mut self,
         node: DrmNode,
         path: PathBuf,
-    ) -> Result<(DrmDevice, RenderProbe)> {
+    ) -> Result<(DrmDevice, RegistrationToken, RenderProbe)> {
         info!(?node, path = %path.display(), "udev backend: opening DRM device");
         let fd = self
             .session
@@ -600,7 +600,8 @@ impl UdevRuntime {
             )
         })?;
 
-        self.wayland
+        let registration_token = self
+            .wayland
             .event_loop
             .handle()
             .insert_source(
@@ -621,7 +622,7 @@ impl UdevRuntime {
                 )
             })?;
 
-        Ok((drm, render))
+        Ok((drm, registration_token, render))
     }
 
     fn create_render_probe(fd: DrmDeviceFd, path: &std::path::Path) -> Result<RenderProbe> {
@@ -704,7 +705,7 @@ impl UdevRuntime {
         }
     }
 
-    fn select_kms_outputs(&self, drm: &DrmDevice) -> Result<Vec<KmsProbeOutput>> {
+    fn select_kms_outputs(drm: &DrmDevice, output_offset: usize) -> Result<Vec<KmsProbeOutput>> {
         let resources = drm
             .resource_handles()
             .context("failed to query DRM resource handles")?;
@@ -718,7 +719,7 @@ impl UdevRuntime {
                 continue;
             }
 
-            let Some(crtc) = self.select_crtc(drm, &resources, &connector)? else {
+            let Some(crtc) = Self::select_crtc(drm, &resources, &connector)? else {
                 info!(connector = %connector, "udev backend: connected connector has no compatible CRTC");
                 continue;
             };
@@ -742,13 +743,14 @@ impl UdevRuntime {
                 "udev backend: selected KMS output candidate"
             );
 
-            let output = self.create_wayland_output(&connector, mode, outputs.len());
+            let output = Self::create_wayland_output(&connector, mode, output_offset + outputs.len());
 
             outputs.push(KmsProbeOutput {
                 connector: connector.handle(),
                 crtc,
                 mode,
                 output,
+                global: None,
             });
         }
 
@@ -756,7 +758,6 @@ impl UdevRuntime {
     }
 
     fn create_wayland_output(
-        &self,
         connector: &connector::Info,
         mode: Mode,
         output_index: usize,
@@ -780,8 +781,15 @@ impl UdevRuntime {
         output
     }
 
+    fn update_wayland_output_state(output: &Output, mode: Mode, output_index: usize) {
+        let wl_mode = WlMode::from(mode);
+        let (width, _) = mode.size();
+        let x = i32::from(width) * output_index as i32;
+        output.set_preferred(wl_mode);
+        output.change_current_state(Some(wl_mode), None, None, Some((x, 0).into()));
+    }
+
     fn select_crtc(
-        &self,
         drm: &DrmDevice,
         resources: &smithay::reexports::drm::control::ResourceHandles,
         connector: &connector::Info,
