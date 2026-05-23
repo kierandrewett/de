@@ -3374,14 +3374,70 @@ impl CompositorApp {
     /// Update `state.active_surface` and keyboard focus from the WM focused window.
     fn update_focused_surface(&self, state: &mut SpikeState) {
         state.active_surface = self.wm.focused_surface();
-        if let Some(surface) = &state.active_surface {
-            if let Some(kb) = state.seat.get_keyboard() {
-                let focus =
-                    crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(state, surface);
-                kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
-            }
+        if let Some(surface) = state.active_surface.clone() {
+            Self::set_keyboard_focus_to_surface(state, &surface);
         } else if let Some(kb) = state.seat.get_keyboard() {
             kb.set_focus(state, None, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    fn seat_has_active_input_grab(state: &SpikeState) -> bool {
+        state
+            .seat
+            .get_pointer()
+            .is_some_and(|pointer| pointer.is_grabbed())
+            || state
+                .seat
+                .get_keyboard()
+                .is_some_and(|keyboard| keyboard.is_grabbed())
+            || state.seat.get_touch().is_some_and(|touch| touch.is_grabbed())
+    }
+
+    fn set_keyboard_focus_to_surface(state: &mut SpikeState, surface: &WlSurface) {
+        if let Some(kb) = state.seat.get_keyboard() {
+            let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
+                state, surface,
+            );
+            kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    fn update_focus_from_button_press(&mut self, state: &mut SpikeState, x: f64, y: f64) {
+        if Self::seat_has_active_input_grab(state) {
+            debug!("focus: ignoring button focus change while a seat grab is active");
+            return;
+        }
+
+        let panel_h = crate::wm::PANEL_HEIGHT as f64;
+        let in_panel = y < panel_h;
+        let in_dock = self.point_in_dock_pill(x, y);
+        if let Some(focused_surface) = self.wm.pointer_click_focus(x, y) {
+            state.active_surface = Some(focused_surface.clone());
+            Self::set_keyboard_focus_to_surface(state, &focused_surface);
+            if let Some(gpu_window) = self.gpu_window.as_ref() {
+                gpu_window.mark_dirty();
+            }
+        } else if !in_panel && !in_dock {
+            // Click on desktop / wallpaper.
+            if self.wm.unfocus_all() {
+                state.active_surface = None;
+                if let Some(kb) = state.seat.get_keyboard() {
+                    kb.set_focus(state, None, SERIAL_COUNTER.next_serial());
+                }
+                // Push the new (un)focus state into the Slint model so
+                // the WindowChrome's `focused` property flips and its
+                // titlebar bg animates from active → inactive. Without
+                // this the model still carries the old focused=true
+                // and the titlebar stays at the active colour.
+                self.update_windows(state);
+                if let Some(gpu_window) = self.gpu_window.as_ref() {
+                    gpu_window.mark_dirty();
+                }
+            }
+            // Left-click on the desktop also closes any open menu.
+            if let Some(ui) = self.ui.as_ref() {
+                ui.set_desktop_menu_open(false);
+            }
         }
     }
 
@@ -3603,6 +3659,7 @@ impl CompositorApp {
         //   text clears and keyboard focus is dropped.
         // - Click on panel/dock → leave focus alone (those are shell areas).
         if button == 0x110 && pressed && !over_client_popup {
+<<<<<<< HEAD
             let panel_h = crate::wm::PANEL_HEIGHT as f64;
             let in_panel = y < panel_h;
             let in_dock = self.point_in_dock_pill(x, y);
@@ -3641,6 +3698,9 @@ impl CompositorApp {
                     ui.set_desktop_menu_open(false);
                 }
             }
+=======
+            self.update_focus_from_button_press(state, x, y);
+>>>>>>> 78e770a (fix(compositor-slint): guard focus changes during grabs)
         }
 
         // (Right-click dismiss is handled in the winit MouseInput
@@ -3668,6 +3728,7 @@ impl CompositorApp {
             let oh = self.wm.output_h as f64;
             let ow = self.wm.output_w as f64;
             let dock_h = crate::wm::DOCK_HEIGHT as f64;
+<<<<<<< HEAD
             let on_window_surface = if over_client_popup {
                 None
             } else {
@@ -3677,6 +3738,9 @@ impl CompositorApp {
                 self.sync_x11_stacking_order(state);
             }
             let on_window = on_window_surface.is_some();
+=======
+            let on_window = !over_client_popup && self.find_toplevel_idx(state, x, y).is_some();
+>>>>>>> 78e770a (fix(compositor-slint): guard focus changes during grabs)
             let in_panel = y < panel_h;
             let in_dock = self.point_in_dock_pill(x, y);
             if !over_client_popup && !on_window && !in_panel && !in_dock {
