@@ -8,8 +8,10 @@
 
 use anyhow::{bail, Context, Result};
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     path::PathBuf,
+    rc::Rc,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -79,7 +81,7 @@ struct UdevRuntime {
     wayland: WaylandRuntime,
     session: LibSeatSession,
     seat_name: String,
-    libinput_context: Arc<Mutex<Libinput>>,
+    libinput_context: Rc<RefCell<Libinput>>,
     session_events: Arc<Mutex<VecDeque<UdevSessionEvent>>>,
     device_snapshot: Vec<DrmDeviceSnapshot>,
     hotplug_events: Arc<Mutex<VecDeque<UdevHotplugEvent>>>,
@@ -164,7 +166,7 @@ impl UdevRuntime {
             bail!("failed to assign libinput context to session seat {seat_name:?}");
         }
         let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
-        let libinput_context = Arc::new(Mutex::new(libinput_context));
+        let libinput_context = Rc::new(RefCell::new(libinput_context));
         info!(seat = %seat_name, "udev backend: libinput seat assigned");
 
         let session_events_for_libseat = session_events.clone();
@@ -348,11 +350,7 @@ impl UdevRuntime {
 
     fn pause_session(&mut self) {
         info!("udev backend: pausing session devices");
-        if let Ok(libinput) = self.libinput_context.lock() {
-            libinput.suspend();
-        } else {
-            error!("udev backend: libinput lock poisoned during session pause");
-        }
+        self.libinput_context.borrow().suspend();
 
         for device in &mut self.drm_devices {
             device.drm.pause();
@@ -366,12 +364,8 @@ impl UdevRuntime {
 
     fn resume_session(&mut self) -> Result<()> {
         info!("udev backend: resuming session devices");
-        if let Ok(mut libinput) = self.libinput_context.lock() {
-            if let Err(err) = libinput.resume() {
-                warn!(?err, "udev backend: failed to resume libinput context");
-            }
-        } else {
-            error!("udev backend: libinput lock poisoned during session resume");
+        if let Err(err) = self.libinput_context.borrow_mut().resume() {
+            warn!(?err, "udev backend: failed to resume libinput context");
         }
 
         for device in &mut self.drm_devices {
