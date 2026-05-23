@@ -56,7 +56,7 @@ use smithay::{
             DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Serial},
+    utils::{Clock, Logical, Monotonic, Point, Rectangle, Serial},
     wayland::{
         alpha_modifier::AlphaModifierState,
         buffer::BufferHandler,
@@ -253,9 +253,8 @@ pub struct ToplevelInfo {
 }
 
 /// A mapped xdg_popup — context menus, dropdowns, autocomplete, etc.
-/// Position is computed at `new_popup` time from the positioner, but the
-/// final compositor-space placement is resolved per-frame in `update_windows`
-/// (parent toplevel may have moved). Pixels are imported on each commit
+/// Compositor-space placement is resolved per-frame from Smithay's committed
+/// popup geometry plus the parent chain. Pixels are imported on each commit
 /// via the surface-tree composite (popups can have their own subsurfaces).
 #[derive(Debug, Clone)]
 pub struct PopupInfo {
@@ -263,11 +262,6 @@ pub struct PopupInfo {
     pub popup: smithay::wayland::shell::xdg::PopupSurface,
     /// Parent surface (toplevel OR another popup) — pop-up tree origin.
     pub parent: WlSurface,
-    /// Popup geometry rect relative to the parent surface (positioner output).
-    pub rel_x: i32,
-    pub rel_y: i32,
-    pub w: i32,
-    pub h: i32,
     /// Composited pixel buffer from the popup's surface tree (legacy
     /// path; kept for backdrop/screencopy parity with toplevels).
     pub pixels: Arc<Mutex<ClientSurfaceData>>,
@@ -286,6 +280,25 @@ pub struct PopupInfo {
     pub geom_y: i32,
     pub geom_w: i32,
     pub geom_h: i32,
+}
+
+impl PopupInfo {
+    pub fn configured_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        self.popup.with_committed_state(|state| state.map(|state| state.geometry))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdgResizeTransactionPhase {
+    WaitingForFinalAck,
+    WaitingForCommit,
+}
+
+#[derive(Debug, Clone)]
+pub struct XdgResizeTransaction {
+    pub surface: WlSurface,
+    pub final_serial: Serial,
+    pub phase: XdgResizeTransactionPhase,
 }
 
 /// Active drag-and-drop icon surface paired with the accumulated buffer
@@ -525,6 +538,12 @@ pub struct SpikeState {
     /// XwmHandler `unminimize_request`. xdg-shell has no client-driven
     /// unminimize so this queue is X11-only.
     pub pending_xdg_restore: Vec<WlSurface>,
+    /// Interactive xdg resize handshakes after pointer release. The final
+    /// non-Resizing configure must be acked, then committed, before ordinary
+    /// buffer commits are allowed to drive WM geometry again. This prevents
+    /// an older in-flight resize configure from snapping the window back after
+    /// button-up.
+    pub xdg_resize_transactions: Vec<XdgResizeTransaction>,
     /// Set by `xdg-system-bell-v1::ring` — the renderer's per-frame tick
     /// drains it and starts a brief flash animation on the targeted
     /// window's chrome. `None` between bells.
@@ -764,6 +783,7 @@ impl SpikeState {
             pending_xdg_fullscreen: Vec::new(),
             pending_xdg_minimize: Vec::new(),
             pending_xdg_restore: Vec::new(),
+            xdg_resize_transactions: Vec::new(),
             pending_bell: None,
             should_exit: false,
             pointer_pos: (0.0, 0.0),
@@ -845,6 +865,70 @@ impl SpikeState {
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+
+    /// Reconfigure reactive xdg popups rooted under `toplevel` after the
+    /// parent toplevel's compositor geometry changes. Mirrors cosmic-comp's
+    /// update_reactive_popups pass: only popups whose last acknowledged
+    /// positioner is reactive are reconstrained and configured.
+    pub fn update_reactive_popups_for_toplevel(&self, toplevel: &WlSurface) {
+        use smithay::desktop::{PopupKind, PopupManager};
+
+        for (popup, _) in PopupManager::popups_for_surface(toplevel) {
+            let PopupKind::Xdg(surface) = popup else {
+                continue;
+            };
+            let reactive = surface.with_committed_state(|state| {
+                state.is_some_and(|state| state.positioner.reactive)
+            });
+            if !reactive {
+                continue;
+            }
+
+            self.unconstrain_popup(&surface);
+            if let Err(err) = surface.send_configure() {
+                warn!(?err, "failed to configure reactive popup after parent geometry change");
+            }
+        }
+    }
+
+    pub fn begin_xdg_resize_transaction(&mut self, surface: WlSurface, final_serial: Serial) {
+        self.xdg_resize_transactions
+            .retain(|tx| tx.surface != surface);
+        self.xdg_resize_transactions.push(XdgResizeTransaction {
+            surface,
+            final_serial,
+            phase: XdgResizeTransactionPhase::WaitingForFinalAck,
+        });
+    }
+
+    pub fn ack_xdg_resize_transaction(&mut self, surface: &WlSurface, serial: Serial) {
+        let Some(tx) = self
+            .xdg_resize_transactions
+            .iter_mut()
+            .find(|tx| &tx.surface == surface)
+        else {
+            return;
+        };
+        if tx.phase == XdgResizeTransactionPhase::WaitingForFinalAck && tx.final_serial == serial {
+            tx.phase = XdgResizeTransactionPhase::WaitingForCommit;
+        }
+    }
+
+    pub fn finish_xdg_resize_transaction_commit(&mut self, surface: &WlSurface) -> bool {
+        let Some(index) = self.xdg_resize_transactions.iter().position(|tx| {
+            &tx.surface == surface && tx.phase == XdgResizeTransactionPhase::WaitingForCommit
+        }) else {
+            return false;
+        };
+        self.xdg_resize_transactions.remove(index);
+        true
+    }
+
+    pub fn has_pending_xdg_resize_transaction(&self, surface: &WlSurface) -> bool {
+        self.xdg_resize_transactions
+            .iter()
+            .any(|tx| &tx.surface == surface)
     }
 
     /// Validate that a client-supplied `serial` corresponds to a real
