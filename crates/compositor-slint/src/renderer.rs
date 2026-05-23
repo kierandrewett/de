@@ -3275,13 +3275,14 @@ impl CompositorApp {
             let Some(id) = self.wm.id_for_surface(&surface) else {
                 continue;
             };
+            let area = self.wm.work_area();
             {
                 let win = match self.wm.windows.values_mut().find(|w| w.id == id) {
                     Some(w) => w,
                     None => continue,
                 };
                 if want_max && !win.maximized {
-                    win.start_maximize(self.wm.output_w, self.wm.output_h);
+                    win.start_maximize_to(area);
                 } else if !want_max && win.maximized {
                     win.start_unmaximize();
                 }
@@ -4042,22 +4043,45 @@ impl CompositorApp {
                     start_geom,
                     ..
                 } => {
-                    if let Some((nx, mut ny, nw, mut nh)) = resize::compute_resize(&drag, x, y) {
-                        // ── Top-edge constraint ───────────────────────────
-                        // Block the top edge from sliding under the panel.
-                        // Adjust height so the bottom edge stays where the
-                        // resize math wanted it.
-                        let panel = crate::wm::PANEL_HEIGHT;
+                    if let Some((mut nx, mut ny, mut nw, mut nh)) = resize::compute_resize(&drag, x, y) {
+                        // ── Work-area constraints ─────────────────────────
+                        // Keep interactive resize inside the same effective
+                        // work area used for maximise and snap. The rectangle
+                        // comes from real layer-shell exclusive zones with the
+                        // built-in shell chrome as a floor.
+                        let work_area = self.wm.work_area();
+                        let work_right = work_area.right();
+                        let work_bottom = work_area.bottom();
                         if matches!(
                             *edge,
                             resize::ResizeEdge::North
                                 | resize::ResizeEdge::NorthWest
                                 | resize::ResizeEdge::NorthEast
-                        ) && ny < panel
+                        ) && ny < work_area.y
                         {
                             let desired_bottom = start_geom.y + start_geom.h;
-                            ny = panel;
+                            ny = work_area.y;
                             nh = (desired_bottom - ny).max(resize::MIN_WINDOW_SIZE);
+                        }
+                        if matches!(
+                            *edge,
+                            resize::ResizeEdge::West
+                                | resize::ResizeEdge::NorthWest
+                                | resize::ResizeEdge::SouthWest
+                        ) && nx < work_area.x
+                        {
+                            let desired_right = start_geom.x + start_geom.w;
+                            nx = work_area.x;
+                            nw = (desired_right - nx).max(resize::MIN_WINDOW_SIZE);
+                        }
+                        if matches!(
+                            *edge,
+                            resize::ResizeEdge::East
+                                | resize::ResizeEdge::NorthEast
+                                | resize::ResizeEdge::SouthEast
+                        ) && nx + nw > work_right
+                        {
+                            nw = (work_right - nx).max(resize::MIN_WINDOW_SIZE);
                         }
 
                         // ── Bottom-edge dock-snap ─────────────────────────
@@ -4065,7 +4089,7 @@ impl CompositorApp {
                         // engage a sticky snap. To break out (down OR up)
                         // the user must travel further than the threshold
                         // from the snap-engagement pointer position.
-                        let dock_top = self.wm.output_h - crate::wm::DOCK_HEIGHT;
+                        let dock_top = work_bottom;
                         let edge_is_south = matches!(
                             *edge,
                             resize::ResizeEdge::South
@@ -4294,20 +4318,16 @@ impl CompositorApp {
                     let mut maybe_wm_id: Option<i32> = None;
                     let mut reactive_popup_parent = None;
                     if let Some(tl) = state.toplevels.get_mut(*toplevel_idx) {
-                        let nx = (x - ox) as i32;
-                        // Clamp y so the window's titlebar can't slide under
-                        // the panel (the top bar is sacred), but the bottom
-                        // is unconstrained — the user explicitly wants to be
-                        // able to drag windows down behind the dock; the
-                        // dock's post-chrome re-blit makes them visually
-                        // disappear behind it without us cutting them off.
-                        let panel = crate::wm::PANEL_HEIGHT;
-                        let oh = self.wm.output_h;
                         let raw_ny = (y - oy) as i32;
-                        // Allow the window to push down so just its titlebar
-                        // remains visible on screen.
-                        let max_ny = (oh - 24).max(panel);
-                        let ny = raw_ny.clamp(panel, max_ny);
+                        let raw_nx = (x - ox) as i32;
+                        // Keep the drag anchor inside the same work area used
+                        // by maximise/snap so layer-shell sidebars and docks
+                        // reserve real movement bounds too.
+                        let work_area = self.wm.work_area();
+                        let max_nx = (work_area.right() - 24).max(work_area.x);
+                        let max_ny = (work_area.bottom() - 24).max(work_area.y);
+                        let nx = raw_nx.clamp(work_area.x, max_nx);
+                        let ny = raw_ny.clamp(work_area.y, max_ny);
                         tl.x = nx;
                         tl.y = ny;
                         let surface = tl.surface.clone();
@@ -4324,9 +4344,7 @@ impl CompositorApp {
 
                     // Snap detection — show preview if cursor is in an edge band.
                     if let Some(ui) = self.ui.as_ref() {
-                        let ow = self.wm.output_w;
-                        let oh = self.wm.output_h;
-                        match crate::snap::detect(x, y, ow, oh) {
+                        match crate::snap::detect(x, y, self.wm.work_area()) {
                             Some((zone, rect)) => {
                                 ui.set_snap_preview_visible(true);
                                 ui.set_snap_preview_x(rect.x);

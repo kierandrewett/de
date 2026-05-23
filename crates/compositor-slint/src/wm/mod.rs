@@ -75,6 +75,24 @@ pub const MINIMIZE_SCALE_TO: f64 = 0.40;
 /// Close animation settle threshold: when opacity falls below this, remove the window.
 pub const CLOSE_OPACITY_THRESHOLD: f32 = 0.01;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkArea {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl WorkArea {
+    pub fn right(self) -> i32 {
+        self.x + self.w
+    }
+
+    pub fn bottom(self) -> i32 {
+        self.y + self.h
+    }
+}
+
 // ── Animation phases ──────────────────────────────────────────────────────────
 
 /// Lifecycle animation phase for a window.
@@ -505,20 +523,25 @@ impl WindowState {
         left: i32,
         right: i32,
     ) {
+        self.start_maximize_to(WorkArea {
+            x: left,
+            y: top,
+            w: (output_w - left - right).max(1),
+            h: (output_h - top - bottom).max(1),
+        });
+    }
+
+    pub fn start_maximize_to(&mut self, area: WorkArea) {
         self.pre_maximize = Some((self.x, self.y, self.w, self.h));
-        let max_x = left;
-        let max_y = top;
-        let max_w = (output_w - left - right).max(0);
-        let max_h = (output_h - top - bottom).max(0);
-        self.anim.set_geometry_target(max_x, max_y, max_w, max_h);
+        self.anim.set_geometry_target(area.x, area.y, area.w, area.h);
         self.anim.opacity.set_target(1.0);
         self.anim.scale.set_target(1.0);
         self.maximized = true;
         // Update committed geometry immediately so configure is correct.
-        self.x = max_x;
-        self.y = max_y;
-        self.w = max_w;
-        self.h = max_h;
+        self.x = area.x;
+        self.y = area.y;
+        self.w = area.w;
+        self.h = area.h;
     }
 
     /// Enter fullscreen using the full output geometry, not the work area.
@@ -698,6 +721,19 @@ impl WindowManager {
     }
     pub fn effective_right(&self) -> i32 {
         self.reserved_right
+    }
+
+    pub fn work_area(&self) -> WorkArea {
+        let left = self.effective_left();
+        let top = self.effective_top();
+        let right = self.effective_right();
+        let bottom = self.effective_bottom();
+        WorkArea {
+            x: left,
+            y: top,
+            w: (self.output_w - left - right).max(1),
+            h: (self.output_h - top - bottom).max(1),
+        }
     }
 
     /// Surface key: raw pointer cast to usize (stable for the lifetime of the surface).
@@ -1049,18 +1085,12 @@ impl WindowManager {
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
-            let (ow, oh) = (self.output_w, self.output_h);
-            let (t, b, l, r) = (
-                self.effective_top(),
-                self.effective_bottom(),
-                self.effective_left(),
-                self.effective_right(),
-            );
+            let area = self.work_area();
             if let Some(win) = self.windows.get_mut(&key) {
                 if win.maximized {
                     win.start_unmaximize();
                 } else {
-                    win.start_maximize_in(ow, oh, t, b, l, r);
+                    win.start_maximize_to(area);
                 }
             }
         }
