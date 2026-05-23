@@ -3375,19 +3375,8 @@ impl CompositorApp {
         // surface would miss a lock/confine the instant the pointer
         // crossed out, defeating the constraint. Mirrors
         // anvil/input_handler.rs:780-813.
-        let resolve_hit = |compositor: &Self, st: &SpikeState, sx: f64, sy: f64| {
-            if st.session_locked {
-                st.lock_surfaces
-                    .first()
-                    .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0))
-            } else {
-                compositor
-                    .popup_surface_under(st, sx, sy)
-                    .or_else(|| compositor.wm.surface_under(sx, sy))
-            }
-        };
-        let current_hit = resolve_hit(self, state, px, py);
-        let hit = resolve_hit(self, state, x, y);
+        let current_hit = self.surface_under_full(state, px, py);
+        let hit = self.surface_under_full(state, x, y);
 
         // Pointer-constraints check, mirroring anvil/input_handler.rs:779-882.
         // If the CURRENT focus surface has an active constraint covering
@@ -3761,9 +3750,7 @@ impl CompositorApp {
             use smithay::input::pointer::MotionEvent;
             use smithay::reexports::wayland_server::Resource;
             use smithay::utils::Point;
-            let hit = self
-                .popup_surface_under(state, x, y)
-                .or_else(|| self.wm.surface_under(x, y));
+            let hit = self.surface_under_full(state, x, y);
             let want_id = hit.as_ref().map(|(s, _, _)| s.id().protocol_id() as i64);
             let have_id = pointer.current_focus().map(|s| s.id().protocol_id() as i64);
             if want_id != have_id {

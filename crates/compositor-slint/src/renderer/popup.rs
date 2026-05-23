@@ -54,6 +54,87 @@ impl CompositorApp {
         anchored.then_some((abs_x as f64, abs_y as f64, w as f64, h as f64))
     }
 
+    /// Hit-test layer-shell surfaces against the screen point (x, y).
+    /// Iterates `state.layer_surfaces` checking the layers in the order
+    /// the caller passes — callers should pass top-of-stack first
+    /// (typically `[Overlay, Top]` for the chain ABOVE windows and
+    /// `[Bottom, Background]` for the chain BELOW them). Uses
+    /// `under_from_surface_tree` so subsurfaces inside a panel/dock
+    /// receive events directly. Closes the layer-shell input gap (audit
+    /// C11): without this, panels, docks, launchers, notification daemons
+    /// and OSDs render but can't receive clicks/scroll, and
+    /// `KeyboardInteractivity::OnDemand` is dead.
+    pub(super) fn layer_surface_under(
+        &self,
+        state: &SpikeState,
+        x: f64,
+        y: f64,
+        layers: &[smithay::wayland::shell::wlr_layer::Layer],
+    ) -> Option<(WlSurface, f64, f64)> {
+        use smithay::desktop::utils::under_from_surface_tree;
+        use smithay::desktop::WindowSurfaceType;
+        use smithay::utils::Point;
+
+        for &want in layers {
+            for li in &state.layer_surfaces {
+                if li.layer != want {
+                    continue;
+                }
+                if li.w <= 0 || li.h <= 0 {
+                    continue;
+                }
+                let lx = x - li.x as f64;
+                let ly = y - li.y as f64;
+                if lx < 0.0 || ly < 0.0 || lx >= li.w as f64 || ly >= li.h as f64 {
+                    continue;
+                }
+                let origin =
+                    Point::<i32, smithay::utils::Logical>::from((li.x, li.y));
+                if let Some((surface, sub_origin)) = under_from_surface_tree(
+                    li.surface.wl_surface(),
+                    Point::from((x, y)),
+                    origin,
+                    WindowSurfaceType::ALL,
+                ) {
+                    return Some((surface, sub_origin.x as f64, sub_origin.y as f64));
+                }
+                return Some((
+                    li.surface.wl_surface().clone(),
+                    li.x as f64,
+                    li.y as f64,
+                ));
+            }
+        }
+        None
+    }
+
+    /// Full pointer hit-test chain in z-order, screen point → surface.
+    /// Used by both motion routing and the press-time focus refresh so
+    /// the two cannot disagree. While the session is locked, the only
+    /// valid focus is the lock surface for this output. Otherwise:
+    /// xdg popups (top) → layer-shell Overlay/Top → xdg toplevels →
+    /// layer-shell Bottom/Background. (Audit C11.)
+    pub(super) fn surface_under_full(
+        &self,
+        state: &SpikeState,
+        x: f64,
+        y: f64,
+    ) -> Option<(WlSurface, f64, f64)> {
+        use smithay::wayland::shell::wlr_layer::Layer;
+        if state.session_locked {
+            return state
+                .lock_surfaces
+                .first()
+                .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0));
+        }
+        self.popup_surface_under(state, x, y)
+            .or_else(|| self.layer_surface_under(state, x, y, &[Layer::Overlay, Layer::Top]))
+            .or_else(|| self.wm.surface_under(x, y))
+            .or_else(|| {
+                self.layer_surface_under(state, x, y, &[Layer::Bottom, Layer::Background])
+            })
+    }
+
     pub(super) fn popup_surface_under(
         &self,
         state: &SpikeState,
