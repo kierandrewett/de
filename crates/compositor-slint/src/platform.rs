@@ -170,6 +170,7 @@ pub struct CalloopPlatform {
 }
 
 impl CalloopPlatform {
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
         loop_signal: LoopSignal,
         instance: wgpu::Instance,

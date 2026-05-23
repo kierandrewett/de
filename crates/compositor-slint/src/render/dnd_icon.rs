@@ -192,6 +192,7 @@ impl DndIconPass {
     /// rectangle in physical surface pixels; pixels outside it are
     /// discarded by the fragment shader so the rest of the swapchain is
     /// untouched.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         queue: &wgpu::Queue,

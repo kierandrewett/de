@@ -9,6 +9,7 @@
 //!   1. SHM — the standard CPU-copy path (all clients support this).
 //!   2. DMA-BUF pending — if `dmabuf_imported` already ran the GLES read-back
 //!      for this surface, retrieve the stored `ClientSurfaceData`.
+//!
 //! We use the buffer type from `with_renderer_surface_state` to decide.
 
 use smithay::{
@@ -17,14 +18,16 @@ use smithay::{
     reexports::wayland_server::{protocol::wl_surface::WlSurface, Client, Resource},
     wayland::{
         compositor::{
-            get_parent, is_sync_subsurface, with_states, CompositorClientState, CompositorHandler,
-            CompositorState, SurfaceAttributes,
+            add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes,
         },
         dmabuf::get_dmabuf,
         shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData},
     },
     xwayland::XWaylandClientData,
 };
+use smithay::reexports::calloop::Interest;
 use tracing::debug;
 
 use crate::wayland_state::{import_shm_buffer, import_shm_per_surface};
@@ -52,26 +55,43 @@ impl CompositorHandler for SpikeState {
         FALLBACK.get_or_init(CompositorClientState::default)
     }
 
-    fn new_surface(&mut self, _surface: &WlSurface) {
-        // DMA-BUF acquire-fence blocker REMOVED.
-        //
-        // The textbook anvil pattern is to add a pre-commit blocker that
-        // waits on `dmabuf.generate_blocker(Interest::READ)` so we don't
-        // sample garbage from a buffer the GPU hasn't finished writing.
-        // In practice, on radv (mesa Vulkan WSI for AMD) the implicit
-        // acquire fence frequently never becomes readable, so wp_fifo
-        // clients (eframe/wgpu, mpv, etc.) deadlock after a handful of
-        // commits — the commit transaction stays in smithay's blocker
-        // queue forever, our `CompositorHandler::commit` never fires for
-        // it, and the wp_fifo barrier on that commit is never signalled,
-        // wedging the client's render loop.
-        //
-        // Skipping the blocker means we may read a buffer mid-write on
-        // the very first frame after a buffer is allocated. In practice
-        // the import path (`import_dmabuf_for_surface` → GLES readback)
-        // re-syncs via its own EGL fence, and clients double-buffer, so
-        // the worst case is a one-frame artifact — far cheaper than the
-        // permanent freeze.
+    fn new_surface(&mut self, surface: &WlSurface) {
+        add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
+            let maybe_dmabuf = with_states(surface, |surface_data| {
+                surface_data
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .pending()
+                    .buffer
+                    .as_ref()
+                    .and_then(|assignment| match assignment {
+                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
+                        _ => None,
+                    })
+            });
+
+            let Some(dmabuf) = maybe_dmabuf else {
+                return;
+            };
+
+            let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) else {
+                return;
+            };
+
+            let Some(client) = surface.client() else {
+                return;
+            };
+
+            let res = state.loop_handle.insert_source(source, move |_, _, state| {
+                let dh = state.display_handle.clone();
+                state.client_compositor_state(&client).blocker_cleared(state, &dh);
+                Ok(())
+            });
+
+            if res.is_ok() {
+                add_blocker(surface, blocker);
+            }
+        });
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -147,8 +167,9 @@ impl CompositorHandler for SpikeState {
         }
 
         // If the surface's current buffer is a DMA-BUF, run the GPU readback
-        // now (the pre-commit blocker has guaranteed the acquire fence
-        // signalled). Result lands in `dmabuf_pending` keyed by surface id.
+        // now. The pre-commit blocker installed in `new_surface` waits for
+        // the DMA-BUF read fence first, so the import path never samples a
+        // producer-owned buffer mid-write.
         let dmabuf = with_renderer_surface_state(surface, |s| {
             s.buffer().and_then(|b| get_dmabuf(b).cloned().ok())
         })

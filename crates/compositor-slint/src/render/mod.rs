@@ -110,6 +110,7 @@ impl ChromeRenderer {
     /// `scene_view` — Slint render-target view (used by the squircle clip
     /// pass; bound as a dummy view for borders/highlights).
     /// `target_view` — composite target view; chrome passes draw onto this.
+    #[allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         queue: &wgpu::Queue,
