@@ -39,9 +39,14 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use smithay::{
+    backend::renderer::{
+        damage::OutputDamageTracker,
+        element::{Element, Id, RenderElementStates},
+        utils::CommitCounter,
+    },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Transform, SERIAL_COUNTER},
+    utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Size, Transform, SERIAL_COUNTER},
 };
 
 use slint::{ComponentHandle, LogicalPosition, Model, SharedString, VecModel};
@@ -88,6 +93,85 @@ const HEIGHT: u32 = 960;
 /// Number of frame-duration samples retained for the debug overlay's chart.
 /// 120 ≈ 2s at 60fps, enough to see a spike without scrolling forever.
 const FRAME_HISTORY_LEN: usize = 120;
+
+#[derive(Clone)]
+struct DamageTrackedElement {
+    id: Id,
+    surface: Option<WlSurface>,
+    commit: CommitCounter,
+    geometry: Rectangle<i32, Physical>,
+    src: Rectangle<f64, BufferCoords>,
+}
+
+impl DamageTrackedElement {
+    fn scene(id: Id, commit: CommitCounter, width: u32, height: u32) -> Self {
+        let geometry = Rectangle::new(
+            Point::from((0, 0)),
+            Size::from((width.max(1) as i32, height.max(1) as i32)),
+        );
+
+        Self {
+            id,
+            surface: None,
+            commit,
+            geometry,
+            src: Rectangle::new(Point::from((0.0, 0.0)), Size::from((width.max(1) as f64, height.max(1) as f64))),
+        }
+    }
+
+    fn surface(
+        surface: WlSurface,
+        commit: CommitCounter,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        scale: f32,
+    ) -> Self {
+        let sx = (x as f32 * scale).round() as i32;
+        let sy = (y as f32 * scale).round() as i32;
+        let sw = (width.max(1) as f32 * scale).round().max(1.0) as i32;
+        let sh = (height.max(1) as f32 * scale).round().max(1.0) as i32;
+
+        Self {
+            id: Id::from(&surface),
+            surface: Some(surface),
+            commit,
+            geometry: Rectangle::new(Point::from((sx, sy)), Size::from((sw, sh))),
+            src: Rectangle::new(Point::from((0.0, 0.0)), Size::from((sw as f64, sh as f64))),
+        }
+    }
+}
+
+impl Element for DamageTrackedElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.commit
+    }
+
+    fn src(&self) -> Rectangle<f64, BufferCoords> {
+        self.src
+    }
+
+    fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.geometry
+    }
+}
+
+#[derive(Default)]
+struct FrameDamageReport {
+    damaged: bool,
+    states: RenderElementStates,
+    surfaces: Vec<WlSurface>,
+}
+
+struct PresentedFrame {
+    time: smithay::utils::Time<smithay::utils::Monotonic>,
+    sequence: u64,
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Pending input events (processed in the main loop where SpikeState is available)
@@ -301,6 +385,15 @@ struct CompositorApp {
     /// surface.
     lock_surface_snapshot: Option<LockSurfaceSnapshot>,
 
+    /// Smithay damage tracker for the winit output. The Slint/wgpu renderer
+    /// still does full-surface copies once damage exists; the tracker is the
+    /// authority for whether a frame should present and which Wayland surfaces
+    /// were included in that output frame.
+    output_damage_tracker: Option<OutputDamageTracker>,
+    scene_damage_id: Id,
+    scene_commit: CommitCounter,
+    present_sequence: u64,
+
     /// Cached Slint `Image` per layer surface (keyed by wl_surface
     /// protocol_id). Rebuilt only when the surface's `pixels.dirty` flag
     /// flips on commit; otherwise reused so the panel/dock textures don't
@@ -444,6 +537,10 @@ impl CompositorApp {
             pending_output_scale: None,
             pending_output_mode: None,
             lock_surface_snapshot: None,
+            output_damage_tracker: None,
+            scene_damage_id: Id::new(),
+            scene_commit: CommitCounter::default(),
+            present_sequence: 0,
             layer_image_cache: std::collections::HashMap::new(),
             last_layers_fingerprint: Vec::new(),
             client_image_cache: std::collections::HashMap::new(),
@@ -470,6 +567,294 @@ impl CompositorApp {
         }
         self.render_texture.as_ref()
     }
+
+    fn scene_needs_repaint(&self, state: &SpikeState) -> bool {
+        let slint_dirty = self
+            .gpu_window
+            .as_ref()
+            .map(|window| window.has_pending_redraw())
+            .unwrap_or(false);
+        let wm_animating = self.wm.windows.values().any(|window| !window.anim.is_settled());
+        let capture_pending = !state.pending_capture_frames.is_empty();
+
+        slint_dirty
+            || wm_animating
+            || self.active_drag.is_some()
+            || self.alt_tab.cycling
+            || self.dnd_icon_snapshot.is_some()
+            || self.lock_surface_snapshot.is_some()
+            || capture_pending
+    }
+
+    fn prepare_frame_damage(&mut self, state: &SpikeState, output: &Output) -> FrameDamageReport {
+        let Some(gpu_window) = self.gpu_window.as_ref() else {
+            return FrameDamageReport::default();
+        };
+
+        let size = gpu_window.get_size();
+        let (width, height) = (size.width.max(1), size.height.max(1));
+        if self.scene_needs_repaint(state) {
+            self.scene_commit.increment();
+        }
+
+        let mut elements = vec![DamageTrackedElement::scene(
+            self.scene_damage_id.clone(),
+            self.scene_commit,
+            width,
+            height,
+        )];
+        self.collect_surface_damage_elements(state, &mut elements);
+
+        let tracker = self
+            .output_damage_tracker
+            .get_or_insert_with(|| OutputDamageTracker::from_output(output));
+        let (damage, states) = match tracker.damage_output(1, &elements) {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(?err, "output damage tracking failed; forcing a full repaint");
+                self.output_damage_tracker = Some(OutputDamageTracker::from_output(output));
+                self.scene_commit.increment();
+                return FrameDamageReport {
+                    damaged: true,
+                    states: RenderElementStates::default(),
+                    surfaces: Vec::new(),
+                };
+            }
+        };
+
+        let surfaces = elements
+            .iter()
+            .filter_map(|element| {
+                element
+                    .surface
+                    .as_ref()
+                    .filter(|_| states.element_was_presented(element.id.clone()))
+                    .cloned()
+            })
+            .collect();
+
+        FrameDamageReport {
+            damaged: damage.is_some(),
+            states,
+            surfaces,
+        }
+    }
+
+    fn collect_surface_damage_elements(
+        &self,
+        state: &SpikeState,
+        elements: &mut Vec<DamageTrackedElement>,
+    ) {
+        use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+        use smithay::reexports::wayland_server::Resource;
+        use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+
+        let scale = self.scale_factor;
+
+        for win in self.wm.windows_sorted() {
+            if win.minimized || win.closing {
+                continue;
+            }
+            let Some(toplevel) = state.toplevels.iter().find(|toplevel| toplevel.surface == win.surface) else {
+                continue;
+            };
+            let surface_pixels = toplevel.surface_pixels.lock().unwrap();
+            let titlebar_y = if toplevel.csd { 0 } else { crate::wm::TITLEBAR_HEIGHT as i32 };
+            let geom = with_states_geometry(&win.surface).unwrap_or((0, 0, win.w, win.h));
+            let (geom_x, geom_y, _, _) = geom;
+
+            with_surface_tree_downward(
+                &win.surface,
+                (0i32, 0i32),
+                |sub, states, parent_offset| {
+                    let mut offset = *parent_offset;
+                    if sub != &win.surface {
+                        if let Some(view_offset) = states
+                            .data_map
+                            .get::<RendererSurfaceStateUserData>()
+                            .and_then(|data| data.lock().ok().and_then(|surface_state| surface_state.view()).map(|view| view.offset))
+                        {
+                            offset.0 += view_offset.x;
+                            offset.1 += view_offset.y;
+                        }
+                    }
+                    TraversalAction::DoChildren(offset)
+                },
+                |sub, states, parent_offset| {
+                    let mut offset = *parent_offset;
+                    let view = states
+                        .data_map
+                        .get::<RendererSurfaceStateUserData>()
+                        .and_then(|data| data.lock().ok().and_then(|surface_state| surface_state.view()));
+                    if sub != &win.surface {
+                        if let Some(view) = view {
+                            offset.0 += view.offset.x;
+                            offset.1 += view.offset.y;
+                        }
+                    }
+
+                    let key = sub.id().protocol_id();
+                    let Some(data) = surface_pixels.get(&key) else {
+                        return;
+                    };
+                    if data.width == 0 || data.height == 0 {
+                        return;
+                    }
+
+                    let (dst_w, dst_h) = view
+                        .map(|view| (view.dst.w, view.dst.h))
+                        .filter(|(w, h)| *w > 0 && *h > 0)
+                        .unwrap_or((data.width as i32, data.height as i32));
+                    let commit = data
+                        .last_commit
+                        .unwrap_or_else(|| CommitCounter::from(data.version as usize));
+                    let screen_x = win.anim.current_x() as i32 + offset.0 - geom_x;
+                    let screen_y = win.anim.current_y() as i32 + titlebar_y + offset.1 - geom_y;
+                    elements.push(DamageTrackedElement::surface(
+                        sub.clone(),
+                        commit,
+                        screen_x,
+                        screen_y,
+                        dst_w,
+                        dst_h,
+                        scale,
+                    ));
+                },
+                |_, _, _| true,
+            );
+        }
+
+        for layer in &state.layer_surfaces {
+            let surface = layer.surface.wl_surface().clone();
+            let pixels = layer.pixels.lock().unwrap();
+            if pixels.width == 0 || pixels.height == 0 || layer.w <= 0 || layer.h <= 0 {
+                continue;
+            }
+            let commit = pixels
+                .last_commit
+                .unwrap_or_else(|| CommitCounter::from(pixels.version as usize));
+            elements.push(DamageTrackedElement::surface(
+                surface,
+                commit,
+                layer.x,
+                layer.y,
+                layer.w,
+                layer.h,
+                scale,
+            ));
+        }
+
+        for popup in &state.popups {
+            let Some((x, y)) = self.popup_screen_position(state, popup) else {
+                continue;
+            };
+            let surface_pixels = popup.surface_pixels.lock().unwrap();
+            with_surface_tree_downward(
+                &popup.surface,
+                (0i32, 0i32),
+                |sub, states, parent_offset| {
+                    let mut offset = *parent_offset;
+                    if sub != &popup.surface {
+                        if let Some(view_offset) = states
+                            .data_map
+                            .get::<RendererSurfaceStateUserData>()
+                            .and_then(|data| data.lock().ok().and_then(|surface_state| surface_state.view()).map(|view| view.offset))
+                        {
+                            offset.0 += view_offset.x;
+                            offset.1 += view_offset.y;
+                        }
+                    }
+                    TraversalAction::DoChildren(offset)
+                },
+                |sub, states, parent_offset| {
+                    let mut offset = *parent_offset;
+                    let view = states
+                        .data_map
+                        .get::<RendererSurfaceStateUserData>()
+                        .and_then(|data| data.lock().ok().and_then(|surface_state| surface_state.view()));
+                    if sub != &popup.surface {
+                        if let Some(view) = view {
+                            offset.0 += view.offset.x;
+                            offset.1 += view.offset.y;
+                        }
+                    }
+                    let key = sub.id().protocol_id();
+                    let Some(data) = surface_pixels.get(&key) else {
+                        return;
+                    };
+                    if data.width == 0 || data.height == 0 {
+                        return;
+                    }
+                    let (dst_w, dst_h) = view
+                        .map(|view| (view.dst.w, view.dst.h))
+                        .filter(|(w, h)| *w > 0 && *h > 0)
+                        .unwrap_or((data.width as i32, data.height as i32));
+                    let commit = data
+                        .last_commit
+                        .unwrap_or_else(|| CommitCounter::from(data.version as usize));
+                    elements.push(DamageTrackedElement::surface(
+                        sub.clone(),
+                        commit,
+                        x + offset.0,
+                        y + offset.1,
+                        dst_w,
+                        dst_h,
+                        scale,
+                    ));
+                },
+                |_, _, _| true,
+            );
+        }
+    }
+
+    fn popup_screen_position(&self, state: &SpikeState, popup: &crate::wayland_state::PopupInfo) -> Option<(i32, i32)> {
+        let geom = popup.configured_geometry()?;
+        let mut x = geom.loc.x;
+        let mut y = geom.loc.y;
+        let mut parent = popup.parent.clone();
+        loop {
+            if let Some(parent_popup) = state.popups.iter().find(|item| item.surface == parent) {
+                let parent_geom = parent_popup.configured_geometry()?;
+                x += parent_geom.loc.x;
+                y += parent_geom.loc.y;
+                parent = parent_popup.parent.clone();
+                continue;
+            }
+
+            if let Some(window) = self.wm.windows.values().find(|window| window.surface == parent) {
+                let titlebar = state
+                    .toplevels
+                    .iter()
+                    .find(|toplevel| toplevel.surface == parent)
+                    .map(|toplevel| if toplevel.csd { 0 } else { crate::wm::TITLEBAR_HEIGHT as i32 })
+                    .unwrap_or(0);
+                x += window.anim.current_x() as i32;
+                y += window.anim.current_y() as i32 + titlebar;
+                return Some((x, y));
+            }
+
+            if let Some(layer) = state.layer_surfaces.iter().find(|layer| layer.surface.wl_surface() == &parent) {
+                x += layer.x;
+                y += layer.y;
+                return Some((x, y));
+            }
+
+            return Some((x, y));
+        }
+    }
+}
+
+fn with_states_geometry(surface: &WlSurface) -> Option<(i32, i32, i32, i32)> {
+    use smithay::wayland::compositor::with_states;
+    use smithay::wayland::shell::xdg::SurfaceCachedState;
+
+    with_states(surface, |states| {
+        let mut cached_state = states.cached_state.get::<SurfaceCachedState>();
+        cached_state
+            .current()
+            .geometry
+            .map(|geometry| (geometry.loc.x, geometry.loc.y, geometry.size.w, geometry.size.h))
+    })
 }
 
 impl ApplicationHandler for CompositorApp {
@@ -978,17 +1363,27 @@ impl ApplicationHandler for CompositorApp {
                 }
             }
 
-            WindowEvent::RedrawRequested => {
-                self.render_frame();
-            }
+            WindowEvent::RedrawRequested => {}
 
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
+        let redraw_needed = self
+            .gpu_window
+            .as_ref()
+            .map(|window| window.has_pending_redraw())
+            .unwrap_or(false)
+            || self.wm.windows.values().any(|window| !window.anim.is_settled())
+            || self.active_drag.is_some()
+            || self.alt_tab.cycling
+            || self.dnd_icon_snapshot.is_some()
+            || self.lock_surface_snapshot.is_some();
+        if redraw_needed {
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
         }
     }
 }
@@ -1244,12 +1639,12 @@ impl CompositorApp {
     }
 
     /// GPU render: damage-tracked Slint render + swapchain blit.
-    fn render_frame(&mut self) {
+    fn render_frame(&mut self) -> Option<PresentedFrame> {
         let gpu_window = match self.gpu_window.clone() {
             Some(w) => w,
-            None => return,
+            None => return None,
         };
-        let Some(ui) = self.ui.as_ref() else { return };
+        let Some(ui) = self.ui.as_ref() else { return None };
 
         let frame_start = Instant::now();
         let now = frame_start;
@@ -1287,7 +1682,7 @@ impl CompositorApp {
             if let Some(render_tex) = self.get_render_texture(w, h) {
                 if let Err(e) = gpu_window.render_to_texture(render_tex) {
                     warn!("render_to_texture failed: {}", e);
-                    return;
+                    return None;
                 }
                 self.frame_count += 1;
                 if self.frame_count.is_multiple_of(60) {
@@ -1301,17 +1696,17 @@ impl CompositorApp {
         }
 
         let Some(surface) = self.wgpu_surface.as_ref() else {
-            return;
+            return None;
         };
         let device = &gpu_window.wgpu_device;
         let queue = &gpu_window.wgpu_queue;
 
         let frame = match surface.get_current_texture() {
             Ok(f) => f,
-            Err(wgpu::SurfaceError::Outdated) => return,
+            Err(wgpu::SurfaceError::Outdated) => return None,
             Err(e) => {
                 warn!("swapchain: {}", e);
-                return;
+                return None;
             }
         };
 
@@ -1715,13 +2110,15 @@ impl CompositorApp {
         frame.present();
 
         // Capture the post-present monotonic timestamp so the main loop can
-        // fire wp_presentation_feedback. Without a real DRM page-flip event
-        // this is "fake vsync" — the actual scanout happens at some point
-        // after the swapchain submit returns, but the delta is sub-frame for
-        // mailbox/fifo presentation modes and good enough for clients that
-        // just need monotonic increments (mpv, Chrome's vsync sync).
+        // fire wp_presentation_feedback for the render-state-backed surfaces
+        // included in this exact frame. Without a real DRM page-flip event
+        // this is still a winit timestamp, not hardware completion.
         let clock: smithay::utils::Clock<smithay::utils::Monotonic> = smithay::utils::Clock::new();
-        self.last_present_time = Some(clock.now());
+        self.present_sequence = self.present_sequence.wrapping_add(1);
+        let presented = PresentedFrame {
+            time: clock.now(),
+            sequence: self.present_sequence,
+        };
 
         // Record this frame's render+present cost (ms) into the chart's
         // sliding window. Eviction first to keep length stable, so Slint
@@ -1731,6 +2128,7 @@ impl CompositorApp {
             self.frame_times_model.remove(0);
         }
         self.frame_times_model.push(frame_ms);
+        Some(presented)
     }
 
     /// Build the Slint `WindowItem` list from `WM` state + toplevel pixel buffers,
