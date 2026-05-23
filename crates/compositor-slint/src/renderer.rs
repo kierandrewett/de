@@ -4598,15 +4598,15 @@ impl CompositorApp {
         // Pass 1 — for each layer surface, decide whether its cached Image
         // is still good. We pull `dirty` out of `pixels` (and reset it) so
         // the next idle iteration sees no pending update. Build the model's
-        // fingerprint (id + rect + ordinal) along the way so we can skip
-        // the Slint set_layers call when nothing changed.
-        let mut fingerprint: Vec<(u32, i32, i32, i32, i32, i32)> =
+        // fingerprint (id + rect + ordinal) in protocol layer order so we
+        // can skip the Slint set_layers call when nothing changed.
+        let mut layer_entries: Vec<(usize, u32, i32, i32, i32, i32, i32)> =
             Vec::with_capacity(state.layer_surfaces.len());
         let mut any_dirty = false;
         let mut visible_ids: std::collections::HashSet<u32> =
             std::collections::HashSet::with_capacity(state.layer_surfaces.len());
 
-        for li in &state.layer_surfaces {
+        for (index, li) in state.layer_surfaces.iter().enumerate() {
             let id = li.surface.wl_surface().id().protocol_id();
             let (pw, ph, dirty) = {
                 let mut pix = li.pixels.lock().unwrap();
@@ -4641,8 +4641,14 @@ impl CompositorApp {
                 Layer::Top => 2,
                 Layer::Overlay => 3,
             };
-            fingerprint.push((id, li.x, li.y, li.w, li.h, ordinal));
+            layer_entries.push((index, id, li.x, li.y, li.w, li.h, ordinal));
         }
+
+        layer_entries.sort_by_key(|&(index, _, _, _, _, _, ordinal)| (ordinal, index));
+        let fingerprint: Vec<(u32, i32, i32, i32, i32, i32)> = layer_entries
+            .iter()
+            .map(|&(_, id, x, y, w, h, ordinal)| (id, x, y, w, h, ordinal))
+            .collect();
 
         // Evict cached Images for surfaces that disappeared (unmap, destroy)
         // so the cache doesn't grow unbounded across a long session.

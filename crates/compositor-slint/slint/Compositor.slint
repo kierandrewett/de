@@ -1,6 +1,7 @@
 // Compositor.slint — Top-level component for the Slint-based Wayland compositor.
-// Composes: Wallpaper → LayerSurfaces (bottom/background) → Windows+Chrome →
-//           LayerSurfaces (top/overlay) → Dock → Panel.
+// Composes: wallpaper, layer-shell background, layer-shell bottom,
+//           windows/chrome, layer-shell top, internal shell chrome,
+//           layer-shell overlay, client popups, cursor.
 //
 // The Rust side owns the event loop (calloop) and feeds all data through the
 // exported properties below.  Callbacks fire user interactions back to Rust.
@@ -18,11 +19,14 @@
 //
 // Z-order (Slint requires integer literals for `z`):
 //   0  — wallpaper
+//   1  — layer-shell background
+//   5  — layer-shell bottom
 //   10 — windows
-//   20 — bottom/background layer-shell surfaces
-//   30 — top/overlay layer-shell surfaces
-//   40 — dock
-//   50 — panel
+//   30 — layer-shell top
+//   40-88 — built-in shell chrome and debug UI
+//   90 — layer-shell overlay
+//   92 — client popups
+//   99 — cursor
 
 import { Tokens, Theme, TokenMode } from "./Tokens.slint";
 import { Wallpaper } from "./Wallpaper.slint";
@@ -356,16 +360,26 @@ export component Compositor inherits Window {
         z: 0;
     }
 
-    // ── Layer 1: Background / bottom layer-shell surfaces ────────────────────
-    // Renders surfaces with layer-ordinal 0 (background) or 1 (bottom).
+    // ── Protocol layer-shell: Background ─────────────────────────────────────
     for layer in root.layers: LayerSurface {
-        visible: layer.layer-ordinal <= 1;
+        visible: layer.layer-ordinal == 0;
         surface: layer.surface;
         surface-x: layer.x * 1px;
         surface-y: layer.y * 1px;
         surface-width: layer.w * 1px;
         surface-height: layer.h * 1px;
-        z: 20;
+        z: 1;
+    }
+
+    // ── Protocol layer-shell: Bottom ─────────────────────────────────────────
+    for layer in root.layers: LayerSurface {
+        visible: layer.layer-ordinal == 1;
+        surface: layer.surface;
+        surface-x: layer.x * 1px;
+        surface-y: layer.y * 1px;
+        surface-width: layer.w * 1px;
+        surface-height: layer.h * 1px;
+        z: 5;
     }
 
     // ── Layer 2: Windows with SSD chrome ─────────────────────────────────────
@@ -437,10 +451,9 @@ export component Compositor inherits Window {
         }
     }
 
-    // ── Layer 3: Top / overlay layer-shell surfaces ───────────────────────────
-    // Renders surfaces with layer-ordinal 2 (top) or 3 (overlay).
+    // ── Protocol layer-shell: Top ────────────────────────────────────────────
     for layer in root.layers: LayerSurface {
-        visible: layer.layer-ordinal >= 2;
+        visible: layer.layer-ordinal == 2;
         surface: layer.surface;
         surface-x: layer.x * 1px;
         surface-y: layer.y * 1px;
@@ -707,16 +720,27 @@ export component Compositor inherits Window {
         }
     }
 
-    // ── Layer 5b: xdg_popup surfaces (context menus, dropdowns) ─────────────
-    // Drawn above windows but below panels/popouts so the menu appears in
-    // front of the parent window. Position is compositor-space — Rust
-    // resolves parent-relative offsets when populating PopupItem each frame.
+    // ── Protocol layer-shell: Overlay ────────────────────────────────────────
+    for layer in root.layers: LayerSurface {
+        visible: layer.layer-ordinal == 3;
+        surface: layer.surface;
+        surface-x: layer.x * 1px;
+        surface-y: layer.y * 1px;
+        surface-width: layer.w * 1px;
+        surface-height: layer.h * 1px;
+        z: 90;
+    }
+
+    // ── Protocol client popups: xdg_popup and layer-shell popups ─────────────
+    // Drawn after the four layer-shell protocol bands. Position is
+    // compositor-space — Rust resolves parent-relative offsets when
+    // populating PopupItem each frame.
     for popup in root.popups: Rectangle {
         x: popup.x * 1px;
         y: popup.y * 1px;
         width: popup.w * 1px;
         height: popup.h * 1px;
-        z: 65;
+        z: 92;
         clip: true;
         // No background / border / drop-shadow on this container — modern
         // popup clients (Firefox, Chromium, libadwaita) paint their own
