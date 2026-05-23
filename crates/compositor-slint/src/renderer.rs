@@ -3604,7 +3604,7 @@ impl CompositorApp {
         }
 
         let (x, y) = self.pointer_pos;
-        let over_client_popup = self.popup_surface_under(state, x, y).is_some();
+        let over_client_popup = self.client_popup_surface_under(state, x, y).is_some();
 
         // Popup dismissal on click outside (the only thing approximating
         // popup-grab semantics without a full `PopupManager` refactor).
