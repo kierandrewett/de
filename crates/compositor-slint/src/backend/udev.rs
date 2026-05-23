@@ -40,9 +40,11 @@ use smithay::backend::{
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::{
+    calloop::RegistrationToken,
     drm::control::{connector, crtc, Device as ControlDevice, Mode, ModeTypeFlags},
     input::Libinput,
     rustix::fs::OFlags,
+    wayland_server::backend::GlobalId,
 };
 use smithay::utils::{DeviceFd, Point, SERIAL_COUNTER};
 use tracing::{error, info, warn};
@@ -94,6 +96,7 @@ struct DrmProbeDevice {
     node: DrmNode,
     path: PathBuf,
     drm: DrmDevice,
+    registration_token: RegistrationToken,
     render: RenderProbe,
     outputs: Vec<KmsProbeOutput>,
 }
@@ -109,6 +112,7 @@ struct KmsProbeOutput {
     crtc: crtc::Handle,
     mode: Mode,
     output: Output,
+    global: Option<GlobalId>,
 }
 
 enum UdevHotplugEvent {
@@ -289,14 +293,16 @@ impl UdevRuntime {
         let node = DrmNode::from_dev_id(device.device_id).map_err(|err| {
             anyhow::anyhow!("failed to resolve DRM node {:?}: {err:?}", device.device_id)
         })?;
-        let (drm, render) = self.open_drm_device(node, device.path.clone())?;
+        let (drm, registration_token, render) = self.open_drm_device(node, device.path.clone())?;
         self.log_kms_state(&drm)?;
-        let outputs = self.select_kms_outputs(&drm)?;
-        self.register_wayland_outputs(&outputs);
+        let output_offset = self.wayland.state.outputs.len();
+        let mut outputs = Self::select_kms_outputs(&drm, output_offset)?;
+        self.register_wayland_outputs(&mut outputs);
         self.drm_devices.push(DrmProbeDevice {
             node,
             path: device.path,
             drm,
+            registration_token,
             render,
             outputs,
         });
@@ -315,18 +321,10 @@ impl UdevRuntime {
                     self.advertise_dmabuf_global();
                 }
                 UdevHotplugEvent::Changed { device_id } => {
-                    info!(
-                        ?device_id,
-                        "udev backend: DRM change event queued for future modeset refresh"
-                    );
+                    self.refresh_drm_device(device_id)?;
                 }
                 UdevHotplugEvent::Removed { device_id } => {
-                    self.drm_devices
-                        .retain(|device| device.node.dev_id() != device_id);
-                    info!(
-                        ?device_id,
-                        "udev backend: DRM device removed from probe list"
-                    );
+                    self.remove_drm_device(device_id);
                 }
             }
         }
@@ -416,19 +414,124 @@ impl UdevRuntime {
         Ok(())
     }
 
-    fn register_wayland_outputs(&mut self, outputs: &[KmsProbeOutput]) {
+    fn register_wayland_outputs(&mut self, outputs: &mut [KmsProbeOutput]) {
         for output in outputs {
-            output
+            self.register_wayland_output(output);
+        }
+    }
+
+    fn register_wayland_output(&mut self, output: &mut KmsProbeOutput) {
+        if output.global.is_none() {
+            output.global = Some(
+                output
                 .output
-                .create_global::<SpikeState>(&self.wayland.display_handle);
-            self.wayland.state.register_output(output.output.clone());
-            info!(
-                output = %output.output.name(),
-                connector = ?output.connector,
-                crtc = ?output.crtc,
-                "udev backend: registered Wayland output global"
+                    .create_global::<SpikeState>(&self.wayland.display_handle),
             );
         }
+        self.wayland.state.register_output(output.output.clone());
+        info!(
+            output = %output.output.name(),
+            connector = ?output.connector,
+            crtc = ?output.crtc,
+            "udev backend: registered Wayland output global"
+        );
+    }
+
+    fn unregister_wayland_output(&mut self, output: &mut KmsProbeOutput) {
+        output.output.leave_all();
+        self.wayland.state.unregister_output(&output.output);
+        if let Some(global) = output.global.take() {
+            self.wayland
+                .display_handle
+                .remove_global::<SpikeState>(global);
+        }
+        info!(
+            output = %output.output.name(),
+            connector = ?output.connector,
+            crtc = ?output.crtc,
+            "udev backend: unregistered Wayland output global"
+        );
+    }
+
+    fn refresh_drm_device(&mut self, device_id: libc::dev_t) -> Result<()> {
+        let Some(index) = self
+            .drm_devices
+            .iter()
+            .position(|device| device.node.dev_id() == device_id)
+        else {
+            warn!(?device_id, "udev backend: change event for unknown DRM device");
+            return Ok(());
+        };
+
+        let output_offset = self.wayland.state.outputs.len();
+        let new_outputs = Self::select_kms_outputs(&self.drm_devices[index].drm, output_offset)?;
+        let mut device = self.drm_devices.remove(index);
+        self.reconcile_drm_outputs(&mut device, new_outputs);
+        self.drm_devices.insert(index, device);
+
+        Ok(())
+    }
+
+    fn reconcile_drm_outputs(
+        &mut self,
+        device: &mut DrmProbeDevice,
+        mut new_outputs: Vec<KmsProbeOutput>,
+    ) {
+        let mut index = 0;
+        while index < device.outputs.len() {
+            let old_connector = device.outputs[index].connector;
+            let Some(new_index) = new_outputs
+                .iter()
+                .position(|output| output.connector == old_connector)
+            else {
+                let mut removed = device.outputs.remove(index);
+                self.unregister_wayland_output(&mut removed);
+                continue;
+            };
+
+            let new_output = new_outputs.remove(new_index);
+            let existing = &mut device.outputs[index];
+            if existing.crtc != new_output.crtc || existing.mode != new_output.mode {
+                existing.crtc = new_output.crtc;
+                existing.mode = new_output.mode;
+                Self::update_wayland_output_state(&existing.output, existing.mode, index);
+                info!(
+                    node = ?device.node,
+                    connector = ?existing.connector,
+                    crtc = ?existing.crtc,
+                    mode = %existing.mode.name().to_string_lossy(),
+                    "udev backend: refreshed changed KMS connector"
+                );
+            }
+            index += 1;
+        }
+
+        for mut output in new_outputs {
+            self.register_wayland_output(&mut output);
+            device.outputs.push(output);
+        }
+    }
+
+    fn remove_drm_device(&mut self, device_id: libc::dev_t) {
+        let Some(index) = self
+            .drm_devices
+            .iter()
+            .position(|device| device.node.dev_id() == device_id)
+        else {
+            warn!(?device_id, "udev backend: remove event for unknown DRM device");
+            return;
+        };
+
+        let mut device = self.drm_devices.remove(index);
+        for output in &mut device.outputs {
+            self.unregister_wayland_output(output);
+        }
+        self.wayland.event_loop.handle().remove(device.registration_token);
+        info!(
+            node = ?device.node,
+            path = %device.path.display(),
+            "udev backend: DRM device removed from probe list"
+        );
     }
 
     fn advertise_dmabuf_global(&mut self) {
