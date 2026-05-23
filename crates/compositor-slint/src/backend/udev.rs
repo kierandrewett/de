@@ -39,7 +39,7 @@ use smithay::backend::{
     session::{libseat::LibSeatSession, Event as SessionEvent, Session},
     udev::{primary_gpu, UdevBackend, UdevEvent},
 };
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::pointer::{AxisFrame, ButtonEvent};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::{
     calloop::RegistrationToken,
@@ -51,7 +51,7 @@ use smithay::reexports::{
 use smithay::utils::{DeviceFd, Point, SERIAL_COUNTER};
 use tracing::{error, info, warn};
 
-use crate::{wayland_runtime::WaylandRuntime, wayland_state::SpikeState};
+use crate::{renderer::input_util, wayland_runtime::WaylandRuntime, wayland_state::SpikeState};
 
 type ProbeAllocator = GbmAllocator<DrmDeviceFd>;
 type ProbeFramebufferExporter = GbmFramebufferExporter<DrmDeviceFd>;
@@ -934,64 +934,24 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
     state.idle_notifier_state.notify_activity(&state.seat);
     match event {
         InputEvent::Keyboard { event } => {
-            let surface = if state.session_locked {
-                state
-                    .lock_surfaces
-                    .first()
-                    .map(|li| li.surface.wl_surface().clone())
-            } else {
-                state
-                    .exclusive_keyboard_layer()
-                    .cloned()
-                    .or_else(|| state.active_surface.clone())
-            };
-            let Some(surface) = surface else { return };
-            let Some(keyboard) = state.seat.get_keyboard() else {
-                return;
-            };
-
-            // Only re-issue set_focus when the target actually changed.
-            // Per-keystroke set_focus calls re-send wl_keyboard.enter/leave
-            // and bump modifier serials (input audit P0.7) — clients see a
-            // serial storm that interacts badly with grabs.
-            let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
-                state, &surface,
-            );
-            if !keyboard
-                .current_focus()
-                .as_ref()
-                .is_some_and(|current| current.matches_wl_surface(&surface))
-            {
-                keyboard.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
-            }
-            keyboard.input_forward(
+            input_util::forward_keyboard_keycode(
                 state,
                 event.key_code(),
-                event.state(),
+                event.state() == smithay::backend::input::KeyState::Pressed,
                 SERIAL_COUNTER.next_serial(),
                 event.time_msec(),
-                false,
             );
         }
         InputEvent::PointerMotion { event } => {
-            let Some(pointer) = state.seat.get_pointer() else {
-                return;
-            };
-            state.pointer_pos.0 += event.delta_x();
-            state.pointer_pos.1 += event.delta_y();
-            state.pointer_pos.0 = state.pointer_pos.0.max(0.0);
-            state.pointer_pos.1 = state.pointer_pos.1.max(0.0);
-
-            pointer.motion(
+            let delta_unaccel = event.delta_unaccel();
+            input_util::forward_pointer_motion(
                 state,
-                None,
-                &MotionEvent {
-                    location: Point::from(state.pointer_pos),
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time: event.time_msec(),
-                },
+                (state.pointer_pos.0 + event.delta_x()).max(0.0),
+                (state.pointer_pos.1 + event.delta_y()).max(0.0),
+                Some((delta_unaccel.x, delta_unaccel.y)),
+                Some(event.time_msec()),
+                input_util::state_surface_under,
             );
-            pointer.frame(state);
         }
         InputEvent::PointerButton { event } => {
             let Some(pointer) = state.seat.get_pointer() else {
@@ -1146,76 +1106,32 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
             );
         }
         InputEvent::TouchDown { event } => {
-            let Some(touch) = state.seat.get_touch() else {
-                return;
-            };
             let Some(loc) = libinput_touch_location(state, &event) else {
                 return;
             };
-            // Touch acts like a click for keyboard focus: bring the surface
-            // under the contact point to the top.
-            let surface_at = surface_under_for_touch(state, loc.x, loc.y);
-            if let Some((surface, _, _)) = surface_at.as_ref() {
-                if let Some(kb) = state.seat.get_keyboard() {
-                    let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
-                        state, surface,
-                    );
-                    kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
-                }
-            }
-            let under = surface_at.map(|(s, ox, oy)| (s, Point::from((ox, oy))));
-            touch.down(
+            input_util::forward_touch_down(
                 state,
-                under,
-                &smithay::input::touch::DownEvent {
-                    slot: event.slot(),
-                    location: loc,
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time: event.time_msec(),
-                },
+                event.slot(),
+                loc.x,
+                loc.y,
+                event.time_msec(),
+                input_util::state_surface_under,
             );
         }
         InputEvent::TouchMotion { event } => {
-            let Some(touch) = state.seat.get_touch() else {
-                return;
-            };
             let Some(loc) = libinput_touch_location(state, &event) else {
                 return;
             };
-            let under = surface_under_for_touch(state, loc.x, loc.y)
-                .map(|(s, ox, oy)| (s, Point::from((ox, oy))));
-            touch.motion(
-                state,
-                under,
-                &smithay::input::touch::MotionEvent {
-                    slot: event.slot(),
-                    location: loc,
-                    time: event.time_msec(),
-                },
-            );
+            input_util::forward_touch_motion(state, event.slot(), loc.x, loc.y, event.time_msec());
         }
         InputEvent::TouchUp { event } => {
-            let Some(touch) = state.seat.get_touch() else {
-                return;
-            };
-            touch.up(
-                state,
-                &smithay::input::touch::UpEvent {
-                    slot: event.slot(),
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time: event.time_msec(),
-                },
-            );
+            input_util::forward_touch_up(state, event.slot(), event.time_msec());
         }
         InputEvent::TouchFrame { .. } => {
-            if let Some(touch) = state.seat.get_touch() {
-                touch.frame(state);
-            }
+            input_util::forward_touch_frame(state);
         }
         InputEvent::TouchCancel { .. } => {
-            if let Some(touch) = state.seat.get_touch() {
-                touch.cancel(state);
-            }
+            input_util::forward_touch_cancel(state);
         }
         InputEvent::DeviceAdded { device } => {
             if InputDevice::has_capability(&device, DeviceCapability::Touch)
@@ -1251,35 +1167,4 @@ where
         event.x_transformed(logical_w as i32),
         event.y_transformed(logical_h as i32),
     )))
-}
-
-/// Surface lookup for touch events. Honours the session lock the same way the
-/// renderer's `forward_pointer_motion` does — touches go ONLY to the lock
-/// surface while locked.
-fn surface_under_for_touch(
-    state: &SpikeState,
-    x: f64,
-    y: f64,
-) -> Option<(
-    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-    f64,
-    f64,
-)> {
-    if state.session_locked {
-        return state
-            .lock_surfaces
-            .first()
-            .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0));
-    }
-    // Best-effort: the udev backend currently has no access to the WM's
-    // surface_under since the renderer owns the WindowManager. Fall back to
-    // "topmost toplevel" — good enough for touch-to-focus on a foreground
-    // window. The full surface tree walk lives in WindowManager::surface_under,
-    // which the production touch path will need once the udev backend
-    // actually drives a frame loop.
-    let _ = (x, y);
-    state
-        .toplevels
-        .last()
-        .map(|tl| (tl.surface.clone(), 0.0, 0.0))
 }

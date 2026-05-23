@@ -49,7 +49,7 @@ use slint::{ComponentHandle, LogicalPosition, Model, SharedString, VecModel};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop as WinitEventLoop},
     keyboard::{KeyCode, PhysicalKey},
     platform::{
@@ -60,7 +60,7 @@ use winit::{
 };
 
 mod calendar;
-mod input_util;
+pub(crate) mod input_util;
 mod popup;
 mod wgpu_setup;
 use wgpu_setup::{configure_surface, make_render_texture};
@@ -104,9 +104,15 @@ pub struct PendingKeyEvent {
 #[derive(Debug, Clone)]
 pub enum PendingPointerEvent {
     /// Pointer moved to compositor-space (x, y).
-    Motion { x: f64, y: f64 },
+    Motion {
+        x: f64,
+        y: f64,
+    },
     /// Mouse button pressed/released. `button` is the Linux evdev button code.
-    Button { button: u32, pressed: bool },
+    Button {
+        button: u32,
+        pressed: bool,
+    },
     /// Scroll wheel / touchpad axis. Pixel-delta semantics; line/discrete scrolls
     /// from a wheel are pre-multiplied by 15 (a typical line height) on the
     /// winit→PendingPointerEvent edge so all events are normalised to pixels
@@ -118,6 +124,21 @@ pub enum PendingPointerEvent {
         discrete_v120: Option<(i32, i32)>,
         is_wheel: bool,
     },
+    TouchDown {
+        slot: smithay::backend::input::TouchSlot,
+        x: f64,
+        y: f64,
+    },
+    TouchMotion {
+        slot: smithay::backend::input::TouchSlot,
+        x: f64,
+        y: f64,
+    },
+    TouchUp {
+        slot: smithay::backend::input::TouchSlot,
+    },
+    TouchCancel,
+    TouchFrame,
 }
 
 // `winit_button_to_evdev`, `forward_keyboard_event`, `ascii_to_scancode`, and
@@ -194,6 +215,7 @@ struct CompositorApp {
 
     // Hotkey state — Super key held tracking for Super+T theme toggle.
     super_held: bool,
+    shortcuts_inhibited: bool,
 
     // Dock state.
     dock_entries: Vec<ResolvedDockEntry>,
@@ -407,6 +429,7 @@ impl CompositorApp {
             dnd_icon_pass: None,
             theme: ThemeState::new(),
             super_held: false,
+            shortcuts_inhibited: false,
             pointer_pos: (0.0, 0.0),
             last_clock_update: Instant::now(),
             calendar_month_offset: 0,
@@ -811,6 +834,33 @@ impl ApplicationHandler for CompositorApp {
                     });
             }
 
+            WindowEvent::Touch(touch) => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor())
+                    .unwrap_or(1.0)
+                    .max(0.0001);
+                let x = touch.location.x / scale;
+                let y = touch.location.y / scale;
+                let Some(slot_id) = u32::try_from(touch.id).ok() else {
+                    return;
+                };
+                let slot = smithay::backend::input::TouchSlot::from(Some(slot_id));
+                let mut pending = self.pending_pointers.lock().unwrap();
+                match touch.phase {
+                    TouchPhase::Started => {
+                        pending.push_back(PendingPointerEvent::TouchDown { slot, x, y })
+                    }
+                    TouchPhase::Moved => {
+                        pending.push_back(PendingPointerEvent::TouchMotion { slot, x, y })
+                    }
+                    TouchPhase::Ended => pending.push_back(PendingPointerEvent::TouchUp { slot }),
+                    TouchPhase::Cancelled => pending.push_back(PendingPointerEvent::TouchCancel),
+                }
+                pending.push_back(PendingPointerEvent::TouchFrame);
+            }
+
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
@@ -823,147 +873,138 @@ impl ApplicationHandler for CompositorApp {
                 // selection and never reach wayland clients. Escape is
                 // already handled below in the catch-all overlay-close
                 // branch.
-                let menu_consumed = if pressed {
-                    self.handle_menu_nav_key(scancode)
+                let shortcuts_inhibited = self.shortcuts_inhibited;
+                let menu_consumed = if !shortcuts_inhibited {
+                    if pressed {
+                        self.handle_menu_nav_key(scancode)
+                    } else {
+                        // Swallow the matching release so clients don't see a
+                        // stray key-up for a press they never received.
+                        matches!(scancode, 103 | 108 | 28 | 96) && self.menu_nav_active()
+                    }
                 } else {
-                    // Swallow the matching release so clients don't see a
-                    // stray key-up for a press they never received.
-                    matches!(scancode, 103 | 108 | 28 | 96) && self.menu_nav_active()
+                    false
                 };
                 let mut compositor_consumed = release_consumed || menu_consumed;
 
-                // ── Super+T → toggle light/dark theme ─────────────────────
-                // Scancode 125 = KEY_LEFTMETA (Super/Win key)
-                // Scancode 126 = KEY_RIGHTMETA
-                // Scancode 20  = KEY_T
-                match scancode {
-                    125 | 126 => {
-                        self.super_held = pressed;
-                    }
-                    20 if pressed && self.super_held => {
-                        // Super+T → toggle light/dark theme + per-mode wallpaper.
-                        self.theme.toggle_mode();
-                        self.apply_theme_to_slint();
-                        self.swap_wallpaper_for_current_mode();
-                        debug!("Super+T: toggled theme to {:?}", self.theme.current_mode);
-                        compositor_consumed = true;
-                    }
-                    23 if pressed && self.super_held => {
-                        // Super+I → toggle debug overlay.
-                        if let Some(ui) = self.ui.as_ref() {
-                            let now = ui.get_debug_overlay_visible();
-                            ui.set_debug_overlay_visible(!now);
+                if !shortcuts_inhibited {
+                    // Scancode 125 = KEY_LEFTMETA (Super/Win key), 126 = KEY_RIGHTMETA.
+                    match scancode {
+                        125 | 126 => {
+                            self.super_held = pressed;
                         }
-                        compositor_consumed = true;
-                    }
-                    53 if pressed && self.super_held => {
-                        // Super+/ → keyboard shortcuts help.
-                        if let Some(ui) = self.ui.as_ref() {
-                            let now = ui.get_help_overlay_visible();
-                            ui.set_help_overlay_visible(!now);
+                        20 if pressed && self.super_held => {
+                            self.theme.toggle_mode();
+                            self.apply_theme_to_slint();
+                            self.swap_wallpaper_for_current_mode();
+                            debug!("Super+T: toggled theme to {:?}", self.theme.current_mode);
+                            compositor_consumed = true;
                         }
-                        compositor_consumed = true;
-                    }
-                    // Super+W (scancode 17) → close focused window.
-                    17 if pressed && self.super_held => {
-                        if let Some(id) = self.wm.focused_id() {
-                            self.pending_close.lock().unwrap().push_back(id);
-                            debug!("Super+W: queued close for focused id={}", id);
-                        }
-                        compositor_consumed = true;
-                    }
-                    // Super+M (scancode 50) → minimize focused window.
-                    50 if pressed && self.super_held => {
-                        if let Some(id) = self.wm.focused_id() {
-                            self.pending_minimize.lock().unwrap().push_back(id);
-                            debug!("Super+M: queued minimize for focused id={}", id);
-                        }
-                        compositor_consumed = true;
-                    }
-                    // Super+D (scancode 32) → show desktop / minimize all.
-                    32 if pressed && self.super_held => {
-                        let ids: Vec<i32> = self
-                            .wm
-                            .windows
-                            .values()
-                            .filter(|w| !w.minimized && !w.closing)
-                            .map(|w| w.id)
-                            .collect();
-                        let mut q = self.pending_minimize.lock().unwrap();
-                        for id in ids {
-                            q.push_back(id);
-                        }
-                        debug!("Super+D: minimized all visible windows");
-                        compositor_consumed = true;
-                    }
-                    // Super+Space (scancode 57) → toggle the app launcher.
-                    57 if pressed && self.super_held => {
-                        if let Some(ui) = self.ui.as_ref() {
-                            let now = ui.get_launcher_open();
-                            ui.set_launcher_open(!now);
-                            if !now {
-                                ui.set_launcher_query(SharedString::default());
+                        23 if pressed && self.super_held => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let now = ui.get_debug_overlay_visible();
+                                ui.set_debug_overlay_visible(!now);
                             }
+                            compositor_consumed = true;
                         }
-                        compositor_consumed = true;
-                    }
-                    // Escape → close any open compositor overlay (menus,
-                    // popouts, debug overlay, launcher) without forwarding
-                    // to clients.
-                    1 if pressed => {
-                        if let Some(ui) = self.ui.as_ref() {
-                            let any_open = ui.get_desktop_menu_open()
-                                || ui.get_datetime_popout_open()
-                                || ui.get_control_centre_open()
-                                || ui.get_help_overlay_visible()
-                                || ui.get_launcher_open()
-                                || ui.get_dock_menu_open()
-                                || ui.get_window_menu_open();
-                            if any_open {
-                                ui.set_desktop_menu_open(false);
-                                ui.set_datetime_popout_open(false);
-                                ui.set_control_centre_open(false);
-                                ui.set_help_overlay_visible(false);
-                                ui.set_launcher_open(false);
-                                ui.set_dock_menu_open(false);
-                                ui.set_window_menu_open(false);
-                                if let Some(gpu) = self.gpu_window.as_ref() {
-                                    gpu.mark_dirty();
+                        53 if pressed && self.super_held => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let now = ui.get_help_overlay_visible();
+                                ui.set_help_overlay_visible(!now);
+                            }
+                            compositor_consumed = true;
+                        }
+                        17 if pressed && self.super_held => {
+                            if let Some(id) = self.wm.focused_id() {
+                                self.pending_close.lock().unwrap().push_back(id);
+                                debug!("Super+W: queued close for focused id={}", id);
+                            }
+                            compositor_consumed = true;
+                        }
+                        50 if pressed && self.super_held => {
+                            if let Some(id) = self.wm.focused_id() {
+                                self.pending_minimize.lock().unwrap().push_back(id);
+                                debug!("Super+M: queued minimize for focused id={}", id);
+                            }
+                            compositor_consumed = true;
+                        }
+                        32 if pressed && self.super_held => {
+                            let ids: Vec<i32> = self
+                                .wm
+                                .windows
+                                .values()
+                                .filter(|w| !w.minimized && !w.closing)
+                                .map(|w| w.id)
+                                .collect();
+                            let mut q = self.pending_minimize.lock().unwrap();
+                            for id in ids {
+                                q.push_back(id);
+                            }
+                            debug!("Super+D: minimized all visible windows");
+                            compositor_consumed = true;
+                        }
+                        57 if pressed && self.super_held => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let now = ui.get_launcher_open();
+                                ui.set_launcher_open(!now);
+                                if !now {
+                                    ui.set_launcher_query(SharedString::default());
                                 }
-                                compositor_consumed = true;
+                            }
+                            compositor_consumed = true;
+                        }
+                        1 if pressed => {
+                            if let Some(ui) = self.ui.as_ref() {
+                                let any_open = ui.get_desktop_menu_open()
+                                    || ui.get_datetime_popout_open()
+                                    || ui.get_control_centre_open()
+                                    || ui.get_help_overlay_visible()
+                                    || ui.get_launcher_open()
+                                    || ui.get_dock_menu_open()
+                                    || ui.get_window_menu_open();
+                                if any_open {
+                                    ui.set_desktop_menu_open(false);
+                                    ui.set_datetime_popout_open(false);
+                                    ui.set_control_centre_open(false);
+                                    ui.set_help_overlay_visible(false);
+                                    ui.set_launcher_open(false);
+                                    ui.set_dock_menu_open(false);
+                                    ui.set_window_menu_open(false);
+                                    if let Some(gpu) = self.gpu_window.as_ref() {
+                                        gpu.mark_dirty();
+                                    }
+                                    compositor_consumed = true;
+                                }
                             }
                         }
-                    }
-                    // Menu key (KEY_MENU = 127 on Linux input) → open
-                    // the window context menu for the focused window
-                    // at its titlebar centre.
-                    127 if pressed => {
-                        if let Some(focused_id) = self.wm.focused_id() {
-                            if let Some(win) = self.wm.windows.values().find(|w| w.id == focused_id)
-                            {
-                                let (wx, wy, ww) = (
-                                    win.anim.current_x() as f64,
-                                    win.anim.current_y() as f64,
-                                    win.anim.current_w() as f64,
-                                );
-                                // Anchor at titlebar centre, just below
-                                // its bottom edge so the menu drops
-                                // out of the chrome.
-                                let titlebar_h = crate::wm::TITLEBAR_HEIGHT;
-                                let cx = wx + ww / 2.0;
-                                let cy = wy + titlebar_h;
-                                self.open_window_menu(focused_id, cx, cy);
-                                compositor_consumed = true;
+                        127 if pressed => {
+                            if let Some(focused_id) = self.wm.focused_id() {
+                                if let Some(win) =
+                                    self.wm.windows.values().find(|w| w.id == focused_id)
+                                {
+                                    let (wx, wy, ww) = (
+                                        win.anim.current_x() as f64,
+                                        win.anim.current_y() as f64,
+                                        win.anim.current_w() as f64,
+                                    );
+                                    let titlebar_h = crate::wm::TITLEBAR_HEIGHT;
+                                    let cx = wx + ww / 2.0;
+                                    let cy = wy + titlebar_h;
+                                    self.open_window_menu(focused_id, cx, cy);
+                                    compositor_consumed = true;
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                }
 
-                // Handle Alt-Tab cycling in the winit handler so we get
-                // immediate key state without waiting for the calloop round-trip.
-                if self.handle_alt_tab_key(&key_event) {
-                    compositor_consumed = true;
+                    // Handle Alt-Tab cycling in the winit handler so we get
+                    // immediate key state without waiting for the calloop round-trip.
+                    if self.handle_alt_tab_key(&key_event) {
+                        compositor_consumed = true;
+                    }
+                } else if matches!(scancode, 125 | 126) {
+                    self.super_held = false;
                 }
 
                 if pressed && compositor_consumed && scancode > 0 {
@@ -2369,7 +2410,10 @@ impl CompositorApp {
                 .and_then(|w| state.toplevels.iter().find(|t| t.surface == w.surface))
                 .and_then(|t| t.appmenu.clone());
             if *self.appmenu_addr.borrow() != focused_appmenu {
-                tracing::debug!("appmenu: focused window menu changed → {:?}", focused_appmenu);
+                tracing::debug!(
+                    "appmenu: focused window menu changed → {:?}",
+                    focused_appmenu
+                );
                 *self.appmenu_addr.borrow_mut() = focused_appmenu.clone();
                 // Focus moved — any open submenu belongs to the old window.
                 ui.set_global_menu_open(false);
@@ -3281,9 +3325,8 @@ impl CompositorApp {
         state.active_surface = self.wm.focused_surface();
         if let Some(surface) = &state.active_surface {
             if let Some(kb) = state.seat.get_keyboard() {
-                let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
-                    state, surface,
-                );
+                let focus =
+                    crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(state, surface);
                 kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
             }
         }
@@ -3388,180 +3431,9 @@ impl CompositorApp {
 
     /// Forward a pointer motion event to the wayland client whose surface is under the pointer.
     fn forward_pointer_motion(&self, state: &mut SpikeState, x: f64, y: f64) {
-        use smithay::input::pointer::{MotionEvent, RelativeMotionEvent};
-        use smithay::utils::Point;
-        use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
-
-        let pointer = match state.seat.get_pointer() {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Reset the idle timer on user input (audit: screen locks while typing).
-        // Mirrors cosmic-comp/src/input/mod.rs:212.
-        state.idle_notifier_state.notify_activity(&state.seat);
-
-        let serial = SERIAL_COUNTER.next_serial();
-        let time = state.clock.now().as_millis();
-
-        // Delta from previous compositor-space pointer position. winit gives us
-        // absolute coords; we compute the relative for `wp_relative_pointer_v1`
-        // and pointer-constraints semantics. No `delta_unaccel` from winit, so
-        // pass the same value (clients that care about accel/unaccel separately
-        // need the libinput path under backend/udev.rs).
-        let (px, py) = state.pointer_pos;
-        let delta_x = x - px;
-        let delta_y = y - py;
-
-        // Session-lock gate: while locked, the only valid pointer focus is
-        // the lock surface for this output. WM surfaces are completely
-        // hidden — sending events there would leak input across the lock
-        // boundary. Lock surfaces span the full output starting at (0, 0)
-        // so their surface origin in compositor coords is (0, 0).
-        //
-        // We resolve focus twice: `current_hit` is the surface the pointer
-        // is currently on (PRE-motion), and `hit` is the surface under
-        // the new absolute coordinate. The pointer-constraint check below
-        // MUST use `current_hit` — the active constraint belongs to the
-        // surface the pointer is on right now; checking the new position's
-        // surface would miss a lock/confine the instant the pointer
-        // crossed out, defeating the constraint. Mirrors
-        // anvil/input_handler.rs:780-813.
-        let current_hit = self.surface_under_full(state, px, py);
-        let hit = self.surface_under_full(state, x, y);
-
-        // Pointer-constraints check, mirroring anvil/input_handler.rs:779-882.
-        // If the CURRENT focus surface has an active constraint covering
-        // the current pointer position:
-        //   Locked   → suppress absolute motion, only emit relative_motion
-        //   Confined → clamp pointer to constraint region / surface bounds
-        let mut pointer_locked = false;
-        let mut pointer_confined = false;
-        let mut confine_region: Option<smithay::wayland::compositor::RegionAttributes> = None;
-        if let Some((surface, origin_x, origin_y)) = current_hit.as_ref() {
-            with_pointer_constraint(surface, &pointer, |constraint| match constraint {
-                Some(c) if c.is_active() => {
-                    let local = ((px - origin_x) as i32, (py - origin_y) as i32);
-                    if !c
-                        .region()
-                        .is_none_or(|r| r.contains(smithay::utils::Point::from(local)))
-                    {
-                        return;
-                    }
-                    match &*c {
-                        PointerConstraint::Locked(_) => pointer_locked = true,
-                        PointerConstraint::Confined(cf) => {
-                            pointer_confined = true;
-                            confine_region = cf.region().cloned();
-                        }
-                    }
-                }
-                _ => {}
-            });
-        }
-
-        // Always emit relative_motion — FPS games (CS2, Aim Lab clones, etc.)
-        // gate their aim on this event regardless of whether the pointer is
-        // locked.
-        pointer.relative_motion(
-            state,
-            hit.clone().map(|(s, ox, oy)| (s, Point::from((ox, oy)))),
-            &RelativeMotionEvent {
-                delta: Point::from((delta_x, delta_y)),
-                delta_unaccel: Point::from((delta_x, delta_y)),
-                utime: (time as u64) * 1000,
-            },
-        );
-
-        if pointer_locked {
-            // Pointer position stays put — do NOT update state.pointer_pos.
-            // Do NOT call pointer.motion (the spec forbids it while locked).
-            pointer.frame(state);
-            return;
-        }
-
-        // Confine path: if moving would leave the constrained surface OR
-        // the constraint region, discard the absolute delta but keep the
-        // relative event (already sent). The "constrained surface" is
-        // `current_hit` — the surface the constraint is anchored to —
-        // NOT the surface under the new coordinate (which would already
-        // be a different surface the moment the cursor crossed out).
-        let (new_x, new_y) = (x, y);
-        if pointer_confined {
-            if let Some((focus_surface, origin_x, origin_y)) = current_hit.as_ref() {
-                let crossed_surface = hit
-                    .as_ref()
-                    .map(|(s, _, _)| s != focus_surface)
-                    .unwrap_or(true);
-                let out_of_region = confine_region.as_ref().is_some_and(|r| {
-                    let local = ((new_x - origin_x) as i32, (new_y - origin_y) as i32);
-                    !r.contains(smithay::utils::Point::from(local))
-                });
-                if crossed_surface || out_of_region {
-                    pointer.frame(state);
-                    return;
-                }
-            }
-        }
-
-        // Commit new compositor-space position.
-        state.pointer_pos = (new_x, new_y);
-
-        // Smithay expects `focus.1` to be the SURFACE ORIGIN in compositor
-        // space (NOT the surface-local position). It computes
-        // surface_local = event.location - focus.1 internally and ships
-        // that as wl_pointer.motion. Passing the surface-local position
-        // here makes smithay double-subtract and the client receives
-        // garbage coordinates that never update — clicks land in the
-        // wrong widget or get ignored as out-of-bounds. wm::surface_under
-        // returns the surface origin; we forward it untouched.
-        if let Some((surface, origin_x, origin_y)) = hit {
-            use smithay::reexports::wayland_server::Resource;
-            tracing::debug!(
-                "pointer.motion → surface_id={} pid={} comp=({:.1},{:.1}) origin=({:.1},{:.1}) implied_local=({:.1},{:.1})",
-                surface.id().protocol_id(),
-                surface.client().and_then(|c| c.get_credentials(&state.display_handle).ok())
-                    .map(|c| c.pid).unwrap_or(0),
-                new_x, new_y, origin_x, origin_y, new_x - origin_x, new_y - origin_y,
-            );
-            // If the surface under the new position has an inactive
-            // constraint whose region contains the pointer, activate it
-            // (anvil/input_handler.rs:867-881 — needed so games that
-            // request lock at pointer-enter time actually get locked).
-            with_pointer_constraint(&surface, &pointer, |constraint| match constraint {
-                Some(c) if !c.is_active() => {
-                    let local = ((new_x - origin_x) as i32, (new_y - origin_y) as i32);
-                    if c.region()
-                        .is_none_or(|r| r.contains(smithay::utils::Point::from(local)))
-                    {
-                        c.activate();
-                    }
-                }
-                _ => {}
-            });
-            pointer.motion(
-                state,
-                Some((surface, Point::from((origin_x, origin_y)))),
-                &MotionEvent {
-                    location: Point::from((new_x, new_y)),
-                    serial,
-                    time,
-                },
-            );
-            pointer.frame(state);
-        } else {
-            tracing::debug!("pointer.motion → no surface at ({:.1},{:.1})", new_x, new_y);
-            pointer.motion(
-                state,
-                None,
-                &MotionEvent {
-                    location: Point::from((new_x, new_y)),
-                    serial,
-                    time,
-                },
-            );
-            pointer.frame(state);
-        }
+        input_util::forward_pointer_motion(state, x, y, None, None, |state, hit_x, hit_y| {
+            self.surface_under_full(state, hit_x, hit_y)
+        });
     }
 
     /// Forward a wl_pointer.axis frame to whatever surface currently has
@@ -3727,16 +3599,15 @@ impl CompositorApp {
         // context menu (Minimize / Maximize / Close). We test the hit
         // zone before the desktop check below; only fall through if
         // the cursor wasn't on a titlebar.
-        if button == 0x111 && pressed
-            && !over_client_popup {
-                let win_rects = self.window_rects(state);
-                if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
-                    if hit.zone == cursor::HitZone::TitleBar {
-                        self.open_window_menu(hit.window_id, x, y);
-                        return;
-                    }
+        if button == 0x111 && pressed && !over_client_popup {
+            let win_rects = self.window_rects(state);
+            if let Some(hit) = cursor::hit_test(x, y, &win_rects) {
+                if hit.zone == cursor::HitZone::TitleBar {
+                    self.open_window_menu(hit.window_id, x, y);
+                    return;
                 }
             }
+        }
 
         // Right-click on the desktop opens our generic context menu.
         if button == 0x111 && pressed {
@@ -3900,8 +3771,7 @@ impl CompositorApp {
             })
         };
 
-        let focused_app_id: Option<String> =
-            state.active_surface.as_ref().and_then(&app_id_for);
+        let focused_app_id: Option<String> = state.active_surface.as_ref().and_then(&app_id_for);
 
         // Collect every running app_id from the toplevel list.
         let mut running_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5869,12 +5739,15 @@ pub fn run() -> Result<()> {
             let y = ((cy as f64) + 6.0).max(pad) as i32;
             let results = results.clone();
             crate::dbusmenu::fetch_layout(service, object_path, move |items| {
-                results.lock().unwrap().push_back(MenuFetchResult::TrayMenu {
-                    items,
-                    x,
-                    y,
-                    sni_id: id,
-                });
+                results
+                    .lock()
+                    .unwrap()
+                    .push_back(MenuFetchResult::TrayMenu {
+                        items,
+                        x,
+                        y,
+                        sni_id: id,
+                    });
             });
         });
     }
@@ -6194,6 +6067,8 @@ pub fn run() -> Result<()> {
     // 7. Main loop.
     info!("Entering GPU compositor main loop");
     loop {
+        app.shortcuts_inhibited = input_util::keyboard_shortcuts_inhibited(&state);
+
         match winit_event_loop.pump_app_events(Some(Duration::from_millis(1)), &mut app) {
             PumpStatus::Exit(_) => {
                 info!("winit exited");
@@ -6450,6 +6325,31 @@ pub fn run() -> Result<()> {
                         is_wheel,
                     } => {
                         app.forward_pointer_axis(&mut state, dx, dy, discrete_v120, is_wheel);
+                    }
+                    PendingPointerEvent::TouchDown { slot, x, y } => {
+                        let time = state.clock.now().as_millis();
+                        input_util::forward_touch_down(
+                            &mut state,
+                            slot,
+                            x,
+                            y,
+                            time,
+                            |state, hit_x, hit_y| app.surface_under_full(state, hit_x, hit_y),
+                        );
+                    }
+                    PendingPointerEvent::TouchMotion { slot, x, y } => {
+                        let time = state.clock.now().as_millis();
+                        input_util::forward_touch_motion(&mut state, slot, x, y, time);
+                    }
+                    PendingPointerEvent::TouchUp { slot } => {
+                        let time = state.clock.now().as_millis();
+                        input_util::forward_touch_up(&mut state, slot, time);
+                    }
+                    PendingPointerEvent::TouchCancel => {
+                        input_util::forward_touch_cancel(&mut state);
+                    }
+                    PendingPointerEvent::TouchFrame => {
+                        input_util::forward_touch_frame(&mut state);
                     }
                 }
             }

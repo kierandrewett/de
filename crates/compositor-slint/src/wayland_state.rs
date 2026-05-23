@@ -33,12 +33,16 @@
 //! (wgpu-29 `create_texture_from_hal`) can replace this once Slint ships a
 //! wgpu-29 feature gate.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
         egl::{EGLContext, EGLDevice, EGLDisplay},
+        input::TouchSlot,
         renderer::{gles::GlesRenderer, ExportMem, ImportDma},
     },
     delegate_dmabuf, delegate_seat, delegate_shm,
@@ -284,7 +288,8 @@ pub struct PopupInfo {
 
 impl PopupInfo {
     pub fn configured_geometry(&self) -> Option<Rectangle<i32, Logical>> {
-        self.popup.with_committed_state(|state| state.map(|state| state.geometry))
+        self.popup
+            .with_committed_state(|state| state.map(|state| state.geometry))
     }
 }
 
@@ -558,6 +563,7 @@ pub struct SpikeState {
 
     pub should_exit: bool,
     pub pointer_pos: (f64, f64),
+    pub touch_focus: HashMap<TouchSlot, (WlSurface, f64, f64)>,
 
     // ── DMA-BUF two-stage import (Option B) ──────────────────────────────────
     /// Surfaceless EGL display — initialised lazily on first DMA-BUF import.
@@ -797,6 +803,7 @@ impl SpikeState {
             pending_bell: None,
             should_exit: false,
             pointer_pos: (0.0, 0.0),
+            touch_focus: HashMap::new(),
             cursor_status: CursorImageStatus::default_named(),
             cursor_surface_pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
             egl_display: None,
@@ -893,16 +900,18 @@ impl SpikeState {
             let PopupKind::Xdg(surface) = popup else {
                 continue;
             };
-            let reactive = surface.with_committed_state(|state| {
-                state.is_some_and(|state| state.positioner.reactive)
-            });
+            let reactive = surface
+                .with_committed_state(|state| state.is_some_and(|state| state.positioner.reactive));
             if !reactive {
                 continue;
             }
 
             self.unconstrain_popup(&surface);
             if let Err(err) = surface.send_configure() {
-                warn!(?err, "failed to configure reactive popup after parent geometry change");
+                warn!(
+                    ?err,
+                    "failed to configure reactive popup after parent geometry change"
+                );
             }
         }
     }
