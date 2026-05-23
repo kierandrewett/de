@@ -653,6 +653,28 @@ impl WindowManager {
         surface.id().protocol_id() as usize
     }
 
+    fn is_focusable(win: &WindowState) -> bool {
+        !win.closing && !win.minimized
+    }
+
+    fn focus_key(&mut self, key: usize) -> bool {
+        if !self.windows.get(&key).is_some_and(Self::is_focusable) {
+            return false;
+        }
+
+        let new_z = self.next_z;
+        self.next_z += 1;
+        for (&k, win) in &mut self.windows {
+            win.focused = k == key;
+            if k == key {
+                win.z_order = new_z;
+            }
+        }
+        self.focus_stack.retain(|&k| k != key);
+        self.focus_stack.push(key);
+        true
+    }
+
     /// Register a newly-mapped toplevel. Returns the assigned stable ID.
     pub fn add_window(&mut self, surface: WlSurface) -> i32 {
         let id = self.next_id;
@@ -783,28 +805,24 @@ impl WindowManager {
     /// Focus a window by surface, raise it to the top of z-order.
     pub fn focus_surface(&mut self, surface: &WlSurface) {
         let key = Self::key(surface);
-        if !self.windows.contains_key(&key) {
+        let Some((id, minimized, closing)) = self
+            .windows
+            .get(&key)
+            .map(|win| (win.id, win.minimized, win.closing))
+        else {
+            return;
+        };
+        if closing {
+            return;
+        }
+        if minimized {
+            self.restore_by_id(id);
             return;
         }
 
-        // Raise z-order.
-        let new_z = self.next_z;
-        self.next_z += 1;
-        if let Some(win) = self.windows.get_mut(&key) {
-            win.z_order = new_z;
-            win.focused = true;
+        if self.focus_key(key) {
+            debug!("WM: focus surface key={}", key);
         }
-
-        // Update focus state on all windows.
-        for (&k, win) in &mut self.windows {
-            win.focused = k == key;
-        }
-
-        // Update focus stack (remove and re-push to make it MRU-last).
-        self.focus_stack.retain(|&k| k != key);
-        self.focus_stack.push(key);
-
-        debug!("WM: focus surface key={}", key);
     }
 
     /// Focus a window by its stable ID.
@@ -815,35 +833,34 @@ impl WindowManager {
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
-            // Raise z.
-            let new_z = self.next_z;
-            self.next_z += 1;
-            for (&k, win) in &mut self.windows {
-                win.focused = k == key;
-                if k == key {
-                    win.z_order = new_z;
-                }
+            let Some((minimized, closing)) = self
+                .windows
+                .get(&key)
+                .map(|win| (win.minimized, win.closing))
+            else {
+                return;
+            };
+            if closing {
+                return;
             }
-            self.focus_stack.retain(|&k| k != key);
-            self.focus_stack.push(key);
+            if minimized {
+                self.restore_by_id(id);
+                return;
+            }
+            self.focus_key(key);
         }
     }
 
     /// Focus the topmost (last focus_stack entry) window.
     fn focus_top(&mut self) {
-        if let Some(&key) = self.focus_stack.last() {
-            let new_z = self.next_z;
-            self.next_z += 1;
-            for (&k, win) in &mut self.windows {
-                win.focused = k == key;
-                if k == key {
-                    win.z_order = new_z;
-                }
+        while let Some(&key) = self.focus_stack.last() {
+            if self.focus_key(key) {
+                return;
             }
-        } else {
-            for win in self.windows.values_mut() {
-                win.focused = false;
-            }
+            self.focus_stack.pop();
+        }
+        for win in self.windows.values_mut() {
+            win.focused = false;
         }
     }
 
@@ -852,23 +869,41 @@ impl WindowManager {
         self.focus_stack
             .last()
             .and_then(|k| self.windows.get(k))
+            .filter(|w| Self::is_focusable(w) && w.focused)
             .map(|w| w.surface.clone())
     }
 
     /// Look up the currently focused window's stable ID.
     pub fn focused_id(&self) -> Option<i32> {
-        self.windows.values().find(|w| w.focused).map(|w| w.id)
+        self.windows
+            .values()
+            .find(|w| w.focused && Self::is_focusable(w))
+            .map(|w| w.id)
     }
 
     /// Return the stable ids of every mapped (non-closing) window whose
     /// `app_id` matches `target` exactly. Used by the dock context menu's
     /// "Show All Windows" / "Quit" actions.
     pub fn ids_for_app(&self, target: &str) -> Vec<i32> {
-        self.windows
-            .values()
-            .filter(|w| !w.closing && w.app_id == target)
-            .map(|w| w.id)
-            .collect()
+        let mut out = Vec::new();
+        for key in &self.focus_stack {
+            if let Some(win) = self.windows.get(key) {
+                if !win.closing && win.app_id == target {
+                    out.push(win.id);
+                }
+            }
+        }
+        let mut rest: Vec<i32> = self
+            .windows
+            .iter()
+            .filter(|(key, win)| {
+                !self.focus_stack.contains(key) && !win.closing && win.app_id == target
+            })
+            .map(|(_, win)| win.id)
+            .collect();
+        rest.sort_unstable();
+        out.extend(rest);
+        out
     }
 
     /// Drop focus from every window (e.g. after a click on the desktop).
@@ -906,17 +941,9 @@ impl WindowManager {
                 }
         }
         if let Some((key, _)) = best {
-            let new_z = self.next_z;
-            self.next_z += 1;
-            for (&k, win) in &mut self.windows {
-                win.focused = k == key;
-                if k == key {
-                    win.z_order = new_z;
-                }
-            }
-            self.focus_stack.retain(|&k| k != key);
-            self.focus_stack.push(key);
-            self.windows.get(&key).map(|w| w.surface.clone())
+            self.focus_key(key)
+                .then(|| self.windows.get(&key).map(|w| w.surface.clone()))
+                .flatten()
         } else {
             None
         }
@@ -947,23 +974,16 @@ impl WindowManager {
             .find(|(_, w)| w.id == id)
             .map(|(&k, _)| k);
         if let Some(key) = key {
+            let Some(closing) = self.windows.get(&key).map(|win| win.closing) else {
+                return;
+            };
+            if closing {
+                return;
+            }
             if let Some(win) = self.windows.get_mut(&key) {
                 win.start_restore();
             }
-            // Raise and focus.
-            let new_z = self.next_z;
-            self.next_z += 1;
-            if let Some(win) = self.windows.get_mut(&key) {
-                win.z_order = new_z;
-                win.focused = true;
-            }
-            for (&k, win) in &mut self.windows {
-                if k != key {
-                    win.focused = false;
-                }
-            }
-            self.focus_stack.retain(|&k| k != key);
-            self.focus_stack.push(key);
+            self.focus_key(key);
         }
     }
 

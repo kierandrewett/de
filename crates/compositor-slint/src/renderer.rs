@@ -3116,11 +3116,13 @@ impl CompositorApp {
             );
             match action {
                 2 => {
-                    // Show All Windows — raise + focus the most-recent one
-                    // belonging to this app. Future polish: open a window
-                    // overview / mission-control style picker.
-                    if let Some(&id) = ids.last() {
-                        self.wm.focus_by_id(id);
+                    // Show All Windows — restore each minimised window for
+                    // the app, then leave focus on the MRU entry. `ids_for_app`
+                    // returns focus-stack order, with stable-ID fallback for
+                    // windows that are not in the stack, so this is no longer
+                    // HashMap iteration order.
+                    for id in ids {
+                        self.wm.restore_by_id(id);
                         self.update_focused_surface(state);
                         self.sync_x11_stacking_order(state);
                     }
@@ -3373,6 +3375,8 @@ impl CompositorApp {
                     crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(state, surface);
                 kb.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
             }
+        } else if let Some(kb) = state.seat.get_keyboard() {
+            kb.set_focus(state, None, SERIAL_COUNTER.next_serial());
         }
     }
 
