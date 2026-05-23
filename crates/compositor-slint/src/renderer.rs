@@ -3220,7 +3220,7 @@ impl CompositorApp {
     /// `render_frame` so the captured pixels reflect the frame the client
     /// just saw on screen. Skipped silently when the renderer hasn't yet
     /// populated `final_tex` — clients re-request next vsync.
-    fn process_capture_frames(&mut self, state: &mut SpikeState) {
+    fn process_capture_frames(&mut self, state: &mut SpikeState, presented: std::time::Duration) {
         if state.pending_capture_frames.is_empty() {
             return;
         }
@@ -3247,10 +3247,6 @@ impl CompositorApp {
         }
         let device = &gpu_window.wgpu_device;
         let queue = &gpu_window.wgpu_queue;
-        let presented = self
-            .last_present_time
-            .map(std::time::Duration::from)
-            .unwrap_or(std::time::Duration::ZERO);
         let ctx = crate::screencopy::CaptureContext {
             device,
             queue,
@@ -6755,7 +6751,7 @@ pub fn run() -> Result<()> {
                 );
                 // Service ext-image-copy-capture-v1 frames after the render so
                 // readback samples the frame that just reached final_tex.
-                app.process_capture_frames(&mut state);
+                app.process_capture_frames(&mut state, std::time::Duration::from(presented.time));
             }
         }
 
