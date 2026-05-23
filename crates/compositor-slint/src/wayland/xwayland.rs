@@ -577,10 +577,8 @@ impl XWaylandShellHandler for SpikeState {
         });
         // OR windows aren't focusable / managed — they piggyback on the
         // parent's keyboard focus (xterm popup menu, GTK dropdown).
-        if !is_or {
-            if self.focus_new_surface_if_allowed(&wl_surface, "X11 surface_associated") {
-                self.raise_x11_window(&x11_surface);
-            }
+        if !is_or && self.focus_new_surface_if_allowed(&wl_surface, "X11 surface_associated") {
+            self.raise_x11_window(&x11_surface);
         }
         // After the toplevel list contains both parent and child,
         // resolve transient_for so dialog→parent z/focus rules can kick in.
