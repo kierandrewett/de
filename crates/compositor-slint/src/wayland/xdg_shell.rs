@@ -16,7 +16,7 @@ use smithay::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge as XdgResizeEdge},
         wayland_server::protocol::{wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface},
     },
-    utils::{Serial, SERIAL_COUNTER},
+    utils::Serial,
     wayland::shell::xdg::{
         Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     },
@@ -114,16 +114,7 @@ impl XdgShellHandler for SpikeState {
             appmenu,
         });
 
-        // Focus the new toplevel (most recently mapped = focused).
-        self.active_surface = Some(wl_surface.clone());
-
-        if let Some(kb) = self.seat.get_keyboard() {
-            kb.set_focus(
-                self,
-                Some(crate::wayland::xwayland::KeyboardFocusTarget::Wayland(wl_surface)),
-                SERIAL_COUNTER.next_serial(),
-            );
-        }
+        self.focus_new_surface_if_allowed(&wl_surface, "xdg new_toplevel");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -197,8 +188,7 @@ impl XdgShellHandler for SpikeState {
 
         // Push to destroyed_surfaces so the WM can start a close animation.
         self.destroyed_surfaces.push(wl.clone());
-        self.xdg_resize_transactions
-            .retain(|tx| tx.surface != *wl);
+        self.xdg_resize_transactions.retain(|tx| tx.surface != *wl);
 
         // Keep the toplevel in `self.toplevels` until the WM close animation
         // finishes — update_windows will remove it via sweep_closed.
@@ -260,11 +250,7 @@ impl XdgShellHandler for SpikeState {
                 grab.ungrab(PopupUngrabStrategy::All);
                 return;
             }
-            keyboard.set_focus(
-                self,
-                grab.current_grab(),
-                serial,
-            );
+            keyboard.set_focus(self, grab.current_grab(), serial);
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         if let Some(pointer) = seat.get_pointer() {

@@ -51,37 +51,44 @@ impl XdgActivationHandler for SpikeState {
         &mut self.activation_state
     }
 
+    fn token_created(&mut self, token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        let valid = self.activation_token_is_valid(&data);
+        if !valid {
+            tracing::debug!(
+                app_id = ?data.app_id,
+                token = ?token,
+                "xdg-activation: rejecting token without a valid keyboard enter serial",
+            );
+        }
+        valid
+    }
+
     fn request_activation(
         &mut self,
         token: XdgActivationToken,
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        // Focus-stealing prevention: an activation token minted without
-        // a `(serial, seat)` from a recent user input event is "blind"
-        // — programmatic, no user intent behind it. Drop it on the
-        // floor. Tokens with a serial pass through and raise/focus the
-        // requested surface (terminal launches that pass
-        // XDG_ACTIVATION_TOKEN, notification action clicks, etc).
-        if token_data.serial.is_none() {
+        if !self.activation_token_is_valid(&token_data) {
             tracing::debug!(
-                "xdg-activation: dropping blind token (no input serial) for app_id={:?} token={:?}",
-                token_data.app_id,
-                token,
+                app_id = ?token_data.app_id,
+                token = ?token,
+                "xdg-activation: dropping request with stale or foreign serial",
             );
+            self.activation_state.remove_token(&token);
             return;
         }
-        self.active_surface = Some(surface.clone());
-        if let Some(kb) = self.seat.get_keyboard() {
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            kb.set_focus(
-                self,
-                Some(crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
-                    self, &surface,
-                )),
-                serial,
+        if token_data.timestamp.elapsed().as_secs() >= 10 {
+            tracing::debug!(
+                app_id = ?token_data.app_id,
+                token = ?token,
+                "xdg-activation: dropping expired request",
             );
+            self.activation_state.remove_token(&token);
+            return;
         }
+        self.focus_surface_for_activation(&surface, "xdg-activation request");
+        self.activation_state.remove_token(&token);
     }
 }
 

@@ -116,7 +116,7 @@ use smithay::{
         text_input::TextInputManagerState,
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
-        xdg_activation::XdgActivationState,
+        xdg_activation::{XdgActivationState, XdgActivationTokenData},
         xdg_foreign::XdgForeignState,
         xdg_system_bell::XdgSystemBellState,
         xdg_toplevel_icon::XdgToplevelIconManager,
@@ -605,6 +605,69 @@ pub struct SpikeState {
 }
 
 impl SpikeState {
+    pub fn activation_token_is_valid(&self, data: &XdgActivationTokenData) -> bool {
+        let Some((serial, seat_resource)) = data.serial.as_ref() else {
+            return false;
+        };
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return false;
+        };
+
+        Seat::from_resource(seat_resource) == Some(self.seat.clone())
+            && keyboard
+                .last_enter()
+                .is_some_and(|last_enter| serial.is_no_older_than(&last_enter))
+    }
+
+    pub fn focus_surface_for_activation(&mut self, surface: &WlSurface, reason: &str) -> bool {
+        let Some(toplevel) = self
+            .toplevels
+            .iter()
+            .find(|toplevel| &toplevel.surface == surface)
+        else {
+            debug!(?reason, surface_id = ?surface.id(), "activation focus denied for untracked surface");
+            return false;
+        };
+        if toplevel
+            .x11_surface
+            .as_ref()
+            .is_some_and(|x11_surface| x11_surface.is_override_redirect())
+        {
+            debug!(?reason, surface_id = ?surface.id(), "activation focus denied for override-redirect surface");
+            return false;
+        }
+
+        self.active_surface = Some(surface.clone());
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            let focus =
+                crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(self, surface);
+            if let crate::wayland::xwayland::KeyboardFocusTarget::X11(x11_surface) = &focus {
+                let _ = x11_surface.set_activated(true);
+            }
+            keyboard.set_focus(
+                self,
+                Some(focus),
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+            );
+        }
+        debug!(?reason, surface_id = ?surface.id(), "activation focus granted");
+        true
+    }
+
+    pub fn focus_new_surface_if_allowed(&mut self, surface: &WlSurface, reason: &str) -> bool {
+        let keyboard_has_focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .is_some();
+        if self.active_surface.is_some() || keyboard_has_focus {
+            debug!(?reason, surface_id = ?surface.id(), "map focus denied while another surface is active");
+            return false;
+        }
+
+        self.focus_surface_for_activation(surface, reason)
+    }
+
     pub fn new(
         display_handle: DisplayHandle,
         loop_handle: LoopHandle<'static, SpikeState>,

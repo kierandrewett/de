@@ -41,7 +41,7 @@ use smithay::{
         Seat,
     },
     reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
-    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
+    utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER},
     wayland::{
         seat::WaylandFocus,
         selection::{
@@ -177,7 +177,8 @@ impl KeyboardFocusTarget {
     }
 
     pub fn matches_wl_surface(&self, surface: &WlSurface) -> bool {
-        self.wl_surface().is_some_and(|focus| focus.as_ref() == surface)
+        self.wl_surface()
+            .is_some_and(|focus| focus.as_ref() == surface)
     }
 }
 
@@ -236,8 +237,12 @@ impl KeyboardTarget<SpikeState> for KeyboardFocusTarget {
         time: u32,
     ) {
         match self {
-            Self::Wayland(surface) => KeyboardTarget::key(surface, seat, data, key, state, serial, time),
-            Self::X11(surface) => KeyboardTarget::key(surface, seat, data, key, state, serial, time),
+            Self::Wayland(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
+            Self::X11(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
         }
     }
 
@@ -249,7 +254,9 @@ impl KeyboardTarget<SpikeState> for KeyboardFocusTarget {
         serial: Serial,
     ) {
         match self {
-            Self::Wayland(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
+            Self::Wayland(surface) => {
+                KeyboardTarget::modifiers(surface, seat, data, modifiers, serial)
+            }
             Self::X11(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
         }
     }
@@ -571,6 +578,7 @@ impl XWaylandShellHandler for SpikeState {
         // OR windows aren't focusable / managed — they piggyback on the
         // parent's keyboard focus (xterm popup menu, GTK dropdown).
         if !is_or {
+<<<<<<< HEAD
             self.active_surface = Some(wl_surface.clone());
             if let Some(kb) = self.seat.get_keyboard() {
                 kb.set_focus(
@@ -581,6 +589,9 @@ impl XWaylandShellHandler for SpikeState {
             }
             let _ = x11_surface.set_activated(true);
             self.raise_x11_window(&x11_surface);
+=======
+            self.focus_new_surface_if_allowed(&wl_surface, "X11 surface_associated");
+>>>>>>> 508e41f (fix(compositor-slint): validate activation tokens before focusing windows)
         }
         // After the toplevel list contains both parent and child,
         // resolve transient_for so dialog→parent z/focus rules can kick in.
@@ -689,6 +700,7 @@ impl XwmHandler for SpikeState {
                     description: None,
                     appmenu: None,
                 });
+<<<<<<< HEAD
                 self.active_surface = Some(wl_surface.clone());
                 if let Some(kb) = self.seat.get_keyboard() {
                     kb.set_focus(
@@ -699,6 +711,9 @@ impl XwmHandler for SpikeState {
                 }
                 let _ = window.set_activated(true);
                 self.raise_x11_window(&window);
+=======
+                self.focus_new_surface_if_allowed(&wl_surface, "X11 map_window_request");
+>>>>>>> 508e41f (fix(compositor-slint): validate activation tokens before focusing windows)
                 // Resolve TRANSIENT_FOR now that both parent and child are in
                 // the toplevel list (parent must have mapped earlier; if not,
                 // a later property_notify will retry).
