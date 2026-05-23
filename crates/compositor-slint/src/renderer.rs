@@ -4848,7 +4848,9 @@ impl CompositorApp {
                 self.pointer_pos = (x, y);
                 self.update_cursor_position(x, y);
                 self.handle_pointer_update(state, x, y);
-                self.forward_pointer_motion(state, x, y);
+                if self.active_drag.is_none() {
+                    self.forward_pointer_motion(state, x, y);
+                }
                 if let Some(gw) = self.gpu_window.as_ref() {
                     gw.mark_dirty();
                 }
@@ -4857,6 +4859,7 @@ impl CompositorApp {
                 button_evdev,
                 pressed,
             } => {
+                let had_drag = self.active_drag.is_some();
                 if button_evdev == 0x110 {
                     self.left_button_down = pressed;
                     if !pressed {
@@ -4867,7 +4870,9 @@ impl CompositorApp {
                         self.handle_pointer_update(state, x, y);
                     }
                 }
-                self.forward_pointer_button(state, button_evdev, pressed);
+                if !had_drag && self.active_drag.is_none() {
+                    self.forward_pointer_button(state, button_evdev, pressed);
+                }
             }
             IpcCommand::KeyEvent { scancode, pressed } => {
                 self.pending_keys
@@ -6344,10 +6349,16 @@ pub fn run() -> Result<()> {
                     PendingPointerEvent::Motion { x, y } => {
                         // Run cursor hit-test + drag update.
                         app.handle_pointer_update(&mut state, x, y);
-                        // Forward to wayland client (only if not in a drag over chrome).
-                        app.forward_pointer_motion(&mut state, x, y);
+                        // While the compositor owns a move/resize drag, no client
+                        // gets pointer focus. This mirrors anvil/cosmic pointer
+                        // grabs using Focus::Clear, but keeps the current
+                        // renderer-side ActiveDrag model intact for this pass.
+                        if app.active_drag.is_none() {
+                            app.forward_pointer_motion(&mut state, x, y);
+                        }
                     }
                     PendingPointerEvent::Button { button, pressed } => {
+                        let had_drag = app.active_drag.is_some();
                         if button == 0x110 && pressed {
                             let (x, y) = app.pointer_pos;
                             app.handle_pointer_update(&mut state, x, y);
@@ -6361,7 +6372,9 @@ pub fn run() -> Result<()> {
                             app.apply_pending_snap(&mut state);
                             app.release_drag(&mut state);
                         }
-                        app.forward_pointer_button(&mut state, button, pressed);
+                        if !had_drag && app.active_drag.is_none() {
+                            app.forward_pointer_button(&mut state, button, pressed);
+                        }
                     }
                     PendingPointerEvent::Axis {
                         dx,
