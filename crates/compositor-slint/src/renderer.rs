@@ -3366,25 +3366,38 @@ impl CompositorApp {
         // hidden — sending events there would leak input across the lock
         // boundary. Lock surfaces span the full output starting at (0, 0)
         // so their surface origin in compositor coords is (0, 0).
-        let hit = if state.session_locked {
-            state
-                .lock_surfaces
-                .first()
-                .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0))
-        } else {
-            self.popup_surface_under(state, x, y)
-                .or_else(|| self.wm.surface_under(x, y))
+        //
+        // We resolve focus twice: `current_hit` is the surface the pointer
+        // is currently on (PRE-motion), and `hit` is the surface under
+        // the new absolute coordinate. The pointer-constraint check below
+        // MUST use `current_hit` — the active constraint belongs to the
+        // surface the pointer is on right now; checking the new position's
+        // surface would miss a lock/confine the instant the pointer
+        // crossed out, defeating the constraint. Mirrors
+        // anvil/input_handler.rs:780-813.
+        let resolve_hit = |compositor: &Self, st: &SpikeState, sx: f64, sy: f64| {
+            if st.session_locked {
+                st.lock_surfaces
+                    .first()
+                    .map(|li| (li.surface.wl_surface().clone(), 0.0, 0.0))
+            } else {
+                compositor
+                    .popup_surface_under(st, sx, sy)
+                    .or_else(|| compositor.wm.surface_under(sx, sy))
+            }
         };
+        let current_hit = resolve_hit(self, state, px, py);
+        let hit = resolve_hit(self, state, x, y);
 
         // Pointer-constraints check, mirroring anvil/input_handler.rs:779-882.
-        // If the focused surface has an active constraint covering the
-        // current pointer position:
+        // If the CURRENT focus surface has an active constraint covering
+        // the current pointer position:
         //   Locked   → suppress absolute motion, only emit relative_motion
         //   Confined → clamp pointer to constraint region / surface bounds
         let mut pointer_locked = false;
         let mut pointer_confined = false;
         let mut confine_region: Option<smithay::wayland::compositor::RegionAttributes> = None;
-        if let Some((surface, origin_x, origin_y)) = hit.as_ref() {
+        if let Some((surface, origin_x, origin_y)) = current_hit.as_ref() {
             with_pointer_constraint(surface, &pointer, |constraint| match constraint {
                 Some(c) if c.is_active() => {
                     let local = ((px - origin_x) as i32, (py - origin_y) as i32);
@@ -3426,15 +3439,16 @@ impl CompositorApp {
             return;
         }
 
-        // Confine path: if moving would leave the surface or constraint region,
-        // discard the absolute delta but keep the relative event (already sent).
+        // Confine path: if moving would leave the constrained surface OR
+        // the constraint region, discard the absolute delta but keep the
+        // relative event (already sent). The "constrained surface" is
+        // `current_hit` — the surface the constraint is anchored to —
+        // NOT the surface under the new coordinate (which would already
+        // be a different surface the moment the cursor crossed out).
         let (new_x, new_y) = (x, y);
         if pointer_confined {
-            if let Some((focus_surface, origin_x, origin_y)) = hit.as_ref() {
-                let new_hit = self
-                    .popup_surface_under(state, new_x, new_y)
-                    .or_else(|| self.wm.surface_under(new_x, new_y));
-                let crossed_surface = new_hit
+            if let Some((focus_surface, origin_x, origin_y)) = current_hit.as_ref() {
+                let crossed_surface = hit
                     .as_ref()
                     .map(|(s, _, _)| s != focus_surface)
                     .unwrap_or(true);
