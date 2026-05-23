@@ -172,11 +172,39 @@ pub fn process_frame(ctx: &CaptureContext<'_>, frame: Frame, presented: std::tim
             // here — but if it did (client raced a destroy), bail.
             return Err(());
         }
+        // Bounds-check the destination SHM buffer BEFORE the raw-pointer
+        // write loop below.
+        //
+        // The old check was `dst_offset + dst_stride * buf_h <= dst_len`,
+        // which a malicious or buggy client could trivially pass with
+        // `dst_stride < row_bytes` (or with a negative stride / offset
+        // that wraps through `as usize`). The loop body still wrote
+        // `row_bytes` per row via raw pointers, so the writes ran past
+        // the buffer end — an OOB write in unsafe code.
+        //
+        // The four checks below cover every overflow path:
+        //   1. stride/offset must be non-negative (i32 in the protocol)
+        //   2. stride must be at least one full row of pixels
+        //   3. the cumulative offset of the last row must not overflow
+        //   4. the byte just past the last write must fit in `dst_len`
+        if spec.stride < 0 || spec.offset < 0 {
+            return Err(());
+        }
         let dst_stride = spec.stride as usize;
         let dst_offset = spec.offset as usize;
-        let needed = dst_offset + dst_stride * (buf_h as usize);
-        if needed > dst_len {
+        if dst_stride < row_bytes {
             return Err(());
+        }
+        let rows = ctx.height as usize;
+        if rows > 0 {
+            let last_byte_end = (rows - 1)
+                .checked_mul(dst_stride)
+                .and_then(|stride_off| stride_off.checked_add(row_bytes))
+                .and_then(|tail| tail.checked_add(dst_offset))
+                .ok_or(())?;
+            if last_byte_end > dst_len {
+                return Err(());
+            }
         }
         for y in 0..(ctx.height as usize) {
             let src_off = y * src_bpr;
