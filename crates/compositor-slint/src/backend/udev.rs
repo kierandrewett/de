@@ -39,7 +39,7 @@ use smithay::backend::{
     session::{libseat::LibSeatSession, Event as SessionEvent, Session},
     udev::{primary_gpu, UdevBackend, UdevEvent},
 };
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::pointer::{AxisFrame, ButtonEvent};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::{
     calloop::RegistrationToken,
@@ -51,7 +51,7 @@ use smithay::reexports::{
 use smithay::utils::{DeviceFd, Point, SERIAL_COUNTER};
 use tracing::{error, info, warn};
 
-use crate::{wayland_runtime::WaylandRuntime, wayland_state::SpikeState};
+use crate::{renderer::input_util, wayland_runtime::WaylandRuntime, wayland_state::SpikeState};
 
 type ProbeAllocator = GbmAllocator<DrmDeviceFd>;
 type ProbeFramebufferExporter = GbmFramebufferExporter<DrmDeviceFd>;
@@ -934,64 +934,24 @@ fn handle_libinput_input_event(event: InputEvent<LibinputInputBackend>, state: &
     state.idle_notifier_state.notify_activity(&state.seat);
     match event {
         InputEvent::Keyboard { event } => {
-            let surface = if state.session_locked {
-                state
-                    .lock_surfaces
-                    .first()
-                    .map(|li| li.surface.wl_surface().clone())
-            } else {
-                state
-                    .exclusive_keyboard_layer()
-                    .cloned()
-                    .or_else(|| state.active_surface.clone())
-            };
-            let Some(surface) = surface else { return };
-            let Some(keyboard) = state.seat.get_keyboard() else {
-                return;
-            };
-
-            // Only re-issue set_focus when the target actually changed.
-            // Per-keystroke set_focus calls re-send wl_keyboard.enter/leave
-            // and bump modifier serials (input audit P0.7) — clients see a
-            // serial storm that interacts badly with grabs.
-            let focus = crate::wayland::xwayland::KeyboardFocusTarget::for_wl_surface(
-                state, &surface,
-            );
-            if !keyboard
-                .current_focus()
-                .as_ref()
-                .is_some_and(|current| current.matches_wl_surface(&surface))
-            {
-                keyboard.set_focus(state, Some(focus), SERIAL_COUNTER.next_serial());
-            }
-            keyboard.input_forward(
+            input_util::forward_keyboard_keycode(
                 state,
                 event.key_code(),
-                event.state(),
+                event.state() == smithay::backend::input::KeyState::Pressed,
                 SERIAL_COUNTER.next_serial(),
                 event.time_msec(),
-                false,
             );
         }
         InputEvent::PointerMotion { event } => {
-            let Some(pointer) = state.seat.get_pointer() else {
-                return;
-            };
-            state.pointer_pos.0 += event.delta_x();
-            state.pointer_pos.1 += event.delta_y();
-            state.pointer_pos.0 = state.pointer_pos.0.max(0.0);
-            state.pointer_pos.1 = state.pointer_pos.1.max(0.0);
-
-            pointer.motion(
+            let delta_unaccel = event.delta_unaccel();
+            input_util::forward_pointer_motion(
                 state,
-                None,
-                &MotionEvent {
-                    location: Point::from(state.pointer_pos),
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time: event.time_msec(),
-                },
+                (state.pointer_pos.0 + event.delta_x()).max(0.0),
+                (state.pointer_pos.1 + event.delta_y()).max(0.0),
+                Some((delta_unaccel.x, delta_unaccel.y)),
+                Some(event.time_msec()),
+                input_util::state_surface_under,
             );
-            pointer.frame(state);
         }
         InputEvent::PointerButton { event } => {
             let Some(pointer) = state.seat.get_pointer() else {
