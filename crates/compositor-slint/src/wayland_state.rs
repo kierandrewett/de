@@ -833,35 +833,40 @@ impl SpikeState {
         state
     }
 
-    /// Re-run the xdg-popup positioner against the parent toplevel + output
-    /// rect so the popup doesn't render off-screen. Mirrors
-    /// anvil/shell/xdg.rs:556-589 simplified for our single-output model.
+    /// Re-run the xdg-popup positioner against its root toplevel or
+    /// layer-shell surface plus the output rect so the popup doesn't render
+    /// off-screen. Mirrors the anvil/cosmic popup constraint path, simplified
+    /// for our single-output model.
     pub fn unconstrain_popup(&self, popup: &smithay::wayland::shell::xdg::PopupSurface) {
         use smithay::desktop::{find_popup_root_surface, get_popup_toplevel_coords, PopupKind};
-        let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
+        let kind = PopupKind::Xdg(popup.clone());
+        let Ok(root) = find_popup_root_surface(&kind) else {
             return;
         };
-        let Some(tl) = self.toplevels.iter().find(|t| t.surface == root) else {
+        let Some((logical_w, logical_h)) = self.primary_output_logical_size() else {
             return;
         };
-        let Some(output) = self.primary_output() else {
+        let root_origin = if let Some(tl) = self.toplevels.iter().find(|t| t.surface == root) {
+            smithay::utils::Point::from((tl.x, tl.y))
+        } else if let Some(layer) = self
+            .layer_surfaces
+            .iter()
+            .find(|layer| layer.surface.wl_surface() == &root)
+        {
+            smithay::utils::Point::from((layer.x, layer.y))
+        } else {
             return;
         };
-        let Some(mode) = output.current_mode() else {
-            return;
-        };
-        let scale = output.current_scale().fractional_scale();
-        let logical_w = (mode.size.w as f64 / scale).max(1.0) as i32;
-        let logical_h = (mode.size.h as f64 / scale).max(1.0) as i32;
-        // Positioner target rect = output, but expressed relative to the
-        // parent toplevel's surface origin (the positioner anchors relative
-        // to its parent).
+
+        // Positioner target rect = output, but expressed relative to the root
+        // parent surface origin because the positioner anchors relative to its
+        // parent.
         let mut target = smithay::utils::Rectangle::new(
             smithay::utils::Point::from((0, 0)),
             smithay::utils::Size::from((logical_w, logical_h)),
         );
-        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
-        target.loc -= smithay::utils::Point::from((tl.x, tl.y));
+        target.loc -= get_popup_toplevel_coords(&kind);
+        target.loc -= root_origin;
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });

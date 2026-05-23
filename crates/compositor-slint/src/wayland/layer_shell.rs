@@ -19,9 +19,14 @@ use std::sync::{Arc, Mutex};
 use smithay::{
     delegate_layer_shell,
     reexports::wayland_server::protocol::{wl_output, wl_surface::WlSurface},
-    wayland::shell::wlr_layer::{
-        Anchor, ExclusiveZone, KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface,
-        LayerSurfaceCachedState, Margins, WlrLayerShellHandler, WlrLayerShellState,
+    utils::{Logical, Size},
+    wayland::shell::{
+        wlr_layer::{
+            Anchor, ExclusiveZone, KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface,
+            LayerSurfaceCachedState, LayerSurfaceData, Margins, WlrLayerShellHandler,
+            WlrLayerShellState,
+        },
+        xdg::PopupSurface,
     },
 };
 use tracing::{info, trace};
@@ -103,13 +108,6 @@ impl WlrLayerShellHandler for SpikeState {
     ) {
         info!(ns = %namespace, layer = ?layer, "layer_shell: new surface");
 
-        // Send the initial configure so the client knows output geometry.
-        // (0, 0) size hint → client chooses its own size.
-        // The cached state (anchor / margin / exclusive_zone / size) is
-        // populated by the client in subsequent commits and re-read each
-        // frame in `refresh_layer_layout`.
-        surface.send_configure();
-
         self.layer_surfaces.push(LayerInfo {
             surface,
             layer,
@@ -131,6 +129,38 @@ impl WlrLayerShellHandler for SpikeState {
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         info!("layer_shell: surface destroyed");
         self.layer_surfaces.retain(|li| li.surface != surface);
+    }
+
+    fn new_popup(&mut self, parent: WlrLayerSurface, popup: PopupSurface) {
+        self.unconstrain_layer_popup(&parent, &popup);
+        if let Err(err) = popup.send_configure() {
+            tracing::warn!("layer-shell popup initial configure failed: {err:?}");
+            return;
+        }
+        if let Err(err) = self
+            .popup_manager
+            .track_popup(smithay::desktop::PopupKind::Xdg(popup.clone()))
+        {
+            tracing::warn!("failed to track layer-shell popup: {err}");
+            return;
+        }
+
+        let geom = popup.with_pending_state(|state| state.geometry);
+        self.popups.push(crate::wayland_state::PopupInfo {
+            surface: popup.wl_surface().clone(),
+            popup,
+            parent: parent.wl_surface().clone(),
+            rel_x: geom.loc.x,
+            rel_y: geom.loc.y,
+            w: geom.size.w,
+            h: geom.size.h,
+            pixels: Arc::new(Mutex::new(ClientSurfaceData::default())),
+            surface_pixels: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            geom_x: 0,
+            geom_y: 0,
+            geom_w: 0,
+            geom_h: 0,
+        });
     }
 }
 
@@ -167,7 +197,58 @@ fn effective_exclusive_edge(anchor: Anchor, explicit: Option<Anchor>) -> Option<
     }
 }
 
+pub fn layer_initial_configure_sent(surface: &WlrLayerSurface) -> bool {
+    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<LayerSurfaceData>()
+            .map(|data| data.lock().unwrap().initial_configure_sent)
+            .unwrap_or(false)
+    })
+}
+
 impl SpikeState {
+    pub fn primary_output_logical_size(&self) -> Option<(i32, i32)> {
+        let output = self.primary_output()?;
+        let mode = output.current_mode()?;
+        let scale = output.current_scale().fractional_scale();
+        Some((
+            (mode.size.w as f64 / scale).max(1.0) as i32,
+            (mode.size.h as f64 / scale).max(1.0) as i32,
+        ))
+    }
+
+    pub fn refresh_layer_layout_for_primary_output(&mut self) {
+        let Some((output_w, output_h)) = self.primary_output_logical_size() else {
+            return;
+        };
+        self.refresh_layer_layout(output_w, output_h);
+    }
+
+    pub fn unconstrain_layer_popup(&self, parent: &WlrLayerSurface, popup: &PopupSurface) {
+        let Some(layer) = self
+            .layer_surfaces
+            .iter()
+            .find(|layer| layer.surface == *parent)
+        else {
+            return;
+        };
+        let Some((output_w, output_h)) = self.primary_output_logical_size() else {
+            return;
+        };
+
+        let kind = smithay::desktop::PopupKind::Xdg(popup.clone());
+        let mut target = smithay::utils::Rectangle::new(
+            smithay::utils::Point::from((0, 0)),
+            smithay::utils::Size::from((output_w, output_h)),
+        );
+        target.loc -= smithay::desktop::get_popup_toplevel_coords(&kind);
+        target.loc -= smithay::utils::Point::from((layer.x, layer.y));
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
+
     /// Per-edge sum of exclusive zones across all currently mapped Top +
     /// Bottom layer surfaces. Background / Overlay layers are not subtracted
     /// from the toplevel work area (Background sits beneath windows, and
@@ -259,6 +340,17 @@ impl SpikeState {
             li.y = rect.1;
             li.w = rect.2;
             li.h = rect.3;
+            let computed_size = Size::<i32, Logical>::from((li.w, li.h));
+            let size_changed = li.surface.with_pending_state(|state| {
+                state
+                    .size
+                    .replace(computed_size)
+                    .map(|old| old != computed_size)
+                    .unwrap_or(true)
+            });
+            if size_changed && layer_initial_configure_sent(&li.surface) {
+                li.surface.send_pending_configure();
+            }
             trace!(
                 ns = %li.namespace, layer = ?li.layer, anchor = ?li.anchor,
                 ez = ?li.exclusive_zone,

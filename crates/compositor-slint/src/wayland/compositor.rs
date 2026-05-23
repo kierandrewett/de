@@ -212,6 +212,18 @@ impl CompositorHandler for SpikeState {
             }
         }
 
+        let layer_surface = self
+            .layer_surfaces
+            .iter()
+            .find(|layer| layer.surface.wl_surface() == surface)
+            .map(|layer| layer.surface.clone());
+        if let Some(layer_surface) = layer_surface {
+            self.refresh_layer_layout_for_primary_output();
+            if !crate::wayland::layer_shell::layer_initial_configure_sent(&layer_surface) {
+                layer_surface.send_configure();
+            }
+        }
+
         // Walk up the wl_subsurface parent chain to the root. The
         // wl_subsurface protocol guarantees this graph is acyclic, so an
         // unbounded walk cannot hang.
