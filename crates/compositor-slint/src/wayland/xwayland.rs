@@ -27,6 +27,7 @@
 //! for `xterm`, `xclock`, and most XInput-only X11 apps to display.
 
 use std::borrow::Cow;
+use std::fs;
 use std::os::unix::io::OwnedFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -40,7 +41,7 @@ use smithay::{
         Seat,
     },
     reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource},
-    utils::{IsAlive, Logical, Rectangle, SERIAL_COUNTER, Serial},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
     wayland::{
         seat::WaylandFocus,
         selection::{
@@ -59,7 +60,7 @@ use smithay::{
     },
     xwayland::{
         xwm::{Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, XwmId},
-        X11Surface, X11Wm, XWayland, XWaylandEvent, XwmHandler,
+        X11Surface, X11Wm, XWayland, XWaylandClientData, XWaylandEvent, XwmHandler,
     },
 };
 use tracing::{debug, info, warn};
@@ -141,6 +142,9 @@ fn refresh_transient_for(state: &SpikeState, child: &X11Surface) {
 /// their composited pixels through the popup pipeline instead.
 #[derive(Debug, Clone, Copy)]
 pub struct X11OverrideRedirect;
+
+const DEFAULT_XWAYLAND_CURSOR_SIZE: u32 = 24;
+const XWAYLAND_CURSOR_NAMES: &[&str] = &["left_ptr", "default", "arrow"];
 
 /// Keyboard focus target that preserves smithay's X11-specific focus path.
 ///
@@ -257,6 +261,139 @@ impl WaylandFocus for KeyboardFocusTarget {
     }
 }
 
+impl SpikeState {
+    fn selected_xwayland_output(&self) -> Option<&smithay::output::Output> {
+        self.xwayland_primary_output_name
+            .as_deref()
+            .and_then(|name| self.outputs.iter().find(|output| output.name() == name))
+            .or_else(|| self.primary_output())
+    }
+
+    fn xwayland_target_scale(&self) -> f64 {
+        self.selected_xwayland_output()
+            .map(|output| output.current_scale().fractional_scale().max(1.0))
+            .unwrap_or(1.0)
+    }
+
+    pub fn sync_xwayland_settings(&mut self) {
+        let scale = self.xwayland_target_scale();
+        let cursor_size = scaled_xwayland_cursor_size(scale);
+        let scale_changed = match self.xwayland_scale {
+            Some(current) => (current - scale).abs() > f64::EPSILON,
+            None => true,
+        };
+        let geometries = scale_changed.then(|| {
+            self.toplevels
+                .iter()
+                .filter_map(|toplevel| {
+                    let surface = toplevel.x11_surface.as_ref()?;
+                    Some((surface.clone(), surface.geometry()))
+                })
+                .collect::<Vec<_>>()
+        });
+        let primary_output = self.selected_xwayland_output().cloned();
+
+        if let Some(client) = &self.xwayland_client {
+            if let Some(data) = client.get_data::<XWaylandClientData>() {
+                data.compositor_state.set_client_scale(scale);
+            } else {
+                warn!("XWayland: missing XWaylandClientData for scale sync");
+            }
+        }
+
+        if let Some(xwm) = self.xwm.as_mut() {
+            let base_dpi = 96.0 * 1024.0;
+            let dpi = scale * base_dpi;
+            let fractional = scale.fract();
+            let integer = (scale - fractional).max(1.0);
+            let unscaled_dpi = base_dpi * (1.0 + fractional / integer);
+
+            if let Err(err) = xwm.set_xsettings(
+                [
+                    ("Xft/DPI".to_string(), (dpi.round() as i32).into()),
+                    (
+                        "Gdk/UnscaledDPI".to_string(),
+                        (unscaled_dpi.round() as i32).into(),
+                    ),
+                    (
+                        "Gdk/WindowScalingFactor".to_string(),
+                        (scale.floor().max(1.0) as i32).into(),
+                    ),
+                    (
+                        "Gtk/CursorThemeSize".to_string(),
+                        i32::try_from(cursor_size).unwrap_or(i32::MAX).into(),
+                    ),
+                ]
+                .into_iter(),
+            ) {
+                warn!(?err, "XWayland: failed to update XSETTINGS");
+            }
+
+            if let Err(err) = xwm.set_randr_primary_output(primary_output.as_ref()) {
+                warn!(?err, "XWayland: failed to update RandR primary output");
+            }
+
+            if let Some((pixels, size, hotspot)) = load_xwayland_cursor(cursor_size) {
+                if let Err(err) = xwm.set_cursor(&pixels, size, hotspot) {
+                    warn!(?err, "XWayland: failed to reload X cursor");
+                }
+            } else {
+                warn!(
+                    cursor_size,
+                    "XWayland: no X cursor image found for scale sync"
+                );
+            }
+        }
+
+        if let Some(geometries) = geometries {
+            for (surface, geometry) in geometries {
+                if let Err(err) = surface.configure(geometry) {
+                    warn!(?err, window_id = ?surface.window_id(), "XWayland: failed to refresh X11 geometry after scale change");
+                }
+            }
+            self.xwayland_scale = Some(scale);
+        }
+    }
+}
+
+fn scaled_xwayland_cursor_size(scale: f64) -> u32 {
+    let base_size = std::env::var("XCURSOR_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(DEFAULT_XWAYLAND_CURSOR_SIZE);
+    ((base_size as f64) * scale).round().max(1.0) as u32
+}
+
+fn xwayland_cursor_theme() -> String {
+    std::env::var("XCURSOR_THEME")
+        .ok()
+        .filter(|theme| !theme.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn load_xwayland_cursor(size: u32) -> Option<(Vec<u8>, Size<u16, Logical>, Point<u16, Logical>)> {
+    let theme = xcursor::CursorTheme::load(&xwayland_cursor_theme());
+    let image = XWAYLAND_CURSOR_NAMES.iter().find_map(|name| {
+        let path = theme.load_icon(name)?;
+        let bytes = fs::read(path).ok()?;
+        let images = xcursor::parser::parse_xcursor(&bytes)?;
+        images
+            .into_iter()
+            .min_by_key(|image| image.size.abs_diff(size))
+    })?;
+
+    let width = u16::try_from(image.width).ok()?;
+    let height = u16::try_from(image.height).ok()?;
+    let hot_x = u16::try_from(image.xhot).ok()?;
+    let hot_y = u16::try_from(image.yhot).ok()?;
+    Some((
+        image.pixels_rgba,
+        (width, height).into(),
+        (hot_x, hot_y).into(),
+    ))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Process lifecycle
 // ──────────────────────────────────────────────────────────────────────────────
@@ -307,7 +444,9 @@ pub fn start_xwayland(state: &mut SpikeState) {
                 ) {
                     Ok(wm) => {
                         data.xwm = Some(wm);
+                        data.xwayland_client = Some(client.clone());
                         data.xdisplay = Some(display_number);
+                        data.sync_xwayland_settings();
                         info!("XWayland: X11Wm attached on :{display_number}");
                     }
                     Err(e) => warn!("XWayland: X11Wm::start_wm failed: {e}"),
@@ -316,6 +455,8 @@ pub fn start_xwayland(state: &mut SpikeState) {
             XWaylandEvent::Error => {
                 warn!("XWayland: process exited unexpectedly");
                 data.xwm = None;
+                data.xwayland_client = None;
+                data.xwayland_scale = None;
                 data.xdisplay = None;
             }
         });
@@ -953,8 +1094,15 @@ impl XwmHandler for SpikeState {
         }
     }
 
+    fn randr_primary_output_change(&mut self, _xwm: XwmId, output_name: Option<String>) {
+        self.xwayland_primary_output_name = output_name;
+        self.sync_xwayland_settings();
+    }
+
     fn disconnected(&mut self, _xwm: XwmId) {
         warn!("X11: xwm disconnected — clearing X11Wm");
         self.xwm = None;
+        self.xwayland_client = None;
+        self.xwayland_scale = None;
     }
 }
