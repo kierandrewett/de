@@ -578,20 +578,9 @@ impl XWaylandShellHandler for SpikeState {
         // OR windows aren't focusable / managed — they piggyback on the
         // parent's keyboard focus (xterm popup menu, GTK dropdown).
         if !is_or {
-<<<<<<< HEAD
-            self.active_surface = Some(wl_surface.clone());
-            if let Some(kb) = self.seat.get_keyboard() {
-                kb.set_focus(
-                    self,
-                    Some(KeyboardFocusTarget::X11(x11_surface.clone())),
-                    SERIAL_COUNTER.next_serial(),
-                );
+            if self.focus_new_surface_if_allowed(&wl_surface, "X11 surface_associated") {
+                self.raise_x11_window(&x11_surface);
             }
-            let _ = x11_surface.set_activated(true);
-            self.raise_x11_window(&x11_surface);
-=======
-            self.focus_new_surface_if_allowed(&wl_surface, "X11 surface_associated");
->>>>>>> 508e41f (fix(compositor-slint): validate activation tokens before focusing windows)
         }
         // After the toplevel list contains both parent and child,
         // resolve transient_for so dialog→parent z/focus rules can kick in.
@@ -700,20 +689,9 @@ impl XwmHandler for SpikeState {
                     description: None,
                     appmenu: None,
                 });
-<<<<<<< HEAD
-                self.active_surface = Some(wl_surface.clone());
-                if let Some(kb) = self.seat.get_keyboard() {
-                    kb.set_focus(
-                        self,
-                        Some(KeyboardFocusTarget::X11(window.clone())),
-                        SERIAL_COUNTER.next_serial(),
-                    );
+                if self.focus_new_surface_if_allowed(&wl_surface, "X11 map_window_request") {
+                    self.raise_x11_window(&window);
                 }
-                let _ = window.set_activated(true);
-                self.raise_x11_window(&window);
-=======
-                self.focus_new_surface_if_allowed(&wl_surface, "X11 map_window_request");
->>>>>>> 508e41f (fix(compositor-slint): validate activation tokens before focusing windows)
                 // Resolve TRANSIENT_FOR now that both parent and child are in
                 // the toplevel list (parent must have mapped earlier; if not,
                 // a later property_notify will retry).
