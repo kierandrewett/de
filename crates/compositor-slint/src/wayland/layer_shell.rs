@@ -296,6 +296,7 @@ impl SpikeState {
 /// `Some((edge, amount))` if the surface has an effective exclusive zone
 /// that should be subtracted from the shared work area for subsequent
 /// surfaces (margin already included in `amount`).
+#[allow(clippy::type_complexity)]
 fn compute_layer_rect(
     li: &LayerInfo,
     output_rect: (i32, i32, i32, i32),

@@ -310,6 +310,7 @@ pub fn inactive_layers() -> [ShadowLayer; 2] {
 }
 
 /// Build the ChromeUniforms for a shadow-layer call.
+#[allow(clippy::too_many_arguments)]
 pub fn uniforms_for_layer(
     win_x: f32,
     win_y: f32,

@@ -1076,9 +1076,9 @@ impl SpikeState {
     /// CPU-roundtrip readback and store the resulting pixels in
     /// `dmabuf_pending` keyed by the surface's `ObjectId`.
     ///
-    /// Called from the commit handler — at that point the acquire-fence
-    /// pre-commit blocker (see `install_dmabuf_blocker`) guarantees the
-    /// producer GPU is done, so reading from the dmabuf is safe.
+    /// Called from the commit handler. At that point the DMA-BUF read-fence
+    /// pre-commit blocker installed in `CompositorHandler::new_surface` has
+    /// released, so reading from the dmabuf is safe.
     pub fn import_dmabuf_for_surface(&mut self, surface: &WlSurface, dmabuf: &Dmabuf) {
         self.ensure_gles_renderer();
 
@@ -1209,6 +1209,7 @@ impl SpikeState {
 ///   2. Allocate an RGBA buffer sized to fit the union of all surfaces.
 ///   3. Second walk: in z-order (parent → children, declared order), blit
 ///      each surface's pixels into the composite.
+///
 /// Scan a premultiplied-RGBA buffer for the bounding box of opaque content.
 /// Used to detect the visible-window rect inside a buffer that has CSD
 /// shadow/border padding (Firefox, GTK header-bar apps).

@@ -73,6 +73,7 @@ impl SpikeState {
     /// callback.
     ///
     /// Ported from `crates/compositor/src/winit.rs::pre_render_drive_clients`.
+    #[allow(clippy::mutable_key_type)]
     pub fn pre_render_drive_clients(&mut self) {
         use smithay::reexports::wayland_server::Resource;
         use smithay::wayland::compositor::CompositorHandler;

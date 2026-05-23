@@ -4671,6 +4671,7 @@ impl CompositorApp {
     }
 
     /// Refresh the panel/dock backdrop on a throttled cadence.
+    #[allow(clippy::type_complexity)]
     pub fn refresh_backdrop(&mut self, state: &SpikeState) {
         // Bail out before the per-window pixel clone if the throttle window
         // hasn't elapsed — the snapshot vector below is megabytes per
