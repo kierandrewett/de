@@ -1,3 +1,12 @@
+#![allow(
+    clippy::arc_with_non_send_sync,
+    clippy::doc_lazy_continuation,
+    clippy::field_reassign_with_default,
+    clippy::mutable_key_type,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+)]
+
 //! compositor-slint: Slint as the compositor render layer.
 //!
 //! Architecture:

@@ -1000,6 +1000,13 @@ impl SpikeState {
         }
     }
 
+    pub fn unregister_output(&mut self, output: &Output) {
+        self.outputs.retain(|existing| existing != output);
+        if self.output.as_ref() == Some(output) {
+            self.output = self.outputs.first().cloned();
+        }
+    }
+
     pub fn primary_output(&self) -> Option<&Output> {
         self.output.as_ref().or_else(|| self.outputs.first())
     }
