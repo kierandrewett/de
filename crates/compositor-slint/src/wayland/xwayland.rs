@@ -262,6 +262,46 @@ impl WaylandFocus for KeyboardFocusTarget {
 }
 
 impl SpikeState {
+    fn x11_surface_for_wl_surface(&self, surface: &WlSurface) -> Option<X11Surface> {
+        self.toplevels
+            .iter()
+            .find(|toplevel| &toplevel.surface == surface)
+            .and_then(|toplevel| toplevel.x11_surface.clone())
+    }
+
+    pub fn raise_x11_window_for_wl_surface(&mut self, surface: &WlSurface) {
+        let Some(x11_surface) = self.x11_surface_for_wl_surface(surface) else {
+            return;
+        };
+        self.raise_x11_window(&x11_surface);
+    }
+
+    pub fn raise_x11_window(&mut self, surface: &X11Surface) {
+        let Some(xwm) = self.xwm.as_mut() else {
+            return;
+        };
+        if let Err(err) = xwm.raise_window(surface) {
+            warn!(window_id = ?surface.window_id(), ?err, "XWayland: failed to raise X11 window");
+        }
+    }
+
+    pub fn sync_x11_stacking_order_top_to_bottom(&mut self, surfaces: &[WlSurface]) {
+        let order = surfaces
+            .iter()
+            .filter_map(|surface| self.x11_surface_for_wl_surface(surface))
+            .collect::<Vec<_>>();
+        if order.is_empty() {
+            return;
+        }
+
+        let Some(xwm) = self.xwm.as_mut() else {
+            return;
+        };
+        if let Err(err) = xwm.update_stacking_order_upwards(order.iter()) {
+            warn!(wm_id = ?xwm.id(), ?err, "XWayland: failed to sync X11 stacking order");
+        }
+    }
+
     fn selected_xwayland_output(&self) -> Option<&smithay::output::Output> {
         self.xwayland_primary_output_name
             .as_deref()
@@ -540,6 +580,7 @@ impl XWaylandShellHandler for SpikeState {
                 );
             }
             let _ = x11_surface.set_activated(true);
+            self.raise_x11_window(&x11_surface);
         }
         // After the toplevel list contains both parent and child,
         // resolve transient_for so dialog→parent z/focus rules can kick in.
@@ -657,6 +698,7 @@ impl XwmHandler for SpikeState {
                     );
                 }
                 let _ = window.set_activated(true);
+                self.raise_x11_window(&window);
                 // Resolve TRANSIENT_FOR now that both parent and child are in
                 // the toplevel list (parent must have mapped earlier; if not,
                 // a later property_notify will retry).
@@ -841,6 +883,7 @@ impl XwmHandler for SpikeState {
             );
         }
         let _ = window.set_activated(true);
+        self.raise_x11_window(&window);
     }
 
     fn configure_notify(
@@ -848,12 +891,13 @@ impl XwmHandler for SpikeState {
         _xwm: XwmId,
         window: X11Surface,
         geometry: Rectangle<i32, Logical>,
-        _above: Option<u32>,
+        above: Option<u32>,
     ) {
         debug!(
-            "X11: configure_notify id={:?} geom={:?}",
+            "X11: configure_notify id={:?} geom={:?} above={:?}",
             window.window_id(),
-            geometry
+            geometry,
+            above,
         );
         // For override-redirect windows the X11 client places itself
         // unilaterally — the compositor must follow. Update the tracked
@@ -869,6 +913,26 @@ impl XwmHandler for SpikeState {
         if let Some(tl) = self.toplevels.iter_mut().find(|t| t.surface == wl_surface) {
             tl.x = geometry.loc.x;
             tl.y = geometry.loc.y;
+        }
+
+        if let Some(above) = above {
+            let Some(own_pos) = self.toplevels.iter().position(|toplevel| toplevel.surface == wl_surface) else {
+                return;
+            };
+            let compare_pos = self
+                .toplevels
+                .iter()
+                .position(|toplevel| {
+                    toplevel
+                        .x11_surface
+                        .as_ref()
+                        .is_some_and(|surface| surface.window_id() == above)
+                })
+                .unwrap_or(0);
+            if compare_pos > own_pos {
+                let toplevel = self.toplevels.remove(own_pos);
+                self.toplevels.insert(compare_pos, toplevel);
+            }
         }
     }
 
